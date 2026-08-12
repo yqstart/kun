@@ -84,11 +84,19 @@ impl TerminalView {
         let ctx = ui.ctx().clone();
         let term_arc = self.session.term();
 
-        // 终端区域背景（最深一档，对齐 MiroCode 终端色）。
-        ui.painter()
-            .rect_filled(ui.min_rect(), 0.0, crate::theme::miro::BG_TERMINAL);
+        // 终端区域背景（当前主题的终端色）。
+        let term_bg = crate::theme::current_theme().term_bg;
+        ui.painter().rect_filled(
+            ui.min_rect(),
+            0.0,
+            Color32::from_rgb(term_bg.r, term_bg.g, term_bg.b),
+        );
 
         // ==================== 事件泵 ====================
+        // 诊断：PTY 读取线程退出会导致输入写入失效。
+        if self.session.pty_thread_finished() {
+            log::warn!("PTY 读取线程已退出！输入将无法写入终端。");
+        }
         for event in self.session.drain_events() {
             match event {
                 SessionEvent::Wakeup => ctx.request_repaint(),
@@ -128,8 +136,8 @@ impl TerminalView {
             let guard = term_arc.lock();
             let content = guard.renderable_content();
             let colors = content.colors;
-            let default_fg = colors[NamedColor::Foreground].unwrap_or(crate::theme::TERM_FG);
-            let default_bg = colors[NamedColor::Background].unwrap_or(crate::theme::TERM_BG);
+            let default_fg = colors[NamedColor::Foreground].unwrap_or(crate::theme::current_theme().term_fg);
+            let default_bg = colors[NamedColor::Background].unwrap_or(crate::theme::current_theme().term_bg);
             self.last_mode = content.mode;
             let mode = content.mode;
             let cursor = content.cursor;
@@ -279,7 +287,7 @@ impl TerminalView {
             if cursor_visible && cursor.shape != CursorShape::Hidden {
                 let (line, col) = (cursor.point.line.0 as usize, cursor.point.column.0);
                 if line < self.rows as usize && col < self.cols as usize {
-                    let color = colors[NamedColor::Cursor].unwrap_or(crate::theme::TERM_CURSOR);
+                    let color = colors[NamedColor::Cursor].unwrap_or(crate::theme::current_theme().term_cursor);
                     cursor_color = Some(to_egui(color));
                     cursor_rect = Some(Rect::from_min_size(
                         ui.min_rect().min
@@ -521,7 +529,7 @@ fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Co
             match n {
                 NamedColor::Foreground => to_egui(default),
                 NamedColor::Background => to_egui(default),
-                NamedColor::Cursor => to_egui(crate::theme::TERM_CURSOR),
+                NamedColor::Cursor => to_egui(crate::theme::current_theme().term_cursor),
                 _ => {
                     let mut idx = n as usize;
                     // 粗体时将基本色映射到亮色（参照 Alacritty 默认行为）。
@@ -529,10 +537,10 @@ fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Co
                         idx += 8;
                     }
                     if idx < 16 {
-                        to_egui(crate::theme::TERM_PALETTE_16[idx])
+                        to_egui(crate::theme::current_theme().term_palette[idx])
                     } else {
                         // 其余命名色（Dim 系等）用 256 色表兜底。
-                        to_egui(crate::theme::xterm256(idx as u8))
+                        to_egui(crate::theme::xterm256(idx as u8, crate::theme::current_theme().term_palette))
                     }
                 }
             }
@@ -542,7 +550,7 @@ fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Co
             if let Some(rgb) = colors[i as usize] {
                 return to_egui(rgb);
             }
-            to_egui(crate::theme::xterm256(i))
+            to_egui(crate::theme::xterm256(i, crate::theme::current_theme().term_palette))
         }
     }
 }
@@ -914,5 +922,133 @@ mod deadlock_tests {
             harness.step();
         }
         // 若修复失效，此处会在 10 秒死锁后 panic；到达这里说明通过。
+    }
+}
+
+#[cfg(test)]
+mod enter_tests {
+    use super::*;
+    use kun_core::terminal::{Session, SessionOptions};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn grid_text(session: &Session) -> String {
+        use alacritty_terminal::term::cell::Flags;
+        let term_arc = session.term();
+        let guard = term_arc.lock();
+        let content = guard.renderable_content();
+        let mut lines: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut current_line = usize::MAX;
+        for item in content.display_iter {
+            let cell = item.cell;
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
+                continue;
+            }
+            if item.point.line.0 as usize != current_line {
+                if current_line != usize::MAX {
+                    lines.push(current.trim_end().to_string());
+                }
+                current = String::new();
+                current_line = item.point.line.0 as usize;
+            }
+            current.push(cell.c);
+        }
+        if current_line != usize::MAX {
+            lines.push(current.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    /// 回车应执行已输入的命令（回归测试：用户报告回车不执行）。
+    #[test]
+    fn 回车执行命令() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+
+        // 等待 zsh 就绪。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if grid_text(view.borrow().session()).contains("kun") {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(ready, "zsh 未就绪");
+
+        // 输入 echo HELLO。
+        for (key, ch) in [
+            (egui::Key::E, "e"),
+            (egui::Key::C, "c"),
+            (egui::Key::H, "h"),
+            (egui::Key::O, "o"),
+        ] {
+            harness.event(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            harness.event(egui::Event::Text(ch.to_string()));
+        }
+        harness.event(egui::Event::Text(" ".to_string()));
+        for (key, ch) in [
+            (egui::Key::H, "h"),
+            (egui::Key::E, "e"),
+            (egui::Key::L, "l"),
+            (egui::Key::L, "l"),
+            (egui::Key::O, "o"),
+        ] {
+            harness.event(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            harness.event(egui::Event::Text(ch.to_string()));
+        }
+
+        // 按回车。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+
+        // 等待 HELLO 输出出现（命令被执行）。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut executed = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if grid_text(view.borrow().session()).contains("hello") {
+                executed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            executed,
+            "回车未执行命令，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
     }
 }

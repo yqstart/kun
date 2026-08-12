@@ -64,6 +64,9 @@ crates/
 - 主机条目支持单击选中、双击连接
 - 终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）在渲染层解析（`theme.rs::TERM_PALETTE_16`/`xterm256`），优先级：Spec > OSC 覆盖（term.colors）> 内置调色板；`Term.colors` 默认全 None，不设调色板则全部渲染为白色
 - 工具栏底部有紫→青渐变指示线（`draw_gradient_line`）；选中主机条目左侧 2px accent 竖条
+- **四套主题**（`theme.rs::THEMES`，对齐 MiroCode）：Miro 深色（紫）/ Dawn 浅色 / Midnight 深蓝 / Cyberpunk 霓虹；每套含 UI token + 终端调色板（16 色 + fg/bg/cursor）；`current_theme()` 静态读取，工具栏 ComboBox 切换（`set_theme`）
+- 主题切换后需重新渲染终端（terminal_view 每帧读 `current_theme()`）
+- 终端输入/回车功能验证正常；若用户"回车不执行"多为中文输入法（IME）激活时回车被输入法消费（确认拼音候选），切英文输入法即可（所有终端应用共性）
 
 ## 关键约定
 

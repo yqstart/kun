@@ -147,6 +147,10 @@ pub struct Session {
     writer: Writer,
     resizer: Resizer,
     shuttor: Shuttor,
+    /// 本地会话的 PTY 读取线程（远程会话为 None）。
+    pty_thread: Option<
+        JoinHandle<(EventLoop<tty::Pty, Listener>, alacritty_terminal::event_loop::State)>,
+    >,
 }
 
 /// 会话创建参数（本地）。
@@ -173,6 +177,7 @@ impl Session {
             writer,
             resizer,
             shuttor,
+            pty_thread: None,
         }
     }
 
@@ -231,7 +236,7 @@ impl Session {
             false,
         )?;
         let channel = event_loop.channel();
-        let _thread: JoinHandle<(
+        let pty_thread: JoinHandle<(
             EventLoop<tty::Pty, Listener>,
             alacritty_terminal::event_loop::State,
         )> = event_loop.spawn();
@@ -255,7 +260,17 @@ impl Session {
             let _ = shuttor_channel.send(Msg::Shutdown);
         });
 
-        Ok(Session::new(term, shared, writer, resizer, shuttor))
+        let mut session = Session::new(term, shared, writer, resizer, shuttor);
+        session.pty_thread = Some(pty_thread);
+        Ok(session)
+    }
+
+    /// PTY 读取线程是否已退出（用于诊断写入失效问题）。
+    pub fn pty_thread_finished(&self) -> bool {
+        self.pty_thread
+            .as_ref()
+            .map(|t| t.is_finished())
+            .unwrap_or(false)
     }
 
     /// 访问终端状态机（渲染时锁定读取）。

@@ -228,7 +228,7 @@ impl SftpView {
             ui.label(
                 RichText::new(&self.current_path)
                     .monospace()
-                    .color(crate::theme::miro::TEXT_MUTED),
+                    .color(crate::theme::current_theme().text_muted),
             );
         });
 
@@ -309,7 +309,7 @@ impl SftpView {
                     self.selected = Some(name);
                 }
                 if self.entries.is_empty() && !self.loading {
-                    ui.label(RichText::new("空目录").color(crate::theme::miro::TEXT_MUTED));
+                    ui.label(RichText::new("空目录").color(crate::theme::current_theme().text_muted));
                 }
             });
 

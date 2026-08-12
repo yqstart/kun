@@ -13,9 +13,6 @@ alacritty_terminal = "0.26.0"
 # GUI
 eframe = "0.36.1"
 egui = "0.36.1"
-# SSH/SFTP（纯 Rust）
-russh = "0.56.0"
-russh-sftp = "2.4.0"
 # 异步
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "fs"] }
 # 配置

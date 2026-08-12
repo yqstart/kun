@@ -50,13 +50,12 @@ pub struct KunApp {
     pending_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>)>,
     /// 远程连接的主机名（用于 SFTP 面板标题）。
     sftp_host: String,
-    dark_mode: bool,
 }
 
 impl KunApp {
     /// 创建应用（启动本地终端会话）。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        crate::theme::apply_dark(&cc.egui_ctx);
+        crate::theme::set_theme(&cc.egui_ctx, 0);
         let ctx = cc.egui_ctx.clone();
 
         // 加载主机配置。
@@ -87,7 +86,6 @@ impl KunApp {
             sftp: None,
             pending_sftp: None,
             sftp_host: String::new(),
-            dark_mode: true,
         }
     }
 
@@ -173,11 +171,11 @@ impl KunApp {
             ui.label(
                 egui::RichText::new("kun")
                     .strong()
-                    .color(crate::theme::miro::ACCENT),
+                    .color(crate::theme::current_theme().accent),
             );
             ui.separator();
             let new_conn_btn = egui::Button::new("新建连接")
-                .fill(crate::theme::miro::ACCENT)
+                .fill(crate::theme::current_theme().accent)
                 .stroke(egui::Stroke::NONE)
                 .corner_radius(crate::theme::miro::RADIUS_SM);
             if ui.add(new_conn_btn).clicked() {
@@ -196,19 +194,22 @@ impl KunApp {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let text = if self.dark_mode {
-                    "浅色模式"
-                } else {
-                    "深色模式"
-                };
-                if ui.button(text).clicked() {
-                    self.dark_mode = !self.dark_mode;
-                    if self.dark_mode {
-                        crate::theme::apply_dark(ui.ctx());
-                    } else {
-                        ui.ctx().set_visuals(egui::Visuals::light());
-                    }
-                }
+                // 主题切换（四套皮肤循环）。
+                let themes = &crate::theme::THEMES;
+                let current = crate::theme::current_theme().name;
+                egui::ComboBox::from_id_salt("theme_switcher")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (i, theme) in themes.iter().enumerate() {
+                            if ui.selectable_label(
+                                crate::theme::current_theme().name == theme.name,
+                                theme.name,
+                            ).clicked()
+                            {
+                                crate::theme::set_theme(ui.ctx(), i);
+                            }
+                        }
+                    });
             });
         });
 
@@ -226,14 +227,14 @@ impl KunApp {
         ui.label(
             egui::RichText::new("主机")
                 .size(13.0)
-                .color(crate::theme::miro::TEXT_SECONDARY)
+                .color(crate::theme::current_theme().text_secondary)
                 .strong(),
         );
         ui.add_space(4.0);
         if ui
             .add(
                 egui::Button::new("新建连接")
-                    .fill(crate::theme::miro::ACCENT)
+                    .fill(crate::theme::current_theme().accent)
                     .stroke(egui::Stroke::NONE)
                     .corner_radius(crate::theme::miro::RADIUS_SM),
             )
@@ -245,7 +246,7 @@ impl KunApp {
         ui.separator();
 
         if self.config.hosts.is_empty() {
-            ui.label(egui::RichText::new("暂无已保存主机").color(crate::theme::miro::TEXT_MUTED));
+            ui.label(egui::RichText::new("暂无已保存主机").color(crate::theme::current_theme().text_muted));
         }
         let mut remove_idx: Option<usize> = None;
         let mut connect_idx: Option<usize> = None;
@@ -262,7 +263,7 @@ impl KunApp {
                         ui.vertical(|ui| {
                             ui.label(
                                 egui::RichText::new(&host.name)
-                                    .color(crate::theme::miro::TEXT_PRIMARY),
+                                    .color(crate::theme::current_theme().text_primary),
                             );
                             ui.weak(format!("{}@{}", host.user, host.host));
                         });
@@ -286,7 +287,7 @@ impl KunApp {
                 ui.painter().rect_filled(
                     rect,
                     crate::theme::miro::RADIUS_ITEM,
-                    crate::theme::miro::ACCENT_SOFT,
+                    crate::theme::current_theme().accent_soft,
                 );
                 if selected_host == Some(i) {
                     ui.painter().rect_filled(
@@ -295,7 +296,7 @@ impl KunApp {
                             egui::pos2(rect.left() + 2.0, rect.bottom() - 3.0),
                         ),
                         2.0,
-                        crate::theme::miro::ACCENT,
+                        crate::theme::current_theme().accent,
                     );
                 }
             }
@@ -423,7 +424,7 @@ impl KunApp {
                     } else {
                         title
                     })
-                    .color(crate::theme::miro::TEXT_SECONDARY),
+                    .color(crate::theme::current_theme().text_secondary),
                 );
                 if session.has_exited() {
                     ui.colored_label(egui::Color32::from_rgb(0xff, 0x55, 0x55), "会话已退出");
@@ -495,9 +496,9 @@ impl eframe::App for KunApp {
 
         // ==================== 左侧主机栏 ====================
         let sidebar_frame = egui::Frame::new()
-            .fill(crate::theme::miro::BG_PANEL)
+            .fill(crate::theme::current_theme().bg_panel)
             .inner_margin(egui::Margin::symmetric(10, 10))
-            .stroke(egui::Stroke::new(1.0, crate::theme::miro::BORDER_SUBTLE));
+            .stroke(egui::Stroke::new(1.0, crate::theme::current_theme().border));
         egui::Panel::left("hosts")
             .default_size(220.0)
             .resizable(true)
@@ -508,9 +509,9 @@ impl eframe::App for KunApp {
 
         // ==================== 顶部工具栏 ====================
         let toolbar_frame = egui::Frame::new()
-            .fill(crate::theme::miro::BG_HEADER)
+            .fill(crate::theme::current_theme().bg_header)
             .inner_margin(egui::Margin::symmetric(10, 6))
-            .stroke(egui::Stroke::new(1.0, crate::theme::miro::BORDER_SUBTLE));
+            .stroke(egui::Stroke::new(1.0, crate::theme::current_theme().border));
         egui::Panel::top("toolbar")
             .frame(toolbar_frame)
             .show(ui, |ui| {
@@ -519,9 +520,9 @@ impl eframe::App for KunApp {
 
         // ==================== 状态栏 ====================
         let status_frame = egui::Frame::new()
-            .fill(crate::theme::miro::BG_PANEL)
+            .fill(crate::theme::current_theme().bg_panel)
             .inner_margin(egui::Margin::symmetric(10, 4))
-            .stroke(egui::Stroke::new(1.0, crate::theme::miro::BORDER_SUBTLE));
+            .stroke(egui::Stroke::new(1.0, crate::theme::current_theme().border));
         egui::Panel::bottom("status")
             .frame(status_frame)
             .show(ui, |ui| {
@@ -539,9 +540,9 @@ impl eframe::App for KunApp {
                 // SFTP 面板存在时水平分栏（终端左，SFTP 右，可拖拽）。
                 if self.sftp.is_some() {
                     let sftp_frame = egui::Frame::new()
-                        .fill(crate::theme::miro::BG_PANEL)
+                        .fill(crate::theme::current_theme().bg_panel)
                         .inner_margin(egui::Margin::symmetric(10, 8))
-                        .stroke(egui::Stroke::new(1.0, crate::theme::miro::BORDER_SUBTLE));
+                        .stroke(egui::Stroke::new(1.0, crate::theme::current_theme().border));
                     egui::Panel::right("sftp_panel")
                         .default_size(360.0)
                         .resizable(true)
@@ -941,5 +942,46 @@ mod snapshot_tests {
         let out = "/tmp/kun_style_sftp.png";
         img.save(out).expect("保存截图失败");
         eprintln!("样式截图已保存：{out}");
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    /// 四套主题切换并渲染截图（视觉验证用）。
+    #[test]
+    fn 四套主题渲染截图() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run();
+
+        // 逐套主题：通过 UI 下拉切换并渲染。
+        for theme_name in ["Miro 深色", "Dawn 浅色", "Midnight 深蓝", "Cyberpunk 霓虹"] {
+            // 点击主题下拉（ComboBox 节点），再选择目标主题。
+            let combo = harness
+                .root()
+                .query_by_role(accesskit::Role::ComboBox)
+                .expect("主题下拉不存在");
+            combo.click();
+            for _ in 0..2 {
+                harness.step();
+            }
+            harness.get_by_label(theme_name).click();
+            for _ in 0..3 {
+                harness.step();
+            }
+            assert_eq!(
+                crate::theme::current_theme().name,
+                theme_name,
+                "主题切换失败"
+            );
+            // 渲染保存截图。
+            let img = harness.render().expect("渲染失败");
+            let out = format!("/tmp/kun_theme_{}.png", theme_name);
+            img.save(&out).expect("保存截图失败");
+            eprintln!("已保存：{out}");
+        }
     }
 }
