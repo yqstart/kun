@@ -1,0 +1,15 @@
+[package]
+name = "kun-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "kun 终端工具 GUI 应用"
+
+[dependencies]
+kun-core = { path = "../kun-core" }
+eframe = { workspace = true }
+egui = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+tokio = { workspace = true }
+alacritty_terminal = "0.26"

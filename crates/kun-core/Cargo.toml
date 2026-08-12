@@ -1,0 +1,22 @@
+[package]
+name = "kun-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "kun 终端与 SFTP 引擎"
+
+[dependencies]
+alacritty_terminal = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+
+[dependencies.russh]
+version = "0.62"
+default-features = false
+features = ["default", "rsa", "ring"]
+
+[dependencies.russh-sftp]
+version = "2.4"

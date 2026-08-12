@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/kun-core", "crates/kun-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# 终端内核（生产级 VT 仿真 + PTY）
+alacritty_terminal = "0.26.0"
+# GUI
+eframe = "0.36.1"
+egui = "0.36.1"
+# SSH/SFTP（纯 Rust）
+russh = "0.56.0"
+russh-sftp = "2.4.0"
+# 异步
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process"] }
+# 配置
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+# 工具
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
