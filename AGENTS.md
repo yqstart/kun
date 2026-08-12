@@ -54,6 +54,15 @@ crates/
 - 远程连接后台线程必须持有 runtime 直到会话关闭（`Notify` 等待 remote_loop 结束），否则 tokio::spawn 的任务被取消
 - `Session` 实现 `Drop` → 发 Shutdown 优雅关闭
 
+## 样式体系（借鉴 MiroCode / Warp）
+
+- 设计 token 在 `theme.rs::miro`：分层背景 `#0a0a0d`（应用）/`#141418`（标题栏）/`#1c1c22`（面板）/`#28282f`（浮层）/`#06060a`（终端，最深）
+- 文字三阶 `#f5f5f7/#c7c7cc/#8e8e93`；accent `#8b5cf6` + `ACCENT_SOFT`（16% 透明）做 hover/选中底
+- 边框统一 5% 半透明白（`BORDER_SUBTLE`）；圆角 10px（按钮/输入）/6px（列表项）
+- 面板用 `Panel::frame(Frame)` 指定背景与边框；主按钮用 accent 填充
+- 终端背景在 TerminalView 里绘制 `BG_TERMINAL`；SFTP/主机列表行 hover/选中用 `ACCENT_SOFT` 圆角底
+- 主机条目支持单击选中、双击连接
+
 ## 关键约定
 
 - 集成测试依赖本地测试 sshd：`/usr/sbin/sshd -f /tmp/kun-test-sshd/sshd_config`（端口 2222、公钥认证、含 sftp subsystem）

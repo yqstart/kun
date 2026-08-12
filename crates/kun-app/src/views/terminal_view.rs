@@ -84,6 +84,10 @@ impl TerminalView {
         let ctx = ui.ctx().clone();
         let term_arc = self.session.term();
 
+        // 终端区域背景（最深一档，对齐 MiroCode 终端色）。
+        ui.painter()
+            .rect_filled(ui.min_rect(), 0.0, crate::theme::miro::BG_TERMINAL);
+
         // ==================== 事件泵 ====================
         for event in self.session.drain_events() {
             match event {
@@ -396,6 +400,9 @@ impl TerminalView {
         let mode = self.last_mode;
         let cell_height = self.cell_height;
         let ctx = ui.ctx().clone();
+        // 滚动后需要重绘；不能在 ui.input 闭包内调用 request_repaint
+        // （Context 锁已被 input 持有，会自死锁 10 秒后 panic），用 flag 延后。
+        let mut need_repaint = false;
 
         ui.input(|i| {
             for event in &i.events {
@@ -475,7 +482,7 @@ impl TerminalView {
                                 } else {
                                     guard.grid_mut().scroll_display(Scroll::PageDown);
                                 }
-                                ctx.request_repaint();
+                                need_repaint = true;
                                 0
                             }
                         };
@@ -492,13 +499,17 @@ impl TerminalView {
                             } else {
                                 grid.scroll_display(Scroll::Delta(lines));
                             }
-                            ctx.request_repaint();
+                            need_repaint = true;
                         }
                     }
                     _ => {}
                 }
             }
         });
+
+        if need_repaint {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -839,5 +850,53 @@ mod tests {
         // 不应有重复 "aa"。
         let text = grid_text(view.borrow().session());
         assert!(!text.contains("aa"), "字符重复写入，终端内容：\n{text}");
+    }
+}
+
+#[cfg(test)]
+mod deadlock_tests {
+    use super::*;
+    use kun_core::terminal::{Session, SessionOptions};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    /// 回归测试：滚轮事件不应在 ui.input 闭包内触发 request_repaint（会自死锁 panic）。
+    #[test]
+    fn 滚轮滚动不死锁() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        // 跑几帧让 zsh 就绪。
+        for _ in 0..6 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // 注入滚轮事件（Point/Line/Page 三种单位）。
+        for unit in [
+            egui::MouseWheelUnit::Point,
+            egui::MouseWheelUnit::Line,
+            egui::MouseWheelUnit::Page,
+        ] {
+            harness.event(egui::Event::MouseWheel {
+                unit,
+                delta: egui::Vec2::new(0.0, 3.0),
+                modifiers: egui::Modifiers::default(),
+                phase: egui::TouchPhase::Move,
+            });
+            harness.step();
+            harness.step();
+        }
+        // 若修复失效，此处会在 10 秒死锁后 panic；到达这里说明通过。
     }
 }

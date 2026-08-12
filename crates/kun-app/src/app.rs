@@ -172,7 +172,11 @@ impl KunApp {
             ui.add_space(4.0);
             ui.label(egui::RichText::new("kun").strong());
             ui.separator();
-            if ui.button("新建连接").clicked() {
+            let new_conn_btn = egui::Button::new("新建连接")
+                .fill(crate::theme::miro::ACCENT)
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(crate::theme::miro::RADIUS_SM);
+            if ui.add(new_conn_btn).clicked() {
                 self.show_new_conn = true;
             }
             if ui.button("本地终端").clicked() {
@@ -207,32 +211,73 @@ impl KunApp {
 
     /// 渲染左侧主机列表。
     fn host_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.heading("主机");
         ui.add_space(2.0);
-        if ui.button("新建连接").clicked() {
+        ui.label(
+            egui::RichText::new("主机")
+                .size(13.0)
+                .color(crate::theme::miro::TEXT_SECONDARY)
+                .strong(),
+        );
+        ui.add_space(4.0);
+        if ui
+            .add(
+                egui::Button::new("新建连接")
+                    .fill(crate::theme::miro::ACCENT)
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(crate::theme::miro::RADIUS_SM),
+            )
+            .clicked()
+        {
             self.show_new_conn = true;
         }
+        ui.add_space(2.0);
         ui.separator();
 
         if self.config.hosts.is_empty() {
-            ui.weak("暂无已保存主机");
+            ui.label(egui::RichText::new("暂无已保存主机").color(crate::theme::miro::TEXT_MUTED));
         }
         let mut remove_idx: Option<usize> = None;
         let mut connect_idx: Option<usize> = None;
+        let mut selected_host: Option<usize> = None;
         for (i, host) in self.config.hosts.iter().enumerate() {
-            ui.horizontal(|ui| {
-                if ui.button("连接").on_hover_text("连接到该主机").clicked() {
-                    connect_idx = Some(i);
-                }
-                ui.vertical(|ui| {
-                    ui.label(&host.name);
-                    ui.weak(format!("{}@{}", host.user, host.host));
-                });
-                if ui.button("删除").on_hover_text("删除该主机").clicked() {
-                    remove_idx = Some(i);
-                }
-            });
+            // 主机行：整行可点击（单击选中，双击连接），hover 显示 accent-soft 底。
+            let row_id = egui::Id::new(("host_row", i));
+            let row_response = ui
+                .scope_builder(egui::UiBuilder::new().id_salt(row_id), |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("连接").on_hover_text("连接到该主机").clicked() {
+                            connect_idx = Some(i);
+                        }
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(&host.name)
+                                    .color(crate::theme::miro::TEXT_PRIMARY),
+                            );
+                            ui.weak(format!("{}@{}", host.user, host.host));
+                        });
+                        if ui.button("删除").on_hover_text("删除该主机").clicked() {
+                            remove_idx = Some(i);
+                        }
+                    });
+                })
+                .response
+                .interact(egui::Sense::click());
+            if row_response.clicked() {
+                selected_host = Some(i);
+            }
+            // 双击条目直接连接（常见交互，也便于鼠标操作）。
+            if row_response.double_clicked() {
+                connect_idx = Some(i);
+            }
+            // 选中/hover 行：accent-soft 底 + 圆角。
+            if selected_host == Some(i) || row_response.hovered() {
+                let rect = row_response.rect.expand(2.0);
+                ui.painter().rect_filled(
+                    rect,
+                    crate::theme::miro::RADIUS_ITEM,
+                    crate::theme::miro::ACCENT_SOFT,
+                );
+            }
         }
         if let Some(i) = connect_idx {
             let profile = self.config.hosts[i].clone();
@@ -403,22 +448,39 @@ impl eframe::App for KunApp {
         self.poll_sftp();
 
         // ==================== 左侧主机栏 ====================
+        let sidebar_frame = egui::Frame::new()
+            .fill(crate::theme::miro::BG_PANEL)
+            .inner_margin(egui::Margin::symmetric(10, 10))
+            .stroke(egui::Stroke::new(1.0, crate::theme::miro::BORDER_SUBTLE));
         egui::Panel::left("hosts")
             .default_size(220.0)
             .resizable(true)
+            .frame(sidebar_frame)
             .show(ui, |ui| {
                 self.host_sidebar(ui);
             });
 
         // ==================== 顶部工具栏 ====================
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            self.toolbar(ui);
-        });
+        let toolbar_frame = egui::Frame::new()
+            .fill(crate::theme::miro::BG_HEADER)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .stroke(egui::Stroke::new(1.0, crate::theme::miro::BORDER_SUBTLE));
+        egui::Panel::top("toolbar")
+            .frame(toolbar_frame)
+            .show(ui, |ui| {
+                self.toolbar(ui);
+            });
 
         // ==================== 状态栏 ====================
-        egui::Panel::bottom("status").show(ui, |ui| {
-            self.status_bar(ui);
-        });
+        let status_frame = egui::Frame::new()
+            .fill(crate::theme::miro::BG_PANEL)
+            .inner_margin(egui::Margin::symmetric(10, 4))
+            .stroke(egui::Stroke::new(1.0, crate::theme::miro::BORDER_SUBTLE));
+        egui::Panel::bottom("status")
+            .frame(status_frame)
+            .show(ui, |ui| {
+                self.status_bar(ui);
+            });
 
         // ==================== 中央区：终端 | SFTP 分栏 ====================
         egui::CentralPanel::default().show(ui, |ui| {
@@ -430,9 +492,14 @@ impl eframe::App for KunApp {
             } else if let Some(terminal) = &mut self.terminal {
                 // SFTP 面板存在时水平分栏（终端左，SFTP 右，可拖拽）。
                 if self.sftp.is_some() {
+                    let sftp_frame = egui::Frame::new()
+                        .fill(crate::theme::miro::BG_PANEL)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .stroke(egui::Stroke::new(1.0, crate::theme::miro::BORDER_SUBTLE));
                     egui::Panel::right("sftp_panel")
                         .default_size(360.0)
                         .resizable(true)
+                        .frame(sftp_frame)
                         .show(ui, |ui| {
                             if let Some(sftp) = &mut self.sftp {
                                 sftp.show(ui);
@@ -658,5 +725,175 @@ mod app_tests {
             harness.query_all_by_label("取消").next().is_some(),
             "取消按钮缺失"
         );
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use kun_core::config::Auth;
+
+    /// 测试主机（需本地测试 sshd 运行，见 scripts/test-sshd.sh）。
+    fn test_profile() -> HostProfile {
+        let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
+            format!(
+                "{}/.ssh/id_ed25519",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        });
+        HostProfile {
+            name: "链路测试".into(),
+            host: std::env::var("KUN_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("KUN_TEST_PORT")
+                .unwrap_or_else(|_| "2222".into())
+                .parse()
+                .unwrap(),
+            user: std::env::var("KUN_TEST_USER")
+                .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "root".into())),
+            auth: Auth::Key {
+                path: key_path.into(),
+                passphrase: None,
+            },
+        }
+    }
+
+    /// 端到端：点击侧栏"连接"按钮 → 远程终端 + SFTP 面板出现。
+    /// （回归测试：用户报告点击后崩溃闪退，此前为 ui.input 闭包内 request_repaint 死锁）
+    #[test]
+    fn 点击连接建立远程会话() {
+        use kittest::Queryable;
+        use std::time::{Duration, Instant};
+
+        // 预写主机配置（测试后清理）。
+        let profile = test_profile();
+        if let Auth::Key { path, .. } = &profile.auth {
+            if !path.exists() {
+                eprintln!("跳过：测试私钥不存在");
+                return;
+            }
+        }
+        let config_path = default_config_path();
+        let config = HostConfig {
+            hosts: vec![profile],
+        };
+        config.save(&config_path).expect("写入测试配置失败");
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run();
+
+        // 点击侧栏条目的"连接"按钮。
+        harness.get_by_label("连接").click();
+
+        // 轮询等待 SFTP 面板出现（连接完成）。
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut connected = false;
+        while Instant::now() < deadline {
+            for _ in 0..5 {
+                harness.step();
+            }
+            if harness
+                .root()
+                .query_all_by_label("SFTP · 链路测试")
+                .next()
+                .is_some()
+            {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // 清理测试配置。
+        std::fs::remove_file(&config_path).ok();
+
+        assert!(connected, "点击连接后未出现 SFTP 面板（连接失败或崩溃）");
+        // 远程终端 + SFTP 面板并存。
+        harness.get_by_label("上传");
+        harness.get_by_label("刷新");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    /// 连接测试 sshd 后渲染应用界面并保存截图（供视觉验证）。
+    #[test]
+    fn 生成连接后样式截图() {
+        use kittest::Queryable;
+        use kun_core::config::Auth;
+        use std::time::{Duration, Instant};
+
+        let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
+            format!(
+                "{}/.ssh/id_ed25519",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        });
+        let profile = HostProfile {
+            // 与连接链路测试同名，避免并发写 hosts.toml 相互覆盖。
+            name: "链路测试".into(),
+            host: std::env::var("KUN_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("KUN_TEST_PORT")
+                .unwrap_or_else(|_| "2222".into())
+                .parse()
+                .unwrap(),
+            user: std::env::var("KUN_TEST_USER")
+                .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "root".into())),
+            auth: Auth::Key {
+                path: key_path.into(),
+                passphrase: None,
+            },
+        };
+        if let Auth::Key { path, .. } = &profile.auth {
+            if !path.exists() {
+                eprintln!("跳过：测试私钥不存在");
+                return;
+            }
+        }
+        let config_path = default_config_path();
+        let config = HostConfig {
+            hosts: vec![profile],
+        };
+        config.save(&config_path).expect("写入测试配置失败");
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run();
+        harness.get_by_label("连接").click();
+
+        // 等待 SFTP 面板出现（并发测试可能竞争配置文件，失败时重写重试）。
+        let mut connected = false;
+        for _attempt in 0..3 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                for _ in 0..5 {
+                    harness.step();
+                }
+                if harness
+                    .root()
+                    .query_all_by_label("SFTP · 链路测试")
+                    .next()
+                    .is_some()
+                {
+                    connected = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if connected {
+                break;
+            }
+            // 配置可能被并发测试删除，重新写入并重启应用。
+            config.save(&config_path).ok();
+            harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+            harness.run();
+            harness.get_by_label("连接").click();
+        }
+        assert!(connected, "连接失败，无法生成截图");
+
+        // 渲染并保存。
+        let img = harness.render().expect("渲染失败");
+        let out = "/tmp/kun_style_sftp.png";
+        img.save(out).expect("保存截图失败");
+        eprintln!("样式截图已保存：{out}");
     }
 }

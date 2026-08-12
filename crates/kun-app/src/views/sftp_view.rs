@@ -225,7 +225,11 @@ impl SftpView {
                 self.handle.list(&parent);
                 self.loading = true;
             }
-            ui.label(RichText::new(&self.current_path).monospace());
+            ui.label(
+                RichText::new(&self.current_path)
+                    .monospace()
+                    .color(crate::theme::miro::TEXT_MUTED),
+            );
         });
 
         // ==================== 错误提示 ====================
@@ -305,7 +309,7 @@ impl SftpView {
                     self.selected = Some(name);
                 }
                 if self.entries.is_empty() && !self.loading {
-                    ui.weak("空目录");
+                    ui.label(RichText::new("空目录").color(crate::theme::miro::TEXT_MUTED));
                 }
             });
 
