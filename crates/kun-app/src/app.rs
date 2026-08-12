@@ -170,7 +170,11 @@ impl KunApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("kun").strong());
+            ui.label(
+                egui::RichText::new("kun")
+                    .strong()
+                    .color(crate::theme::miro::ACCENT),
+            );
             ui.separator();
             let new_conn_btn = egui::Button::new("新建连接")
                 .fill(crate::theme::miro::ACCENT)
@@ -207,6 +211,13 @@ impl KunApp {
                 }
             });
         });
+
+        // 工具栏底部 accent 渐变细线（紫 → 青）。
+        let rect = egui::Rect::from_min_max(
+            ui.min_rect().left_top(),
+            egui::pos2(ui.min_rect().right(), ui.min_rect().top() + 2.0),
+        );
+        draw_gradient_line(ui, rect);
     }
 
     /// 渲染左侧主机列表。
@@ -269,7 +280,7 @@ impl KunApp {
             if row_response.double_clicked() {
                 connect_idx = Some(i);
             }
-            // 选中/hover 行：accent-soft 底 + 圆角。
+            // 选中/hover 行：accent-soft 底 + 圆角；选中时左侧 2px accent 指示条。
             if selected_host == Some(i) || row_response.hovered() {
                 let rect = row_response.rect.expand(2.0);
                 ui.painter().rect_filled(
@@ -277,6 +288,16 @@ impl KunApp {
                     crate::theme::miro::RADIUS_ITEM,
                     crate::theme::miro::ACCENT_SOFT,
                 );
+                if selected_host == Some(i) {
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), rect.top() + 3.0),
+                            egui::pos2(rect.left() + 2.0, rect.bottom() - 3.0),
+                        ),
+                        2.0,
+                        crate::theme::miro::ACCENT,
+                    );
+                }
             }
         }
         if let Some(i) = connect_idx {
@@ -396,11 +417,14 @@ impl KunApp {
             if let Some(terminal) = &self.terminal {
                 let session = terminal.session();
                 let title = session.title();
-                ui.label(if title.is_empty() {
-                    "本地终端".to_string()
-                } else {
-                    title
-                });
+                ui.label(
+                    egui::RichText::new(if title.is_empty() {
+                        "本地终端".to_string()
+                    } else {
+                        title
+                    })
+                    .color(crate::theme::miro::TEXT_SECONDARY),
+                );
                 if session.has_exited() {
                     ui.colored_label(egui::Color32::from_rgb(0xff, 0x55, 0x55), "会话已退出");
                 }
@@ -419,6 +443,28 @@ impl KunApp {
                 ui.weak("⌘N 新建连接  ⌘1 本地终端");
             });
         });
+    }
+}
+
+/// 绘制 accent 渐变横线（紫 → 青）。
+fn draw_gradient_line(ui: &egui::Ui, rect: egui::Rect) {
+    let painter = ui.painter();
+    let steps = 6;
+    let colors = [
+        egui::Color32::from_rgb(0x8b, 0x5c, 0xf6), // 紫
+        egui::Color32::from_rgb(0x9a, 0x6c, 0xf0),
+        egui::Color32::from_rgb(0xa9, 0x7c, 0xea),
+        egui::Color32::from_rgb(0x7c, 0xa8, 0xf0),
+        egui::Color32::from_rgb(0x4f, 0xd4, 0xf6),
+        egui::Color32::from_rgb(0x22, 0xd3, 0xee), // 青
+    ];
+    let w = rect.width() / steps as f32;
+    for (i, color) in colors.iter().enumerate() {
+        let seg = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + w * i as f32, rect.top()),
+            egui::pos2(rect.left() + w * (i + 1) as f32, rect.bottom()),
+        );
+        painter.rect_filled(seg, 0.0, *color);
     }
 }
 

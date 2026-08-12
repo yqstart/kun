@@ -3,6 +3,7 @@
 //! 借鉴 MiroCode（Tauri + Vue 代码编辑器）的视觉体系：
 //! macOS 原生风深色主题——分层明度差、半透明极淡边线、紫罗兰强调色。
 
+use alacritty_terminal::vte::ansi::Rgb;
 use egui::{Color32, Context, CornerRadius, Stroke, Visuals};
 
 /// 设计 token（对齐 MiroCode `themes.css` / `tokens.css`）。
@@ -18,8 +19,8 @@ pub mod miro {
     pub const BG_PANEL: Color32 = Color32::from_rgb(0x1c, 0x1c, 0x22);
     /// 卡片 / 弹层 / 菜单（+12 阶）。
     pub const BG_ELEVATED: Color32 = Color32::from_rgb(0x28, 0x28, 0x2f);
-    /// 终端区域（最深一档）。
-    pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x06, 0x06, 0x0a);
+    /// 终端区域（紫调深色，配合 Catppuccin 调色板）。
+    pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x2e);
 
     // ==================== 边框（5% 半透明白） ====================
     /// 全部边框线。
@@ -57,6 +58,133 @@ pub mod miro {
     pub const RADIUS_SM: f32 = 10.0;
     /// 列表项内部圆角。
     pub const RADIUS_ITEM: f32 = 6.0;
+}
+
+// ==================== 终端调色板（Catppuccin Mocha） ====================
+/// 终端 16 色（基本色 + 亮色），按 NamedColor 判别值 0-15 排列。
+pub const TERM_PALETTE_16: [Rgb; 16] = [
+    // 基本色
+    Rgb {
+        r: 0x45,
+        g: 0x47,
+        b: 0x5a,
+    }, // Black
+    Rgb {
+        r: 0xf3,
+        g: 0x8b,
+        b: 0xa8,
+    }, // Red
+    Rgb {
+        r: 0xa6,
+        g: 0xe3,
+        b: 0xa1,
+    }, // Green
+    Rgb {
+        r: 0xf9,
+        g: 0xe2,
+        b: 0xaf,
+    }, // Yellow
+    Rgb {
+        r: 0x89,
+        g: 0xb4,
+        b: 0xfa,
+    }, // Blue
+    Rgb {
+        r: 0xf5,
+        g: 0xc2,
+        b: 0xe7,
+    }, // Magenta（粉）
+    Rgb {
+        r: 0x94,
+        g: 0xe2,
+        b: 0xd5,
+    }, // Cyan
+    Rgb {
+        r: 0xba,
+        g: 0xc2,
+        b: 0xde,
+    }, // White
+    // 亮色
+    Rgb {
+        r: 0x58,
+        g: 0x5b,
+        b: 0x70,
+    }, // BrightBlack
+    Rgb {
+        r: 0xf3,
+        g: 0x8b,
+        b: 0xa8,
+    }, // BrightRed
+    Rgb {
+        r: 0xa6,
+        g: 0xe3,
+        b: 0xa1,
+    }, // BrightGreen
+    Rgb {
+        r: 0xf9,
+        g: 0xe2,
+        b: 0xaf,
+    }, // BrightYellow
+    Rgb {
+        r: 0x89,
+        g: 0xb4,
+        b: 0xfa,
+    }, // BrightBlue
+    Rgb {
+        r: 0xf5,
+        g: 0xc2,
+        b: 0xe7,
+    }, // BrightMagenta
+    Rgb {
+        r: 0x94,
+        g: 0xe2,
+        b: 0xd5,
+    }, // BrightCyan
+    Rgb {
+        r: 0xa6,
+        g: 0xad,
+        b: 0xc8,
+    }, // BrightWhite
+];
+
+/// 终端前景。
+pub const TERM_FG: Rgb = Rgb {
+    r: 0xcd,
+    g: 0xd6,
+    b: 0xf4,
+};
+/// 终端背景（紫调深色）。
+pub const TERM_BG: Rgb = Rgb {
+    r: 0x1e,
+    g: 0x1e,
+    b: 0x2e,
+};
+/// 终端光标色。
+pub const TERM_CURSOR: Rgb = Rgb {
+    r: 0xf5,
+    g: 0xc2,
+    b: 0xe7,
+};
+
+/// xterm 256 色表（16 基本 + 216 立方色 + 24 灰阶）。
+pub fn xterm256(index: u8) -> Rgb {
+    if index < 16 {
+        TERM_PALETTE_16[index as usize]
+    } else if index < 232 {
+        let n = index - 16;
+        let r = n / 36;
+        let g = (n % 36) / 6;
+        let b = n % 6;
+        let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+        Rgb {
+            r: level(r),
+            g: level(g),
+            b: level(b),
+        }
+    } else {
+        let v = 8 + (index - 232) * 10;
+        Rgb { r: v, g: v, b: v }
+    }
 }
 
 /// 应用深色主题（MiroCode 风格）。

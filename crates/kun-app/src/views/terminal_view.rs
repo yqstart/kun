@@ -128,16 +128,8 @@ impl TerminalView {
             let guard = term_arc.lock();
             let content = guard.renderable_content();
             let colors = content.colors;
-            let default_fg = colors[NamedColor::Foreground].unwrap_or(Rgb {
-                r: 0xf8,
-                g: 0xf8,
-                b: 0xf2,
-            });
-            let default_bg = colors[NamedColor::Background].unwrap_or(Rgb {
-                r: 0x28,
-                g: 0x2a,
-                b: 0x36,
-            });
+            let default_fg = colors[NamedColor::Foreground].unwrap_or(crate::theme::TERM_FG);
+            let default_bg = colors[NamedColor::Background].unwrap_or(crate::theme::TERM_BG);
             self.last_mode = content.mode;
             let mode = content.mode;
             let cursor = content.cursor;
@@ -287,7 +279,7 @@ impl TerminalView {
             if cursor_visible && cursor.shape != CursorShape::Hidden {
                 let (line, col) = (cursor.point.line.0 as usize, cursor.point.column.0);
                 if line < self.rows as usize && col < self.cols as usize {
-                    let color = colors[NamedColor::Cursor].unwrap_or(default_fg);
+                    let color = colors[NamedColor::Cursor].unwrap_or(crate::theme::TERM_CURSOR);
                     cursor_color = Some(to_egui(color));
                     cursor_rect = Some(Rect::from_min_size(
                         ui.min_rect().min
@@ -515,19 +507,43 @@ impl TerminalView {
 
 // ==================== 辅助函数 ====================
 
-/// 解析终端颜色为 egui 颜色（含粗体 → 亮色映射）。
+/// 解析终端颜色为 egui 颜色（Catppuccin 调色板 + xterm 256 色表）。
+///
+/// 优先级：程序直接指定颜色（Spec）> OSC 动态覆盖（term.colors）> 内置调色板。
 fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Color32 {
     match color {
         AColor::Spec(rgb) => to_egui(rgb),
         AColor::Named(n) => {
-            let mut idx = n as usize;
-            // 粗体时将基本色映射到亮色（参照 Alacritty 默认行为）。
-            if bold && idx < 8 {
-                idx += 8;
+            // OSC 覆盖优先（终端程序动态改色）。
+            if let Some(rgb) = colors[n as usize] {
+                return to_egui(rgb);
             }
-            colors[idx].map(to_egui).unwrap_or(to_egui(default))
+            match n {
+                NamedColor::Foreground => to_egui(default),
+                NamedColor::Background => to_egui(default),
+                NamedColor::Cursor => to_egui(crate::theme::TERM_CURSOR),
+                _ => {
+                    let mut idx = n as usize;
+                    // 粗体时将基本色映射到亮色（参照 Alacritty 默认行为）。
+                    if bold && idx < 8 {
+                        idx += 8;
+                    }
+                    if idx < 16 {
+                        to_egui(crate::theme::TERM_PALETTE_16[idx])
+                    } else {
+                        // 其余命名色（Dim 系等）用 256 色表兜底。
+                        to_egui(crate::theme::xterm256(idx as u8))
+                    }
+                }
+            }
         }
-        AColor::Indexed(i) => colors[i as usize].map(to_egui).unwrap_or(to_egui(default)),
+        AColor::Indexed(i) => {
+            // OSC 覆盖优先。
+            if let Some(rgb) = colors[i as usize] {
+                return to_egui(rgb);
+            }
+            to_egui(crate::theme::xterm256(i))
+        }
     }
 }
 

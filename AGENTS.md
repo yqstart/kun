@@ -62,6 +62,8 @@ crates/
 - 面板用 `Panel::frame(Frame)` 指定背景与边框；主按钮用 accent 填充
 - 终端背景在 TerminalView 里绘制 `BG_TERMINAL`；SFTP/主机列表行 hover/选中用 `ACCENT_SOFT` 圆角底
 - 主机条目支持单击选中、双击连接
+- 终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）在渲染层解析（`theme.rs::TERM_PALETTE_16`/`xterm256`），优先级：Spec > OSC 覆盖（term.colors）> 内置调色板；`Term.colors` 默认全 None，不设调色板则全部渲染为白色
+- 工具栏底部有紫→青渐变指示线（`draw_gradient_line`）；选中主机条目左侧 2px accent 竖条
 
 ## 关键约定
 
