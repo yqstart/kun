@@ -1,21 +1,32 @@
 //! SFTP 集成测试：连接本地测试 sshd，验证列表/上传/下载/删除/重命名/新建目录。
 
-use tokio::sync::mpsc::UnboundedReceiver;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use kun_core::config::{Auth, HostProfile};
-use kun_core::ssh::sftp::{SftpEvent, connect_sftp};
+use kun_core::ssh::sftp::{connect_sftp, SftpEvent};
 
 /// 测试主机（与 ssh_remote.rs 相同的测试 sshd）。
 fn test_profile() -> HostProfile {
-    let key_path = std::env::var("KUN_TEST_KEY")
-        .unwrap_or_else(|_| format!("{}/.ssh/id_ed25519", std::env::var("HOME").unwrap_or_default()));
+    let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
+        format!(
+            "{}/.ssh/id_ed25519",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
     HostProfile {
         name: "SFTP 集成测试".into(),
         host: std::env::var("KUN_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-        port: std::env::var("KUN_TEST_PORT").unwrap_or_else(|_| "2222".into()).parse().unwrap(),
-        user: std::env::var("KUN_TEST_USER").unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "root".into())),
-        auth: Auth::Key { path: key_path.into(), passphrase: None },
+        port: std::env::var("KUN_TEST_PORT")
+            .unwrap_or_else(|_| "2222".into())
+            .parse()
+            .unwrap(),
+        user: std::env::var("KUN_TEST_USER")
+            .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "root".into())),
+        auth: Auth::Key {
+            path: key_path.into(),
+            passphrase: None,
+        },
     }
 }
 
@@ -55,8 +66,10 @@ fn sftp_完整操作流程() {
     let (_thread, handle, mut rx) = connect_sftp(&profile);
 
     // ============ 1. 连接就绪 ============
-    let mut seen = wait_event(&mut rx, Duration::from_secs(10), |ev| matches!(ev, SftpEvent::Ready))
-        .expect("SFTP 连接失败");
+    let mut seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
+        matches!(ev, SftpEvent::Ready)
+    })
+    .expect("SFTP 连接失败");
     if let Some(SftpEvent::Failed(e)) = seen.iter().find(|e| matches!(e, SftpEvent::Failed(_))) {
         panic!("SFTP 连接失败：{e:?}");
     }
@@ -65,13 +78,18 @@ fn sftp_完整操作流程() {
     // ============ 2. 列出家目录 ============
     let remote_home = format!("/Users/{}", profile.user);
     handle.list(&remote_home);
-    let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| matches!(ev, SftpEvent::Listed { .. }))
-        .expect("列出目录失败");
+    let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
+        matches!(ev, SftpEvent::Listed { .. })
+    })
+    .expect("列出目录失败");
     let entries = match seen.last().unwrap() {
         SftpEvent::Listed { entries, .. } => entries,
         _ => unreachable!(),
     };
-    assert!(entries.iter().any(|e| e.name == "Desktop"), "家目录应包含 Desktop");
+    assert!(
+        entries.iter().any(|e| e.name == "Desktop"),
+        "家目录应包含 Desktop"
+    );
 
     // ============ 3. 上传 ============
     let local_file = std::env::temp_dir().join("kun_sftp_test_upload.txt");
@@ -85,14 +103,18 @@ fn sftp_完整操作流程() {
 
     // ============ 4. 验证远程文件存在 ============
     handle.list(&remote_home);
-    let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| matches!(ev, SftpEvent::Listed { .. }))
-        .expect("重新列出失败");
+    let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
+        matches!(ev, SftpEvent::Listed { .. })
+    })
+    .expect("重新列出失败");
     let entries = match seen.last().unwrap() {
         SftpEvent::Listed { entries, .. } => entries,
         _ => unreachable!(),
     };
     assert!(
-        entries.iter().any(|e| e.name == "kun_sftp_test_upload.txt" && e.size == 22),
+        entries
+            .iter()
+            .any(|e| e.name == "kun_sftp_test_upload.txt" && e.size == 22),
         "上传文件应存在且大小正确，实际：{entries:?}"
     );
 
@@ -137,8 +159,10 @@ fn sftp_完整操作流程() {
 
     // ============ 8. 验证清理干净 ============
     handle.list(&remote_home);
-    let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| matches!(ev, SftpEvent::Listed { .. }))
-        .expect("最终列出失败");
+    let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
+        matches!(ev, SftpEvent::Listed { .. })
+    })
+    .expect("最终列出失败");
     let entries = match seen.last().unwrap() {
         SftpEvent::Listed { entries, .. } => entries,
         _ => unreachable!(),

@@ -12,7 +12,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, Term};
 use alacritty_terminal::vte::ansi::Processor;
 use russh::client;
-use russh::keys::{HashAlg, PrivateKeyWithHashAlg, decode_secret_key};
+use russh::keys::{decode_secret_key, HashAlg, PrivateKeyWithHashAlg};
 use russh::{Channel, ChannelMsg};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
@@ -60,7 +60,10 @@ pub fn connect_remote(
     cols: u16,
     rows: u16,
     on_event: EventHandler,
-) -> (std::thread::JoinHandle<()>, UnboundedReceiver<ConnectResult>) {
+) -> (
+    std::thread::JoinHandle<()>,
+    UnboundedReceiver<ConnectResult>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
     let profile = profile.clone();
     let handle = std::thread::spawn(move || {
@@ -126,8 +129,14 @@ pub fn connect_remote(
             let shared = Arc::new(Shared::default());
             let term: Arc<FairMutex<Term<Listener>>> = Arc::new(FairMutex::new(Term::new(
                 term::Config::default(),
-                &TermSize { rows: rows as usize, cols: cols as usize },
-                Listener { shared: shared.clone(), on_event: on_event.clone() },
+                &TermSize {
+                    rows: rows as usize,
+                    cols: cols as usize,
+                },
+                Listener {
+                    shared: shared.clone(),
+                    on_event: on_event.clone(),
+                },
             )));
 
             // ============ 4. 命令队列（UI → 后台） ============
@@ -154,14 +163,13 @@ pub fn connect_remote(
             let writer_tx = cmd_tx.clone();
             let resizer_tx = cmd_tx.clone();
             let shuttor_tx = cmd_tx.clone();
-            let writer: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |bytes: &[u8]| {
+            let writer = crate::terminal::Writer::new(move |bytes: &[u8]| {
                 let _ = writer_tx.send(SessionCmd::Write(bytes.to_vec()));
             });
-            let resizer: Arc<dyn Fn(u16, u16) + Send + Sync> =
-                Arc::new(move |cols: u16, rows: u16| {
-                    let _ = resizer_tx.send(SessionCmd::Resize(cols, rows));
-                });
-            let shuttor: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let resizer = crate::terminal::Resizer::new(move |cols: u16, rows: u16| {
+                let _ = resizer_tx.send(SessionCmd::Resize(cols, rows));
+            });
+            let shuttor = crate::terminal::Shuttor::new(move || {
                 let _ = shuttor_tx.send(SessionCmd::Shutdown);
             });
 
@@ -262,7 +270,8 @@ pub(crate) async fn authenticate(
             .map_err(|e| format!("认证失败：{e}"))?
             .success(),
         Auth::Key { path, passphrase } => {
-            let key = load_private_key(path, passphrase.as_deref()).map_err(|e| format!("加载私钥失败：{e}"))?;
+            let key = load_private_key(path, passphrase.as_deref())
+                .map_err(|e| format!("加载私钥失败：{e}"))?;
             let key = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
             handle
                 .authenticate_publickey(&profile.user, key)

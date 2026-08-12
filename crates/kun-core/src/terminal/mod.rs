@@ -97,11 +97,48 @@ impl EventListener for Listener {
 }
 
 /// 写目标：非阻塞写入字节到会话（本地 → EventLoopSender，远程 → 命令队列）。
-type Writer = Arc<dyn Fn(&[u8]) + Send + Sync>;
+pub type WriteFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+#[derive(Clone)]
+pub struct Writer(WriteFn);
+
+impl Writer {
+    pub fn new(f: impl Fn(&[u8]) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub fn write(&self, bytes: &[u8]) {
+        (self.0)(bytes);
+    }
+}
+
 /// 尺寸调整目标：非阻塞通知后台调整窗口尺寸。
-type Resizer = Arc<dyn Fn(u16, u16) + Send + Sync>;
+#[derive(Clone)]
+pub struct Resizer(Arc<dyn Fn(u16, u16) + Send + Sync>);
+
+impl Resizer {
+    pub fn new(f: impl Fn(u16, u16) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        (self.0)(cols, rows);
+    }
+}
+
 /// 关闭目标。
-type Shuttor = Arc<dyn Fn() + Send + Sync>;
+#[derive(Clone)]
+pub struct Shuttor(Arc<dyn Fn() + Send + Sync>);
+
+impl Shuttor {
+    pub fn new(f: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub fn shutdown(&self) {
+        (self.0)();
+    }
+}
 
 /// 终端会话（本地或远程 shell 的统一封装）。
 pub struct Session {
@@ -113,17 +150,12 @@ pub struct Session {
 }
 
 /// 会话创建参数（本地）。
+#[derive(Default)]
 pub struct SessionOptions {
     /// 要启动的 shell 程序，None 表示系统默认 shell。
     pub shell: Option<String>,
     /// 启动目录。
     pub working_directory: Option<PathBuf>,
-}
-
-impl Default for SessionOptions {
-    fn default() -> Self {
-        Self { shell: None, working_directory: None }
-    }
 }
 
 impl Session {
@@ -135,7 +167,13 @@ impl Session {
         resizer: Resizer,
         shuttor: Shuttor,
     ) -> Session {
-        Session { term, shared, writer, resizer, shuttor }
+        Session {
+            term,
+            shared,
+            writer,
+            resizer,
+            shuttor,
+        }
     }
 
     /// 启动一个本地 PTY 会话。
@@ -151,7 +189,9 @@ impl Session {
         let config = term::Config::default();
 
         // 创建 PTY（macOS/Unix 平台）。
-        let shell = options.shell.map(|program| tty::Shell::new(program, Vec::new()));
+        let shell = options
+            .shell
+            .map(|program| tty::Shell::new(program, Vec::new()));
         let pty_options = tty::Options {
             shell,
             working_directory: options.working_directory,
@@ -169,30 +209,41 @@ impl Session {
         // 创建终端状态机。
         let term = Arc::new(FairMutex::new(Term::new(
             config,
-            &TermSize { rows: rows as usize, cols: cols as usize },
-            Listener { shared: shared.clone(), on_event: Arc::new(|_| {}) },
+            &TermSize {
+                rows: rows as usize,
+                cols: cols as usize,
+            },
+            Listener {
+                shared: shared.clone(),
+                on_event: Arc::new(|_| {}),
+            },
         )));
 
         // 创建事件循环（PTY 读取线程）。
         let event_loop = EventLoop::new(
             term.clone(),
-            Listener { shared: shared.clone(), on_event: on_event.clone() },
+            Listener {
+                shared: shared.clone(),
+                on_event: on_event.clone(),
+            },
             pty,
             true,
             false,
         )?;
         let channel = event_loop.channel();
-        let _thread: JoinHandle<(EventLoop<tty::Pty, Listener>, alacritty_terminal::event_loop::State)> =
-            event_loop.spawn();
+        let _thread: JoinHandle<(
+            EventLoop<tty::Pty, Listener>,
+            alacritty_terminal::event_loop::State,
+        )> = event_loop.spawn();
 
         // 写 / 缩放 / 关闭 都走 EventLoopSender（克隆共享）。
         let writer_channel = channel.clone();
         let resizer_channel = channel.clone();
         let shuttor_channel = channel.clone();
-        let writer: Writer = Arc::new(move |bytes: &[u8]| {
+        let writer = Writer::new(move |bytes: &[u8]| {
             let _ = writer_channel.send(Msg::Input(bytes.to_vec().into()));
         });
-        let resizer: Resizer = Arc::new(move |cols: u16, rows: u16| {
+        let resizer = Resizer::new(move |cols: u16, rows: u16| {
             let _ = resizer_channel.send(Msg::Resize(WindowSize {
                 num_lines: rows,
                 num_cols: cols,
@@ -200,7 +251,7 @@ impl Session {
                 cell_height: 1,
             }));
         });
-        let shuttor: Shuttor = Arc::new(move || {
+        let shuttor = Shuttor::new(move || {
             let _ = shuttor_channel.send(Msg::Shutdown);
         });
 
@@ -214,15 +265,18 @@ impl Session {
 
     /// 写入数据（键盘输入、粘贴内容等）。
     pub fn write(&self, bytes: &[u8]) {
-        (self.writer)(bytes);
+        self.writer.write(bytes);
     }
 
     /// 调整终端尺寸（窗口 resize 时调用）。
     pub fn resize(&mut self, cols: u16, rows: u16) {
         // 同步更新终端状态机网格。
-        self.term.lock().resize(TermSize { rows: rows as usize, cols: cols as usize });
+        self.term.lock().resize(TermSize {
+            rows: rows as usize,
+            cols: cols as usize,
+        });
         // 通知后台（PTY/SSH channel）。
-        (self.resizer)(cols, rows);
+        self.resizer.resize(cols, rows);
     }
 
     /// 取出所有待处理事件（UI 每帧轮询）。
@@ -243,6 +297,13 @@ impl Session {
 
     /// 关闭会话。
     pub fn shutdown(self) {
-        (self.shuttor)();
+        self.shuttor.shutdown();
+    }
+}
+
+impl Drop for Session {
+    /// 会话被丢弃时优雅关闭后台线程。
+    fn drop(&mut self) {
+        self.shuttor.shutdown();
     }
 }

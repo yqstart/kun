@@ -9,19 +9,29 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kun_core::config::{Auth, HostProfile};
-use kun_core::ssh::{ConnectResult, connect_remote};
+use kun_core::ssh::{connect_remote, ConnectResult};
 use kun_core::terminal::{Session, SessionEvent};
 
 /// 测试主机（环境变量可覆盖，默认本地测试 sshd）。
 fn test_profile() -> HostProfile {
-    let key_path = std::env::var("KUN_TEST_KEY")
-        .unwrap_or_else(|_| format!("{}/.ssh/id_ed25519", std::env::var("HOME").unwrap_or_default()));
+    let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
+        format!(
+            "{}/.ssh/id_ed25519",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
     HostProfile {
         name: "集成测试".into(),
         host: std::env::var("KUN_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-        port: std::env::var("KUN_TEST_PORT").unwrap_or_else(|_| "2222".into()).parse().unwrap(),
+        port: std::env::var("KUN_TEST_PORT")
+            .unwrap_or_else(|_| "2222".into())
+            .parse()
+            .unwrap(),
         user: std::env::var("KUN_TEST_USER").unwrap_or_else(|_| whoami()),
-        auth: Auth::Key { path: key_path.into(), passphrase: None },
+        auth: Auth::Key {
+            path: key_path.into(),
+            passphrase: None,
+        },
     }
 }
 

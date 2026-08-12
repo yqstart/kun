@@ -10,7 +10,10 @@ pub enum Auth {
     /// 密码认证。
     Password(String),
     /// 私钥认证（路径 + 可选口令）。
-    Key { path: PathBuf, passphrase: Option<String> },
+    Key {
+        path: PathBuf,
+        passphrase: Option<String>,
+    },
 }
 
 /// 主机配置。
@@ -30,7 +33,13 @@ pub struct HostProfile {
 
 impl Default for HostProfile {
     fn default() -> Self {
-        Self { name: String::new(), host: String::new(), port: 22, user: String::new(), auth: Auth::Password(String::new()) }
+        Self {
+            name: String::new(),
+            host: String::new(),
+            port: 22,
+            user: String::new(),
+            auth: Auth::Password(String::new()),
+        }
     }
 }
 
@@ -44,12 +53,14 @@ impl HostConfig {
     /// 加载配置文件；不存在时返回空配置。
     pub fn load(path: &std::path::Path) -> std::io::Result<HostConfig> {
         let content = std::fs::read_to_string(path)?;
-        toml::from_str(&content).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        toml::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     /// 保存配置到文件。
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let content = toml::to_string_pretty(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(path, content)
     }
 }
@@ -57,7 +68,10 @@ impl HostConfig {
 /// 默认配置文件路径：`~/.config/kun/hosts.toml`。
 pub fn default_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config").join("kun").join("hosts.toml")
+    PathBuf::from(home)
+        .join(".config")
+        .join("kun")
+        .join("hosts.toml")
 }
 
 #[cfg(test)]
@@ -71,7 +85,10 @@ mod tests {
                 host: "example.com".into(),
                 port: 22,
                 user: "root".into(),
-                auth: Auth::Key { path: PathBuf::from("~/.ssh/id_ed25519"), passphrase: None },
+                auth: Auth::Key {
+                    path: PathBuf::from("~/.ssh/id_ed25519"),
+                    passphrase: None,
+                },
             }],
         }
     }

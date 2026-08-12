@@ -41,9 +41,16 @@ pub enum SftpEvent {
     /// 连接失败。
     Failed(String),
     /// 目录列表完成。
-    Listed { path: String, entries: Vec<RemoteEntry> },
+    Listed {
+        path: String,
+        entries: Vec<RemoteEntry>,
+    },
     /// 传输进度。
-    Progress { label: String, done: u64, total: u64 },
+    Progress {
+        label: String,
+        done: u64,
+        total: u64,
+    },
     /// 操作完成。
     Done { label: String },
     /// 操作失败。
@@ -59,9 +66,18 @@ pub struct SftpHandle {
 }
 
 impl SftpHandle {
+    /// 从原始发送端构造（测试用）。
+    pub fn from_raw(cmd_tx: UnboundedSender<SftpCmd>) -> Self {
+        Self { cmd_tx }
+    }
+}
+
+impl SftpHandle {
     /// 列出远程目录。
     pub fn list(&self, path: &str) {
-        let _ = self.cmd_tx.send(SftpCmd::List { path: path.to_string() });
+        let _ = self.cmd_tx.send(SftpCmd::List {
+            path: path.to_string(),
+        });
     }
 
     /// 上传本地文件到远程。
@@ -82,17 +98,25 @@ impl SftpHandle {
 
     /// 删除远程文件或目录。
     pub fn remove(&self, path: &str, is_dir: bool) {
-        let _ = self.cmd_tx.send(SftpCmd::Remove { path: path.to_string(), is_dir });
+        let _ = self.cmd_tx.send(SftpCmd::Remove {
+            path: path.to_string(),
+            is_dir,
+        });
     }
 
     /// 重命名远程文件或目录。
     pub fn rename(&self, from: &str, to: &str) {
-        let _ = self.cmd_tx.send(SftpCmd::Rename { from: from.to_string(), to: to.to_string() });
+        let _ = self.cmd_tx.send(SftpCmd::Rename {
+            from: from.to_string(),
+            to: to.to_string(),
+        });
     }
 
     /// 新建远程目录。
     pub fn mkdir(&self, path: &str) {
-        let _ = self.cmd_tx.send(SftpCmd::Mkdir { path: path.to_string() });
+        let _ = self.cmd_tx.send(SftpCmd::Mkdir {
+            path: path.to_string(),
+        });
     }
 
     /// 关闭 SFTP 连接。
@@ -135,8 +159,7 @@ async fn sftp_main(
     log::info!("sftp_main 启动：{}:{}", profile.host, profile.port);
     let config = Arc::new(client::Config::default());
     let mut handle =
-        match client::connect(config, (profile.host.as_str(), profile.port), ClientHandler).await
-        {
+        match client::connect(config, (profile.host.as_str(), profile.port), ClientHandler).await {
             Ok(h) => h,
             Err(e) => {
                 let _ = ev_tx.send(SftpEvent::Failed(format!(
@@ -193,7 +216,10 @@ async fn sftp_main(
                         let _ = ev_tx.send(SftpEvent::Listed { path, entries });
                     }
                     Err(e) => {
-                        let _ = ev_tx.send(SftpEvent::Error { label: "列出目录".into(), message: e });
+                        let _ = ev_tx.send(SftpEvent::Error {
+                            label: "列出目录".into(),
+                            message: e,
+                        });
                     }
                 }
             }
@@ -249,7 +275,10 @@ async fn sftp_main(
                         let _ = ev_tx.send(SftpEvent::Done { label });
                     }
                     Err(e) => {
-                        let _ = ev_tx.send(SftpEvent::Error { label, message: e.to_string() });
+                        let _ = ev_tx.send(SftpEvent::Error {
+                            label,
+                            message: e.to_string(),
+                        });
                     }
                 }
             }
@@ -260,7 +289,10 @@ async fn sftp_main(
                         let _ = ev_tx.send(SftpEvent::Done { label });
                     }
                     Err(e) => {
-                        let _ = ev_tx.send(SftpEvent::Error { label, message: e.to_string() });
+                        let _ = ev_tx.send(SftpEvent::Error {
+                            label,
+                            message: e.to_string(),
+                        });
                     }
                 }
             }
@@ -271,7 +303,10 @@ async fn sftp_main(
                         let _ = ev_tx.send(SftpEvent::Done { label });
                     }
                     Err(e) => {
-                        let _ = ev_tx.send(SftpEvent::Error { label, message: e.to_string() });
+                        let _ = ev_tx.send(SftpEvent::Error {
+                            label,
+                            message: e.to_string(),
+                        });
                     }
                 }
             }
@@ -311,8 +346,14 @@ async fn upload_file(
     label: &str,
     ev_tx: &UnboundedSender<SftpEvent>,
 ) -> Result<(), String> {
-    let mut local_file = tokio::fs::File::open(local).await.map_err(|e| e.to_string())?;
-    let total = local_file.metadata().await.map_err(|e| e.to_string())?.len();
+    let mut local_file = tokio::fs::File::open(local)
+        .await
+        .map_err(|e| e.to_string())?;
+    let total = local_file
+        .metadata()
+        .await
+        .map_err(|e| e.to_string())?
+        .len();
     let mut remote_file = sftp.create(remote).await.map_err(|e| e.to_string())?;
 
     let mut done = 0u64;
@@ -322,9 +363,16 @@ async fn upload_file(
         if n == 0 {
             break;
         }
-        remote_file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
+        remote_file
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| e.to_string())?;
         done += n as u64;
-        let _ = ev_tx.send(SftpEvent::Progress { label: label.to_string(), done, total });
+        let _ = ev_tx.send(SftpEvent::Progress {
+            label: label.to_string(),
+            done,
+            total,
+        });
     }
     remote_file.close().await.map_err(|e| e.to_string())
 }
@@ -340,18 +388,30 @@ async fn download_file(
     let meta = sftp.metadata(remote).await.map_err(|e| e.to_string())?;
     let total = meta.len();
     let mut remote_file = sftp.open(remote).await.map_err(|e| e.to_string())?;
-    let mut local_file = tokio::fs::File::create(local).await.map_err(|e| e.to_string())?;
+    let mut local_file = tokio::fs::File::create(local)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mut done = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = remote_file.read(&mut buf).await.map_err(|e| e.to_string())?;
+        let n = remote_file
+            .read(&mut buf)
+            .await
+            .map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
-        local_file.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
+        local_file
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| e.to_string())?;
         done += n as u64;
-        let _ = ev_tx.send(SftpEvent::Progress { label: label.to_string(), done, total });
+        let _ = ev_tx.send(SftpEvent::Progress {
+            label: label.to_string(),
+            done,
+            total,
+        });
     }
     local_file.flush().await.map_err(|e| e.to_string())
 }

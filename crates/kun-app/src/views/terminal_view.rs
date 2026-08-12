@@ -124,10 +124,16 @@ impl TerminalView {
             let guard = term_arc.lock();
             let content = guard.renderable_content();
             let colors = content.colors;
-            let default_fg = colors[NamedColor::Foreground]
-                .unwrap_or(Rgb { r: 0xf8, g: 0xf8, b: 0xf2 });
-            let default_bg = colors[NamedColor::Background]
-                .unwrap_or(Rgb { r: 0x28, g: 0x2a, b: 0x36 });
+            let default_fg = colors[NamedColor::Foreground].unwrap_or(Rgb {
+                r: 0xf8,
+                g: 0xf8,
+                b: 0xf2,
+            });
+            let default_bg = colors[NamedColor::Background].unwrap_or(Rgb {
+                r: 0x28,
+                g: 0x2a,
+                b: 0x36,
+            });
             self.last_mode = content.mode;
             let mode = content.mode;
             let cursor = content.cursor;
@@ -137,7 +143,7 @@ impl TerminalView {
             let time = ctx.input(|i| i.time);
             let blinking = cursor_style.blinking;
             let cursor_visible = mode.contains(TermMode::SHOW_CURSOR)
-                && (!blinking || (time * 2.0) as u64 % 2 == 0);
+                && (!blinking || ((time * 2.0) as u64).is_multiple_of(2));
             if blinking {
                 ctx.request_repaint_after(Duration::from_millis(500));
             }
@@ -157,7 +163,9 @@ impl TerminalView {
                 let is_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER)
                     || cell.flags.contains(Flags::HIDDEN);
                 if is_spacer {
-                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && !cell.flags.contains(Flags::HIDDEN) {
+                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                        && !cell.flags.contains(Flags::HIDDEN)
+                    {
                         // 宽字符占位格继承前一格的背景，合并背景段。
                         let bg = resolve_color(cell.bg, colors, default_bg, false);
                         if bg != default_bg_egui {
@@ -165,10 +173,18 @@ impl TerminalView {
                                 if last.color == bg {
                                     last.end = (point.column + 1).0;
                                 } else {
-                                    backgrounds.push(BgRect { start: point.column.0, end: (point.column + 1).0, color: bg });
+                                    backgrounds.push(BgRect {
+                                        start: point.column.0,
+                                        end: (point.column + 1).0,
+                                        color: bg,
+                                    });
                                 }
                             } else {
-                                backgrounds.push(BgRect { start: point.column.0, end: (point.column + 1).0, color: bg });
+                                backgrounds.push(BgRect {
+                                    start: point.column.0,
+                                    end: (point.column + 1).0,
+                                    color: bg,
+                                });
                             }
                         }
                     }
@@ -189,7 +205,12 @@ impl TerminalView {
                 }
 
                 // 解析颜色（含粗体 → 亮色映射）。
-                let mut fg = resolve_color(cell.fg, colors, default_fg, cell.flags.contains(Flags::BOLD));
+                let mut fg = resolve_color(
+                    cell.fg,
+                    colors,
+                    default_fg,
+                    cell.flags.contains(Flags::BOLD),
+                );
                 let mut bg = resolve_color(cell.bg, colors, default_bg, false);
                 let bold = cell.flags.contains(Flags::BOLD);
                 let italic = cell.flags.contains(Flags::ITALIC);
@@ -220,15 +241,34 @@ impl TerminalView {
                         if last.color == bg {
                             last.end = (point.column + 1).0;
                         } else {
-                            backgrounds.push(BgRect { start: point.column.0, end: (point.column + 1).0, color: bg });
+                            backgrounds.push(BgRect {
+                                start: point.column.0,
+                                end: (point.column + 1).0,
+                                color: bg,
+                            });
                         }
                     } else {
-                        backgrounds.push(BgRect { start: point.column.0, end: (point.column + 1).0, color: bg });
+                        backgrounds.push(BgRect {
+                            start: point.column.0,
+                            end: (point.column + 1).0,
+                            color: bg,
+                        });
                     }
                 }
 
                 // 文本段合并。
-                push_or_merge(&mut segments, cell.c, fg, bold, italic, underline, strikeout, &mut hash);
+                push_or_merge(
+                    &mut segments,
+                    cell.c,
+                    CellStyle {
+                        fg,
+                        bold,
+                        italic,
+                        underline,
+                        strikeout,
+                    },
+                    &mut hash,
+                );
             }
             if current_line != usize::MAX {
                 lines_data.push(LineData {
@@ -261,7 +301,8 @@ impl TerminalView {
             // 绘制背景矩形（行内连续背景段）。
             for bg in &data.backgrounds {
                 let rect = Rect::from_min_size(
-                    origin + Vec2::new(bg.start as f32 * cell_width, data.line as f32 * cell_height),
+                    origin
+                        + Vec2::new(bg.start as f32 * cell_width, data.line as f32 * cell_height),
                     Vec2::new((bg.end - bg.start) as f32 * cell_width, cell_height),
                 );
                 painter.rect_filled(rect, 0.0, bg.color);
@@ -285,15 +326,26 @@ impl TerminalView {
                 }
                 CursorShape::Underline => {
                     painter.line_segment(
-                        [rect.left_bottom() + Vec2::new(0.0, -1.0), rect.right_bottom() + Vec2::new(0.0, -1.0)],
+                        [
+                            rect.left_bottom() + Vec2::new(0.0, -1.0),
+                            rect.right_bottom() + Vec2::new(0.0, -1.0),
+                        ],
                         Stroke::new(1.5, color),
                     );
                 }
                 CursorShape::Beam => {
-                    painter.line_segment([rect.left_top(), rect.left_bottom()], Stroke::new(1.5, color));
+                    painter.line_segment(
+                        [rect.left_top(), rect.left_bottom()],
+                        Stroke::new(1.5, color),
+                    );
                 }
                 CursorShape::HollowBlock => {
-                    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, color), egui::StrokeKind::Middle);
+                    painter.rect_stroke(
+                        rect,
+                        0.0,
+                        Stroke::new(1.0, color),
+                        egui::StrokeKind::Middle,
+                    );
                 }
                 CursorShape::Hidden => {}
             }
@@ -325,7 +377,13 @@ impl TerminalView {
         }
         let job = build_job(&data.segments, self.font_size);
         if self.rows_cache.len() <= data.line {
-            self.rows_cache.resize(data.line + 1, RowCache { hash: 0, job: LayoutJob::default() });
+            self.rows_cache.resize(
+                data.line + 1,
+                RowCache {
+                    hash: 0,
+                    job: LayoutJob::default(),
+                },
+            );
         }
         self.rows_cache[data.line].hash = data.hash;
         self.rows_cache[data.line].job = job;
@@ -342,7 +400,12 @@ impl TerminalView {
         ui.input(|i| {
             for event in &i.events {
                 match event {
-                    egui::Event::Key { key, modifiers, pressed, .. } => {
+                    egui::Event::Key {
+                        key,
+                        modifiers,
+                        pressed,
+                        ..
+                    } => {
                         if !*pressed {
                             continue;
                         }
@@ -389,7 +452,12 @@ impl TerminalView {
                         };
                         session.write(payload.as_bytes());
                     }
-                    egui::Event::MouseWheel { unit, delta, modifiers, .. } => {
+                    egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                        ..
+                    } => {
                         let lines = match unit {
                             egui::MouseWheelUnit::Point => (delta.y / (cell_height * 3.0)) as i32,
                             egui::MouseWheelUnit::Line => delta.y as i32,
@@ -451,46 +519,66 @@ fn to_egui(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.r, rgb.g, rgb.b)
 }
 
-/// 合并或追加一个 cell 到段列表（相同样式则追加字符）。
-fn push_or_merge(
-    segments: &mut Vec<Segment>,
-    c: char,
+/// cell 的文本样式（用于段合并判断与哈希）。
+#[derive(Clone, Copy)]
+struct CellStyle {
     fg: Color32,
     bold: bool,
     italic: bool,
     underline: bool,
     strikeout: bool,
-    hash: &mut u64,
-) {
+}
+
+impl CellStyle {
+    fn key(self) -> u64 {
+        u64::from(self.fg.r())
+            ^ (u64::from(self.fg.g()) << 8)
+            ^ (u64::from(self.fg.b()) << 16)
+            ^ (u64::from(self.bold) << 24)
+            ^ (u64::from(self.italic) << 25)
+            ^ (u64::from(self.underline) << 26)
+            ^ (u64::from(self.strikeout) << 27)
+    }
+}
+
+/// 合并或追加一个 cell 到段列表（相同样式则追加字符）。
+fn push_or_merge(segments: &mut Vec<Segment>, c: char, style: CellStyle, hash: &mut u64) {
     if let Some(last) = segments.last_mut() {
-        if last.fg == fg
-            && last.bold == bold
-            && last.italic == italic
-            && last.underline == underline
-            && last.strikeout == strikeout
+        if last.fg == style.fg
+            && last.bold == style.bold
+            && last.italic == style.italic
+            && last.underline == style.underline
+            && last.strikeout == style.strikeout
         {
             last.text.push(c);
-            *hash = hash
-                .wrapping_mul(131)
-                .wrapping_add(style_key(fg, bold, italic, underline, strikeout));
+            *hash = hash.wrapping_mul(131).wrapping_add(style.key());
             *hash = hash.wrapping_mul(131).wrapping_add(c as u64);
             return;
         }
     }
-    segments.push(Segment { text: c.to_string(), fg, bold, italic, underline, strikeout });
-    *hash = hash
-        .wrapping_mul(131)
-        .wrapping_add(style_key(fg, bold, italic, underline, strikeout));
+    segments.push(Segment {
+        text: c.to_string(),
+        fg: style.fg,
+        bold: style.bold,
+        italic: style.italic,
+        underline: style.underline,
+        strikeout: style.strikeout,
+    });
+    *hash = hash.wrapping_mul(131).wrapping_add(style.key());
     *hash = hash.wrapping_mul(131).wrapping_add(c as u64);
 }
 
 /// 样式 → 哈希键。
+#[allow(dead_code)]
 fn style_key(fg: Color32, bold: bool, italic: bool, underline: bool, strikeout: bool) -> u64 {
-    u64::from(fg.r()) ^ (u64::from(fg.g()) << 8) ^ (u64::from(fg.b()) << 16)
-        ^ (u64::from(bold) << 24)
-        ^ (u64::from(italic) << 25)
-        ^ (u64::from(underline) << 26)
-        ^ (u64::from(strikeout) << 27)
+    CellStyle {
+        fg,
+        bold,
+        italic,
+        underline,
+        strikeout,
+    }
+    .key()
 }
 
 /// 将段列表构建为 egui LayoutJob。
@@ -501,8 +589,16 @@ fn build_job(segments: &[Segment], font_size: f32) -> LayoutJob {
             font_id: FontId::monospace(font_size),
             color: seg.fg,
             italics: seg.italic,
-            underline: if seg.underline { Stroke::new(1.0, seg.fg) } else { Stroke::NONE },
-            strikethrough: if seg.strikeout { Stroke::new(1.0, seg.fg) } else { Stroke::NONE },
+            underline: if seg.underline {
+                Stroke::new(1.0, seg.fg)
+            } else {
+                Stroke::NONE
+            },
+            strikethrough: if seg.strikeout {
+                Stroke::new(1.0, seg.fg)
+            } else {
+                Stroke::NONE
+            },
             ..Default::default()
         };
         job.append(&seg.text, 0.0, format);

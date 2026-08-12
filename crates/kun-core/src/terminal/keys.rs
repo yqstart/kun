@@ -117,27 +117,51 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
         // 方向键：应用光标模式下用 SS3 编码（ESC O x）。
         Key::Up => {
             let app = mode.contains(TermMode::APP_CURSOR);
-            Some(if app { b"\x1bOA".to_vec() } else { csi_with_mods(b'A', mods) })
+            Some(if app {
+                b"\x1bOA".to_vec()
+            } else {
+                csi_with_mods(b'A', mods)
+            })
         }
         Key::Down => {
             let app = mode.contains(TermMode::APP_CURSOR);
-            Some(if app { b"\x1bOB".to_vec() } else { csi_with_mods(b'B', mods) })
+            Some(if app {
+                b"\x1bOB".to_vec()
+            } else {
+                csi_with_mods(b'B', mods)
+            })
         }
         Key::Right => {
             let app = mode.contains(TermMode::APP_CURSOR);
-            Some(if app { b"\x1bOC".to_vec() } else { csi_with_mods(b'C', mods) })
+            Some(if app {
+                b"\x1bOC".to_vec()
+            } else {
+                csi_with_mods(b'C', mods)
+            })
         }
         Key::Left => {
             let app = mode.contains(TermMode::APP_CURSOR);
-            Some(if app { b"\x1bOD".to_vec() } else { csi_with_mods(b'D', mods) })
+            Some(if app {
+                b"\x1bOD".to_vec()
+            } else {
+                csi_with_mods(b'D', mods)
+            })
         }
         Key::Home => {
             let app = mode.contains(TermMode::APP_CURSOR);
-            Some(if app { b"\x1bOH".to_vec() } else { csi_with_mods(b'H', mods) })
+            Some(if app {
+                b"\x1bOH".to_vec()
+            } else {
+                csi_with_mods(b'H', mods)
+            })
         }
         Key::End => {
             let app = mode.contains(TermMode::APP_CURSOR);
-            Some(if app { b"\x1bOF".to_vec() } else { csi_with_mods(b'F', mods) })
+            Some(if app {
+                b"\x1bOF".to_vec()
+            } else {
+                csi_with_mods(b'F', mods)
+            })
         }
         Key::PageUp => {
             if mods.shift {
@@ -200,14 +224,26 @@ mod tests {
 
     #[test]
     fn ctrl字母映射控制字符() {
-        let mods = Mods { ctrl: true, ..Default::default() };
-        assert_eq!(encode_key(Key::Char('c'), mods, TermMode::NONE).unwrap(), vec![0x03]);
-        assert_eq!(encode_key(Key::Char('a'), mods, TermMode::NONE).unwrap(), vec![0x01]);
+        let mods = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(Key::Char('c'), mods, TermMode::NONE).unwrap(),
+            vec![0x03]
+        );
+        assert_eq!(
+            encode_key(Key::Char('a'), mods, TermMode::NONE).unwrap(),
+            vec![0x01]
+        );
     }
 
     #[test]
     fn alt前缀转义() {
-        let mods = Mods { alt: true, ..Default::default() };
+        let mods = Mods {
+            alt: true,
+            ..Default::default()
+        };
         let bytes = encode_key(Key::Char('x'), mods, TermMode::NONE).unwrap();
         assert_eq!(bytes, b"\x1bx");
     }
@@ -222,10 +258,16 @@ mod tests {
 
     #[test]
     fn 方向键带修饰符() {
-        let mods = Mods { shift: true, ..Default::default() };
+        let mods = Mods {
+            shift: true,
+            ..Default::default()
+        };
         let bytes = encode_key(Key::Up, mods, TermMode::NONE).unwrap();
         assert_eq!(bytes, b"\x1b[1;2A");
-        let mods = Mods { ctrl: true, ..Default::default() };
+        let mods = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
         let bytes = encode_key(Key::Left, mods, TermMode::NONE).unwrap();
         assert_eq!(bytes, b"\x1b[1;5D");
     }
@@ -233,8 +275,14 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn shift_tab_reverse() {
-        let mods = Mods { shift: true, ..Default::default() };
-        assert_eq!(encode_key(Key::Tab, mods, TermMode::NONE).unwrap(), b"\x1b[Z");
+        let mods = Mods {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(Key::Tab, mods, TermMode::NONE).unwrap(),
+            b"\x1b[Z"
+        );
     }
 
     #[test]
@@ -245,7 +293,13 @@ mod tests {
 
     #[test]
     fn 功能键序列() {
-        assert_eq!(encode_key(Key::F(1), no_mods(), TermMode::NONE).unwrap(), b"\x1bOP");
-        assert_eq!(encode_key(Key::F(5), no_mods(), TermMode::NONE).unwrap(), b"\x1b[15~");
+        assert_eq!(
+            encode_key(Key::F(1), no_mods(), TermMode::NONE).unwrap(),
+            b"\x1bOP"
+        );
+        assert_eq!(
+            encode_key(Key::F(5), no_mods(), TermMode::NONE).unwrap(),
+            b"\x1b[15~"
+        );
     }
 }

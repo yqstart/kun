@@ -16,9 +16,20 @@ struct Transfer {
 
 /// 文件操作确认对话框。
 enum ConfirmDialog {
-    Delete { name: String, path: String, is_dir: bool },
-    Rename { from: String, path: String, input: String },
-    Mkdir { path: String, input: String },
+    Delete {
+        name: String,
+        path: String,
+        is_dir: bool,
+    },
+    Rename {
+        from: String,
+        path: String,
+        input: String,
+    },
+    Mkdir {
+        path: String,
+        input: String,
+    },
 }
 
 /// SFTP 面板状态。
@@ -232,69 +243,71 @@ impl SftpView {
         });
         let table_width = ui.available_width();
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if self.loading {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("加载中…");
+                    });
+                }
+                // 表头。
                 ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("加载中…");
-                });
-            }
-            // 表头。
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("名称").strong());
-                ui.add_space(table_width - cell_width * 38.0);
-                ui.label(RichText::new("大小").strong());
-                ui.add_space(cell_width * 10.0);
-                ui.label(RichText::new("修改时间").strong());
-            });
-            ui.separator();
-
-            let mut open_dir: Option<String> = None;
-            let mut select: Option<String> = None;
-            for entry in &self.entries {
-                let selected = self.selected.as_deref() == Some(entry.name.as_str());
-                let label = if entry.is_dir {
-                    format!("{}/", entry.name)
-                } else {
-                    entry.name.clone()
-                };
-                let mut name_text = RichText::new(label).monospace();
-                if selected {
-                    name_text = name_text.background_color(Color32::from_rgb(0x44, 0x47, 0x5a));
-                }
-                let response = ui.horizontal(|ui| {
-                    ui.label(name_text);
-                    ui.add_space(table_width - cell_width * 38.0 - 2.0 * cell_width);
-                    if entry.is_dir {
-                        ui.weak("—");
-                    } else {
-                        ui.weak(Self::format_size(entry.size));
-                    }
+                    ui.label(RichText::new("名称").strong());
+                    ui.add_space(table_width - cell_width * 38.0);
+                    ui.label(RichText::new("大小").strong());
                     ui.add_space(cell_width * 10.0);
-                    if let Some(modified) = entry.modified {
-                        ui.weak(Self::format_time(modified));
-                    }
+                    ui.label(RichText::new("修改时间").strong());
                 });
-                if response.response.clicked() {
-                    select = Some(entry.name.clone());
+                ui.separator();
+
+                let mut open_dir: Option<String> = None;
+                let mut select: Option<String> = None;
+                for entry in &self.entries {
+                    let selected = self.selected.as_deref() == Some(entry.name.as_str());
+                    let label = if entry.is_dir {
+                        format!("{}/", entry.name)
+                    } else {
+                        entry.name.clone()
+                    };
+                    let mut name_text = RichText::new(label).monospace();
+                    if selected {
+                        name_text = name_text.background_color(Color32::from_rgb(0x44, 0x47, 0x5a));
+                    }
+                    let response = ui.horizontal(|ui| {
+                        ui.label(name_text);
+                        ui.add_space(table_width - cell_width * 38.0 - 2.0 * cell_width);
+                        if entry.is_dir {
+                            ui.weak("—");
+                        } else {
+                            ui.weak(Self::format_size(entry.size));
+                        }
+                        ui.add_space(cell_width * 10.0);
+                        if let Some(modified) = entry.modified {
+                            ui.weak(Self::format_time(modified));
+                        }
+                    });
+                    if response.response.clicked() {
+                        select = Some(entry.name.clone());
+                    }
+                    if response.response.double_clicked() && entry.is_dir {
+                        open_dir = Some(entry.name.clone());
+                    }
                 }
-                if response.response.double_clicked() && entry.is_dir {
-                    open_dir = Some(entry.name.clone());
+                if let Some(name) = open_dir {
+                    let path = self.join(&name);
+                    self.handle.list(&path);
+                    self.loading = true;
+                    self.selected = None;
                 }
-            }
-            if let Some(name) = open_dir {
-                let path = self.join(&name);
-                self.handle.list(&path);
-                self.loading = true;
-                self.selected = None;
-            }
-            if let Some(name) = select {
-                self.selected = Some(name);
-            }
-            if self.entries.is_empty() && !self.loading {
-                ui.weak("空目录");
-            }
-        });
+                if let Some(name) = select {
+                    self.selected = Some(name);
+                }
+                if self.entries.is_empty() && !self.loading {
+                    ui.weak("空目录");
+                }
+            });
 
         // ==================== 传输进度 ====================
         if !self.transfers.is_empty() {
@@ -317,15 +330,13 @@ impl SftpView {
                     ui.label(&transfer.label);
                     if !transfer.finished && !transfer.failed && transfer.total > 0 {
                         let progress = transfer.done as f32 / transfer.total as f32;
-                        ui.add(
-                            egui::ProgressBar::new(progress)
-                                .desired_width(120.0)
-                                .text(format!(
-                                    "{} / {}",
-                                    Self::format_size(transfer.done),
-                                    Self::format_size(transfer.total)
-                                )),
-                        );
+                        ui.add(egui::ProgressBar::new(progress).desired_width(120.0).text(
+                            format!(
+                                "{} / {}",
+                                Self::format_size(transfer.done),
+                                Self::format_size(transfer.total)
+                            ),
+                        ));
                     }
                 });
             }
@@ -355,7 +366,9 @@ impl SftpView {
 
     /// 下载选中文件。
     fn download_selected(&mut self) {
-        let Some(name) = self.selected.clone() else { return };
+        let Some(name) = self.selected.clone() else {
+            return;
+        };
         let Some(path) = rfd::FileDialog::new().set_file_name(&name).save_file() else {
             return;
         };
@@ -374,53 +387,51 @@ impl SftpView {
             })
             .resizable(false)
             .collapsible(false)
-            .show(ctx, |ui| {
-                match dialog {
-                    ConfirmDialog::Delete { name, is_dir, .. } => {
-                        ui.label(format!(
-                            "确定删除{} {}？此操作不可恢复。",
-                            if *is_dir { "目录" } else { "文件" },
-                            name
-                        ));
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("删除").clicked() {
-                                action = Some(dialog.clone());
-                                close = true;
-                            }
-                            if ui.button("取消").clicked() {
-                                close = true;
-                            }
-                        });
-                    }
-                    ConfirmDialog::Rename { input, .. } => {
-                        ui.label("新名称：");
-                        ui.text_edit_singleline(input);
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("确定").clicked() {
-                                action = Some(dialog.clone());
-                                close = true;
-                            }
-                            if ui.button("取消").clicked() {
-                                close = true;
-                            }
-                        });
-                    }
-                    ConfirmDialog::Mkdir { input, .. } => {
-                        ui.label("目录名称：");
-                        ui.text_edit_singleline(input);
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("确定").clicked() {
-                                action = Some(dialog.clone());
-                                close = true;
-                            }
-                            if ui.button("取消").clicked() {
-                                close = true;
-                            }
-                        });
-                    }
+            .show(ctx, |ui| match dialog {
+                ConfirmDialog::Delete { name, is_dir, .. } => {
+                    ui.label(format!(
+                        "确定删除{} {}？此操作不可恢复。",
+                        if *is_dir { "目录" } else { "文件" },
+                        name
+                    ));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("删除").clicked() {
+                            action = Some(dialog.clone());
+                            close = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                ConfirmDialog::Rename { input, .. } => {
+                    ui.label("新名称：");
+                    ui.text_edit_singleline(input);
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("确定").clicked() {
+                            action = Some(dialog.clone());
+                            close = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                ConfirmDialog::Mkdir { input, .. } => {
+                    ui.label("目录名称：");
+                    ui.text_edit_singleline(input);
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("确定").clicked() {
+                            action = Some(dialog.clone());
+                            close = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            close = true;
+                        }
+                    });
                 }
             });
         }
@@ -496,22 +507,31 @@ mod tests {
     fn test_profile() -> kun_core::config::HostProfile {
         use kun_core::config::Auth;
         let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
-            format!("{}/.ssh/id_ed25519", std::env::var("HOME").unwrap_or_default())
+            format!(
+                "{}/.ssh/id_ed25519",
+                std::env::var("HOME").unwrap_or_default()
+            )
         });
         kun_core::config::HostProfile {
             name: "UI 测试".into(),
             host: std::env::var("KUN_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-            port: std::env::var("KUN_TEST_PORT").unwrap_or_else(|_| "2222".into()).parse().unwrap(),
+            port: std::env::var("KUN_TEST_PORT")
+                .unwrap_or_else(|_| "2222".into())
+                .parse()
+                .unwrap(),
             user: std::env::var("KUN_TEST_USER")
                 .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "root".into())),
-            auth: Auth::Key { path: key_path.into(), passphrase: None },
+            auth: Auth::Key {
+                path: key_path.into(),
+                passphrase: None,
+            },
         }
     }
 
     /// SFTP 面板真实连接并渲染文件列表。
     #[test]
     fn sftp_面板真实连接渲染() {
-        use kun_core::ssh::sftp::{SftpEvent, connect_sftp};
+        use kun_core::ssh::sftp::connect_sftp;
         use std::time::{Duration, Instant};
 
         let profile = test_profile();
@@ -533,7 +553,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(!view.entries.is_empty(), "SFTP 目录列表应为空目录列表（加载完成）");
+        assert!(
+            !view.entries.is_empty(),
+            "SFTP 目录列表应为空目录列表（加载完成）"
+        );
 
         // 渲染并断言条目可见。
         use kittest::Queryable;
@@ -547,6 +570,66 @@ mod tests {
         harness.get_by_label("新建目录");
         // 面板标题包含主机名。
         harness.get_by_label("SFTP · UI 测试主机");
+    }
+
+    /// 确认对话框流程：选中条目 → 点击删除 → 出现确认框。
+    #[test]
+    fn 删除确认对话框流程() {
+        use kittest::Queryable;
+
+        // 直接构造带条目的面板（不依赖网络）。
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_raw(handle_tx);
+        let mut view = SftpView {
+            host_name: "测试主机".into(),
+            handle,
+            rx,
+            current_path: "/".into(),
+            entries: vec![
+                RemoteEntry {
+                    name: "Desktop".into(),
+                    is_dir: true,
+                    size: 0,
+                    modified: None,
+                    permissions: 0,
+                },
+                RemoteEntry {
+                    name: "readme.md".into(),
+                    is_dir: false,
+                    size: 100,
+                    modified: None,
+                    permissions: 0,
+                },
+            ],
+            selected: Some("readme.md".into()),
+            loading: false,
+            transfers: Vec::new(),
+            dialog: None,
+            error: None,
+            closed: false,
+        };
+
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            let ctx = ui.ctx().clone();
+            view.show(ui);
+            view.show_dialog(&ctx);
+        });
+        harness.run();
+
+        // 点击删除按钮 → 出现确认对话框。
+        harness.get_by_label("删除").click();
+        harness.run();
+        harness.get_by_label("确认删除");
+        harness.get_by_label("readme.md");
+
+        // 点击取消 → 对话框关闭。
+        harness.get_by_label("取消").click();
+        harness.run();
+        assert!(
+            harness.root().query_by_label("确认删除").is_none(),
+            "取消后对话框应关闭"
+        );
     }
 
     #[test]
@@ -567,4 +650,3 @@ mod tests {
         assert_eq!(SftpView::format_size(1024 * 1024 * 1024), "1.0 GB");
     }
 }
-

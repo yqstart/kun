@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui;
-use kun_core::config::{Auth, HostConfig, HostProfile, default_config_path};
-use kun_core::ssh::{ConnectResult, connect_remote};
+use kun_core::config::{default_config_path, Auth, HostConfig, HostProfile};
+use kun_core::ssh::{connect_remote, ConnectResult};
 use kun_core::terminal::{Session, SessionEvent, SessionOptions};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -24,6 +24,8 @@ struct ConnectForm {
     password: String,
     key_path: String,
     passphrase: String,
+    /// 名称输入框是否已聚焦（对话框打开时自动聚焦）。
+    name_focused: bool,
 }
 
 /// 应用状态。
@@ -186,7 +188,11 @@ impl KunApp {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let text = if self.dark_mode { "浅色模式" } else { "深色模式" };
+                let text = if self.dark_mode {
+                    "浅色模式"
+                } else {
+                    "深色模式"
+                };
                 if ui.button(text).clicked() {
                     self.dark_mode = !self.dark_mode;
                     if self.dark_mode {
@@ -251,7 +257,13 @@ impl KunApp {
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("名称");
-                        ui.text_edit_singleline(&mut self.form.name);
+                        // 对话框打开时自动聚焦名称输入框。
+                        let name_id = egui::Id::new("conn_form_name");
+                        ui.add(egui::TextEdit::singleline(&mut self.form.name).id(name_id));
+                        if !self.form.name_focused {
+                            ui.memory_mut(|m| m.request_focus(name_id));
+                            self.form.name_focused = true;
+                        }
                         ui.end_row();
                         ui.label("主机");
                         ui.text_edit_singleline(&mut self.form.host);
@@ -270,14 +282,19 @@ impl KunApp {
                         ui.end_row();
                         if self.form.auth_kind == 0 {
                             ui.label("密码");
-                            ui.add(egui::TextEdit::singleline(&mut self.form.password).password(true));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.form.password).password(true),
+                            );
                             ui.end_row();
                         } else {
                             ui.label("私钥路径");
                             ui.text_edit_singleline(&mut self.form.key_path);
                             ui.end_row();
                             ui.label("口令（可选）");
-                            ui.add(egui::TextEdit::singleline(&mut self.form.passphrase).password(true));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.form.passphrase)
+                                    .password(true),
+                            );
                             ui.end_row();
                         }
                     });
@@ -312,6 +329,7 @@ impl KunApp {
                             self.config.hosts.push(profile.clone());
                             self.save_config();
                             self.show_new_conn = false;
+                            self.form.name_focused = false;
                             self.start_connect(ctx, profile);
                         } else {
                             self.toast = Some(("请填写主机与用户名".into(), true));
@@ -319,6 +337,7 @@ impl KunApp {
                     }
                     if ui.button("取消").clicked() {
                         self.show_new_conn = false;
+                        self.form.name_focused = false;
                     }
                 });
             });
@@ -332,12 +351,28 @@ impl KunApp {
             if let Some(terminal) = &self.terminal {
                 let session = terminal.session();
                 let title = session.title();
-                ui.label(if title.is_empty() { "本地终端".to_string() } else { title });
-                ui.separator();
+                ui.label(if title.is_empty() {
+                    "本地终端".to_string()
+                } else {
+                    title
+                });
                 if session.has_exited() {
                     ui.colored_label(egui::Color32::from_rgb(0xff, 0x55, 0x55), "会话已退出");
                 }
             }
+            if self.sftp.is_some() {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(0x50, 0xfa, 0x7b),
+                    format!("SFTP · {}", self.sftp_host),
+                );
+            } else if self.pending_sftp.is_some() {
+                ui.separator();
+                ui.weak("SFTP 连接中…");
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak("⌘N 新建连接  ⌘1 本地终端");
+            });
         });
     }
 }
@@ -346,14 +381,34 @@ impl eframe::App for KunApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // ==================== 快捷键 ====================
+        // ⌘N 新建连接、⌘1 本地终端、Esc 关闭对话框。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+            self.show_new_conn = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1)) {
+            // 切换本地终端。
+            let repaint_ctx = ctx.clone();
+            let on_event = Arc::new(move |_ev: &SessionEvent| {
+                repaint_ctx.request_repaint();
+            });
+            if let Ok(session) = Session::spawn_local(SessionOptions::default(), 80, 24, on_event) {
+                self.terminal = Some(TerminalView::new(session));
+                self.sftp = None;
+            }
+        }
+
         // ==================== 处理连接结果 ====================
         self.poll_connection(&ctx);
         self.poll_sftp();
 
         // ==================== 左侧主机栏 ====================
-        egui::Panel::left("hosts").default_size(220.0).resizable(true).show(ui, |ui| {
-            self.host_sidebar(ui);
-        });
+        egui::Panel::left("hosts")
+            .default_size(220.0)
+            .resizable(true)
+            .show(ui, |ui| {
+                self.host_sidebar(ui);
+            });
 
         // ==================== 顶部工具栏 ====================
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -437,11 +492,14 @@ mod tests {
     #[test]
     fn 面板渲染完整() {
         let mut harness = Harness::new_ui(|ui| {
-            egui::Panel::left("hosts").default_size(220.0).resizable(true).show(ui, |ui| {
-                ui.heading("主机");
-                let _ = ui.button("新建连接");
-                ui.weak("暂无已保存主机");
-            });
+            egui::Panel::left("hosts")
+                .default_size(220.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    ui.heading("主机");
+                    let _ = ui.button("新建连接");
+                    ui.weak("暂无已保存主机");
+                });
             egui::Panel::top("toolbar").show(ui, |ui| {
                 ui.label(egui::RichText::new("kun").strong());
                 let _ = ui.button("本地终端");

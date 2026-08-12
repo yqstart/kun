@@ -16,7 +16,7 @@ fn setup_fonts(ctx: &egui::Context) {
     // 等宽主字体候选（依次尝试）。
     let mono_candidates = [
         "/System/Library/Fonts/SFNSMono.ttf", // SF Mono
-        "/System/Library/Fonts/Menlo.ttc", // Menlo
+        "/System/Library/Fonts/Menlo.ttc",    // Menlo
         "/System/Library/Fonts/Supplemental/Menlo.ttc",
     ];
     // 中文 fallback 候选（用于中文等宽显示）。
@@ -28,7 +28,10 @@ fn setup_fonts(ctx: &egui::Context) {
     let mut loaded_mono = false;
     for path in mono_candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert("kun_mono".to_owned(), std::sync::Arc::new(FontData::from_owned(bytes)));
+            fonts.font_data.insert(
+                "kun_mono".to_owned(),
+                std::sync::Arc::new(FontData::from_owned(bytes)),
+            );
             fonts
                 .families
                 .get_mut(&FontFamily::Monospace)
@@ -46,8 +49,13 @@ fn setup_fonts(ctx: &egui::Context) {
     // 中文 fallback 追加到等宽族末尾。
     for path in cjk_candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert("kun_cjk".to_owned(), std::sync::Arc::new(FontData::from_owned(bytes)));
-            fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("kun_cjk".to_owned());
+            fonts.font_data.insert(
+                "kun_cjk".to_owned(),
+                std::sync::Arc::new(FontData::from_owned(bytes)),
+            );
+            for family in [FontFamily::Proportional, FontFamily::Monospace] {
+                fonts.families.get_mut(&family).unwrap().push("kun_cjk".to_owned());
+            }
             log::info!("加载中文 fallback 字体：{path}");
             break;
         }
