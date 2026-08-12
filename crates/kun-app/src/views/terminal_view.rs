@@ -886,9 +886,14 @@ mod tests {
             "字符 a 未显示，终端内容：\n{}",
             grid_text(view.borrow().session())
         );
-        // 不应有重复 "aa"。
+        // 不应有重复 "aa"：只检查当前输入行（最后一行），
+        // 避免被提示符中的主机名（CI 为随机 UUID，可能含 "aa"）误报。
         let text = grid_text(view.borrow().session());
-        assert!(!text.contains("aa"), "字符重复写入，终端内容：\n{text}");
+        let last_line = text.lines().last().unwrap_or("");
+        assert!(
+            !last_line.contains("aa"),
+            "字符重复写入，最后一行：{last_line:?}，终端内容：\n{text}"
+        );
     }
 }
 

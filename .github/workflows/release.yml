@@ -50,7 +50,7 @@ jobs:
         run: cargo build --release --workspace
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1
 
       # ============ macOS：.app + dmg ============
       - name: Package macOS (.app + dmg)
