@@ -1,0 +1,71 @@
+# kun 项目架构
+
+轻量终端 + SFTP 可视化工具。Rust workspace，两个 crate。
+
+## 技术选型
+
+| 组件 | 选型 | 理由 |
+|---|---|---|
+| GUI | eframe/egui 0.36 + wgpu | 原生轻量、macOS 走 Metal |
+| 终端内核 | alacritty_terminal 0.26 | 生产级 VT 仿真 + PTY（Alacritty 自用） |
+| SSH/SFTP | russh 0.62 + russh-sftp 2.4 | 纯 Rust 无 C 依赖 |
+| 配置 | serde + toml | hosts.toml 持久化 |
+| UI 测试 | egui_kittest | 渲染级断言 |
+
+## 目录结构
+
+```
+crates/
+├── kun-core/                 # 纯引擎，禁止依赖 egui
+│   ├── src/lib.rs
+│   ├── src/terminal/mod.rs   # Session 统一封装（本地/远程）、TermSize、Listener
+│   ├── src/terminal/keys.rs  # 键盘 → 字节序列编码（XTerm 修饰键）
+│   ├── src/ssh/mod.rs        # connect_remote（后台线程 + tokio）、authenticate
+│   ├── src/ssh/sftp.rs       # connect_sftp、SftpHandle（命令队列）、SftpEvent（事件流）
+│   ├── src/config/mod.rs     # HostProfile/HostConfig + hosts.toml
+│   └── tests/                # 集成测试（需本地测试 sshd: 127.0.0.1:2222）
+└── kun-app/                  # egui 应用
+    ├── src/main.rs           # 入口 + 字体加载（SF Mono + CJK fallback）
+    ├── src/app.rs            # KunApp：布局/连接管理/对话框/快捷键
+    ├── src/theme.rs          # Dracula 深色主题
+    └── src/views/
+        ├── terminal_view.rs  # cell 渲染（增量 hash 缓存）、输入转发、滚动
+        └── sftp_view.rs      # 文件面板：列表/导航/传输进度/确认对话框
+```
+
+## 核心数据流
+
+### 终端会话（本地与远程统一）
+
+- 本地：`tty::new` 建 PTY → alacritty `EventLoop` 线程读 → vte 解析 → `Term` 网格
+- 远程：后台线程 tokio runtime → SSH channel 读 → `Processor::advance` → 同一 `Term`
+- 统一接口：`Session { term, writer, resizer, shuttor }`（Writer/Resizer/Shuttor 闭包抽象）
+- 写操作：本地走 `EventLoopSender`，远程走命令队列（UI 线程非阻塞）
+- 渲染：UI 锁 `FairMutex<Term>` → `renderable_content()` → 逐行 hash 缓存 LayoutJob（增量重建）
+
+### SFTP
+
+- `connect_sftp` 建立独立 SSH 连接（后台线程 runtime 存活到 `Shutdown` 命令）
+- UI 持 `SftpHandle`（克隆发送端）发命令；后台执行后经 `SftpEvent` 通道回报
+- 事件流：`Listed / Progress / Done / Error / Closed`
+
+### 连接生命周期
+
+- 远程连接后台线程必须持有 runtime 直到会话关闭（`Notify` 等待 remote_loop 结束），否则 tokio::spawn 的任务被取消
+- `Session` 实现 `Drop` → 发 Shutdown 优雅关闭
+
+## 关键约定
+
+- 集成测试依赖本地测试 sshd：`/usr/sbin/sshd -f /tmp/kun-test-sshd/sshd_config`（端口 2222、公钥认证、含 sftp subsystem）
+- 配置文件：`~/.config/kun/hosts.toml`（toml 中 enum 用内部标记：`[hosts.auth.Key]`）
+- 字体：仅 Monospace/Proportional 族加载 CJK fallback（STHeiti），否则中文显示豆腐块
+- egui 0.36 API 注意：`App::ui` 替代 `update`、`Panel::top/left` 替代 `TopBottomPanel`、`Fonts` 需要 `fonts_mut`、`Event::Key` 无 `text` 字段（Text 独立事件）
+- 终端视图使用固定 `focus_id` 管理键盘焦点；对话框打开时自动聚焦首个输入框
+
+## 验证
+
+```bash
+cargo test --workspace         # 17 个测试（单元 + ssh 集成 + sftp 集成 + UI 渲染）
+cargo clippy --workspace --all-targets   # 零警告
+cargo fmt --all
+```

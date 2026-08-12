@@ -54,7 +54,11 @@ fn setup_fonts(ctx: &egui::Context) {
                 std::sync::Arc::new(FontData::from_owned(bytes)),
             );
             for family in [FontFamily::Proportional, FontFamily::Monospace] {
-                fonts.families.get_mut(&family).unwrap().push("kun_cjk".to_owned());
+                fonts
+                    .families
+                    .get_mut(&family)
+                    .unwrap()
+                    .push("kun_cjk".to_owned());
             }
             log::info!("加载中文 fallback 字体：{path}");
             break;
