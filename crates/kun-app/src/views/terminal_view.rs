@@ -43,6 +43,9 @@ struct LineData {
     backgrounds: Vec<BgRect>,
 }
 
+/// 终端内容内边距（文本与面板边缘的间距，参照 Terminal.app 观感）。
+const PADDING: f32 = 10.0;
+
 /// 终端视图。
 pub struct TerminalView {
     session: Session,
@@ -55,6 +58,10 @@ pub struct TerminalView {
     focus_id: egui::Id,
     initialized: bool,
     last_mode: TermMode,
+    /// 退格/删除键按下后，下一帧的"空白类" Text 事件应丢弃。
+    /// （某些输入法（如微信输入法）退格时会伴随发送空格类文本，
+    /// 写入终端表现为"删除键插入空格"；正常字符不受影响）
+    suppress_next_text: bool,
 }
 
 impl TerminalView {
@@ -71,6 +78,7 @@ impl TerminalView {
             focus_id: egui::Id::new("terminal_view"),
             initialized: false,
             last_mode: TermMode::NONE,
+            suppress_next_text: false,
         }
     }
 
@@ -85,12 +93,17 @@ impl TerminalView {
         let term_arc = self.session.term();
 
         // 终端区域背景（当前主题的终端色）。
+        // 注意：用 max_rect（布局分配区域）而非 min_rect（已用内容包围盒，
+        // 无子项时为 0x0，会导致背景画不出来）。
         let term_bg = crate::theme::current_theme().term_bg;
+        let outer = ui.max_rect();
         ui.painter().rect_filled(
-            ui.min_rect(),
+            outer,
             0.0,
             Color32::from_rgb(term_bg.r, term_bg.g, term_bg.b),
         );
+        // 终端内容区域：背景铺满面板，文本/光标在内边距内绘制。
+        let inner = outer.shrink(PADDING);
 
         // ==================== 事件泵 ====================
         // 诊断：PTY 读取线程退出会导致输入写入失效。
@@ -113,7 +126,7 @@ impl TerminalView {
         self.cell_width = cell_width;
         self.cell_height = cell_height;
 
-        let avail = ui.available_size();
+        let avail = inner.size();
         let cols = ((avail.x / cell_width).floor() as usize).max(2);
         let rows = ((avail.y / cell_height).floor() as usize).max(1);
         if cols as u16 != self.cols || rows as u16 != self.rows {
@@ -294,8 +307,7 @@ impl TerminalView {
                         .unwrap_or(crate::theme::current_theme().term_cursor);
                     cursor_color = Some(to_egui(color));
                     cursor_rect = Some(Rect::from_min_size(
-                        ui.min_rect().min
-                            + Vec2::new(col as f32 * cell_width, line as f32 * cell_height),
+                        inner.min + Vec2::new(col as f32 * cell_width, line as f32 * cell_height),
                         Vec2::new(cell_width, cell_height),
                     ));
                 }
@@ -304,7 +316,7 @@ impl TerminalView {
 
         // ==================== 绘制（锁外） ====================
         let painter = ui.painter();
-        let origin = ui.min_rect().min;
+        let origin = inner.min;
         for data in &lines_data {
             // 绘制背景矩形（行内连续背景段）。
             for bg in &data.backgrounds {
@@ -364,7 +376,8 @@ impl TerminalView {
             ui.memory_mut(|m| m.request_focus(self.focus_id));
             self.initialized = true;
         }
-        let response = ui.interact(ui.min_rect(), self.focus_id, egui::Sense::click());
+        // 点击区域覆盖整个面板（min_rect 无子项时为 0x0，会导致点击无法重新聚焦）。
+        let response = ui.interact(ui.max_rect(), self.focus_id, egui::Sense::click());
         if response.clicked() {
             ui.memory_mut(|m| m.request_focus(self.focus_id));
         }
@@ -408,6 +421,24 @@ impl TerminalView {
         // （Context 锁已被 input 持有，会自死锁 10 秒后 panic），用 flag 延后。
         let mut need_repaint = false;
 
+        // 检测本帧是否有退格/删除键按下（含上一帧的抑制状态）。
+        // 某些输入法（如微信输入法）在退格时会伴随发送"空格类" Text 事件，
+        // 写入终端会表现为"删除键插入空格"。
+        let backspace_this_frame = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Backspace | egui::Key::Delete,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        });
+        let suppress_blank_text = self.suppress_next_text || backspace_this_frame;
+        self.suppress_next_text = backspace_this_frame;
+
         ui.input(|i| {
             for event in &i.events {
                 match event {
@@ -447,6 +478,13 @@ impl TerminalView {
                         }
                     }
                     egui::Event::Text(text) => {
+                        // 退格/删除键伴随的"空白类"文本（输入法产物）丢弃，
+                        // 只影响空格/零宽等空白字符，正常输入不受影响。
+                        if suppress_blank_text
+                            && text.chars().all(|c| c == ' ' || !is_printable_text_char(c))
+                        {
+                            continue;
+                        }
                         // Ctrl/Alt 组合已在 Key 事件处理，跳过避免重复写入。
                         let mods = i.modifiers;
                         if mods.ctrl || mods.alt {
@@ -1120,5 +1158,131 @@ mod osc_tests {
             false,
         );
         assert_eq!(resolved_fg, Color32::from_rgb(0x00, 0xff, 0x00));
+    }
+}
+
+#[cfg(test)]
+mod ime_backspace_tests {
+    use super::*;
+    use kun_core::terminal::{Session, SessionOptions};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn grid_text(session: &Session) -> String {
+        use alacritty_terminal::term::cell::Flags;
+        let term_arc = session.term();
+        let guard = term_arc.lock();
+        let content = guard.renderable_content();
+        let mut lines: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut current_line = usize::MAX;
+        for item in content.display_iter {
+            let cell = item.cell;
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
+                continue;
+            }
+            if item.point.line.0 as usize != current_line {
+                if current_line != usize::MAX {
+                    lines.push(current.trim_end().to_string());
+                }
+                current = String::new();
+                current_line = item.point.line.0 as usize;
+            }
+            current.push(cell.c);
+        }
+        if current_line != usize::MAX {
+            lines.push(current.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    fn send_key(harness: &mut egui_kittest::Harness, key: egui::Key, text: Option<&str>) {
+        harness.event(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        if let Some(t) = text {
+            harness.event(egui::Event::Text(t.to_string()));
+        }
+    }
+
+    /// 回归测试（用户报告"删除键插入空格"）：输入法（如微信输入法）在退格时
+    /// 伴随发送"空格" Text 事件，不应插入空格。
+    #[test]
+    fn 退格伴随空格文本不插入() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+
+        // 等 zsh 就绪。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if grid_text(view.borrow().session()).contains("kun") {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(ready, "zsh 未就绪");
+
+        // 输入 abc。
+        send_key(&mut harness, egui::Key::A, Some("a"));
+        send_key(&mut harness, egui::Key::B, Some("b"));
+        send_key(&mut harness, egui::Key::C, Some("c"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut typed = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if grid_text(view.borrow().session()).contains("abc") {
+                typed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(typed, "输入 abc 失败");
+
+        // 退格（伴随空格 Text——输入法产物）。
+        send_key(&mut harness, egui::Key::Backspace, Some(" "));
+        // 等待 zsh 回显更新为 ab。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut deleted = false;
+        while Instant::now() < deadline {
+            harness.step();
+            let text = grid_text(view.borrow().session());
+            if text.lines().any(|l| l.ends_with("ab")) {
+                deleted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            deleted,
+            "退格后应为 ab，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+
+        // 不得出现"ab "（退格伴随的空格被丢弃）。
+        let text = grid_text(view.borrow().session());
+        let last_line = text.lines().last().unwrap_or("");
+        assert!(
+            !last_line.contains("ab "),
+            "退格不应插入空格，最后一行：{last_line:?}"
+        );
     }
 }

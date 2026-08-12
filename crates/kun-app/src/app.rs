@@ -43,10 +43,49 @@ enum UpdateState {
     Failed,
 }
 
+/// 单个终端标签页（本地或远程会话）。
+struct TerminalTab {
+    /// 标签标题（远程=主机名；本地=动态会话标题）。
+    label: String,
+    terminal: TerminalView,
+    /// 远程会话的 SFTP 面板（本地标签页为 None）。
+    sftp: Option<SftpView>,
+}
+
+impl TerminalTab {
+    fn new(label: String, terminal: TerminalView) -> Self {
+        Self {
+            label,
+            terminal,
+            sftp: None,
+        }
+    }
+
+    /// 标签显示标题（跟随会话标题变化）。
+    fn title(&self) -> String {
+        let t = self.terminal.session().title();
+        if t.is_empty() {
+            self.label.clone()
+        } else {
+            t
+        }
+    }
+}
+
 /// 应用状态。
 pub struct KunApp {
-    /// 当前活动终端视图（本地或远程）。
-    terminal: Option<TerminalView>,
+    /// 终端标签页列表。
+    tabs: Vec<TerminalTab>,
+    /// 当前激活的标签页索引。
+    active_tab: usize,
+    /// 连接成功后创建的标签页索引（用于挂载 SFTP）。
+    pending_tab: Option<usize>,
+    /// 左侧主机列表是否展开（默认收起，直接进入终端）。
+    sidebar_open: bool,
+    /// 主机行最近一次点击（时间, 行索引），用于自实现双击检测。
+    /// （egui 的多击计数会把无关点击（如折叠按钮）计入序列，导致 count=3
+    /// 而 double_clicked（count==2）失效，故自行记录）
+    last_row_click: Option<(f64, usize)>,
     /// 主机配置。
     config: HostConfig,
     config_path: PathBuf,
@@ -59,8 +98,6 @@ pub struct KunApp {
     pending_label: String,
     /// 提示消息（消息, 是否错误）。
     toast: Option<(String, bool)>,
-    /// SFTP 面板（远程连接时存在）。
-    sftp: Option<SftpView>,
     /// 进行中的 SFTP 连接。
     pending_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>)>,
     /// 远程连接的主机名（用于 SFTP 面板标题）。
@@ -69,6 +106,15 @@ pub struct KunApp {
     update_state: UpdateState,
     /// 更新检查结果接收端。
     update_rx: Option<std::sync::mpsc::Receiver<Result<Option<UpdateInfo>, String>>>,
+}
+
+/// 本地终端会话选项：默认工作目录为 home。
+/// （Finder/Dock 启动时进程 cwd 为 `/`，不指定会导致终端落在根目录）
+fn local_session_options() -> SessionOptions {
+    SessionOptions {
+        working_directory: std::env::var("HOME").ok().map(PathBuf::from),
+        ..Default::default()
+    }
 }
 
 impl KunApp {
@@ -81,20 +127,12 @@ impl KunApp {
         let config_path = default_config_path();
         let config = HostConfig::load(&config_path).unwrap_or_default();
 
-        // 启动本地终端会话。
-        let on_event = Arc::new(move |_ev: &SessionEvent| {
-            ctx.request_repaint();
-        });
-        let terminal = match Session::spawn_local(SessionOptions::default(), 80, 24, on_event) {
-            Ok(session) => Some(TerminalView::new(session)),
-            Err(e) => {
-                log::error!("启动本地终端失败：{e}");
-                None
-            }
-        };
-
         let mut app = Self {
-            terminal,
+            tabs: Vec::new(),
+            active_tab: 0,
+            pending_tab: None,
+            sidebar_open: false,
+            last_row_click: None,
             config,
             config_path,
             show_new_conn: false,
@@ -102,7 +140,6 @@ impl KunApp {
             pending: None,
             pending_label: String::new(),
             toast: None,
-            sftp: None,
             pending_sftp: None,
             sftp_host: String::new(),
             update_state: UpdateState::Idle,
@@ -110,7 +147,46 @@ impl KunApp {
         };
         // 启动时自动检查更新（后台线程，延迟 3 秒）。
         app.start_update_check(true);
+        // 初始打开一个本地终端标签页。
+        app.new_local_tab(&ctx);
         app
+    }
+
+    /// 新建本地终端标签页并激活。
+    fn new_local_tab(&mut self, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        let on_event = Arc::new(move |_ev: &SessionEvent| {
+            ctx.request_repaint();
+        });
+        match Session::spawn_local(local_session_options(), 80, 24, on_event) {
+            Ok(session) => {
+                self.tabs.push(TerminalTab::new(
+                    "本地终端".into(),
+                    TerminalView::new(session),
+                ));
+                self.active_tab = self.tabs.len() - 1;
+            }
+            Err(e) => {
+                log::error!("启动本地终端失败：{e}");
+                self.toast = Some((format!("启动本地终端失败：{e}"), true));
+            }
+        }
+    }
+
+    /// 关闭指定标签页（会话随之 Drop 优雅关闭）。
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            // 全部关闭后重置激活索引（可再新建）。
+            self.active_tab = 0;
+        } else if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        } else if self.active_tab > index {
+            self.active_tab -= 1;
+        }
     }
 
     /// 启动后台更新检查（delay=true 时延迟 3 秒，避免影响启动）。
@@ -169,7 +245,11 @@ impl KunApp {
             match result {
                 ConnectResult::Connected(session) => {
                     let view = TerminalView::new(session);
-                    self.terminal = Some(view);
+                    // 新建远程标签页并激活（SFTP 就绪后挂载到该页）。
+                    self.tabs
+                        .push(TerminalTab::new(self.pending_label.clone(), view));
+                    self.active_tab = self.tabs.len() - 1;
+                    self.pending_tab = Some(self.active_tab);
                     self.toast = Some((format!("已连接到 {}", self.pending_label), false));
                     ctx.request_repaint();
                 }
@@ -197,7 +277,7 @@ impl KunApp {
         let (_sftp_thread, sftp_handle, sftp_rx) = connect_sftp(&profile);
         self.sftp_host = label;
         self.pending_sftp = Some((sftp_handle, sftp_rx));
-        self.sftp = None;
+        self.pending_tab = None;
     }
 
     /// 处理 SFTP 连接结果。
@@ -215,7 +295,12 @@ impl KunApp {
         }
         if ready {
             if let Some((handle, rx)) = self.pending_sftp.take() {
-                self.sftp = Some(SftpView::new(&self.sftp_host, handle, rx));
+                // 挂载到连接成功后创建的标签页（用户可能已切换标签页）。
+                if let Some(idx) = self.pending_tab {
+                    if let Some(tab) = self.tabs.get_mut(idx) {
+                        tab.sftp = Some(SftpView::new(&self.sftp_host, handle, rx));
+                    }
+                }
             }
         }
         if let Some(e) = failed {
@@ -224,35 +309,33 @@ impl KunApp {
         }
     }
 
-    /// 渲染顶部工具栏。
+    /// 渲染顶部工具栏（左侧：主机列表折叠开关；右侧：主题切换 + 检查更新）。
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("kun")
-                    .strong()
-                    .color(crate::theme::current_theme().accent),
-            );
-            ui.separator();
-            let new_conn_btn = egui::Button::new("新建连接")
-                .fill(crate::theme::current_theme().accent)
+            // 主机列表折叠开关（默认收起）。
+            let theme = crate::theme::current_theme();
+            let sidebar_btn =
+                egui::Button::new(egui::RichText::new("◧").color(if self.sidebar_open {
+                    theme.text_primary
+                } else {
+                    theme.text_muted
+                }))
+                .fill(if self.sidebar_open {
+                    theme.accent_soft
+                } else {
+                    egui::Color32::TRANSPARENT
+                })
                 .stroke(egui::Stroke::NONE)
-                .corner_radius(crate::theme::miro::RADIUS_SM);
-            if ui.add(new_conn_btn).clicked() {
-                self.show_new_conn = true;
+                .corner_radius(crate::theme::miro::RADIUS_ITEM);
+            if ui
+                .add(sidebar_btn)
+                .on_hover_text("主机列表（⌘B）")
+                .clicked()
+            {
+                self.sidebar_open = !self.sidebar_open;
             }
-            if ui.button("本地终端").clicked() {
-                // 重新挂载本地终端（若当前是远程会话则替换）。
-                let ctx = ui.ctx().clone();
-                let on_event = Arc::new(move |_ev: &SessionEvent| {
-                    ctx.request_repaint();
-                });
-                if let Ok(session) =
-                    Session::spawn_local(SessionOptions::default(), 80, 24, on_event)
-                {
-                    self.terminal = Some(TerminalView::new(session));
-                }
-            }
+            ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 手动检查更新。
                 let update_btn = match &self.update_state {
@@ -291,13 +374,6 @@ impl KunApp {
     /// 渲染左侧主机列表。
     fn host_sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new("主机")
-                .size(13.0)
-                .color(crate::theme::current_theme().text_secondary)
-                .strong(),
-        );
-        ui.add_space(4.0);
         if ui
             .add(
                 egui::Button::new("新建连接")
@@ -322,34 +398,77 @@ impl KunApp {
         let mut connect_idx: Option<usize> = None;
         let mut selected_host: Option<usize> = None;
         for (i, host) in self.config.hosts.iter().enumerate() {
-            // 主机行：整行可点击（单击选中，双击连接），hover 显示 accent-soft 底。
+            // 主机行：头像 + 名称 + 删除图标；整行可点击（单击选中，双击连接）。
             let row_id = egui::Id::new(("host_row", i));
-            let row_response = ui
+            let theme = crate::theme::current_theme();
+            // 行内容（头像 + 名称）。
+            let inner = ui
                 .scope_builder(egui::UiBuilder::new().id_salt(row_id), |ui| {
                     ui.horizontal(|ui| {
-                        if ui.button("连接").on_hover_text("连接到该主机").clicked() {
-                            connect_idx = Some(i);
-                        }
+                        // 头像：accent 圆底 + 主机名首字符。
+                        let avatar_size = 30.0;
+                        let (avatar_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(avatar_size, avatar_size),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().circle_filled(
+                            avatar_rect.center(),
+                            avatar_size / 2.0,
+                            theme.accent,
+                        );
+                        let initial = host.name.chars().next().unwrap_or('?');
+                        ui.painter().text(
+                            avatar_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            initial.to_string(),
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::WHITE,
+                        );
+                        ui.add_space(6.0);
                         ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(&host.name)
-                                    .color(crate::theme::current_theme().text_primary),
-                            );
+                            ui.label(egui::RichText::new(&host.name).color(theme.text_primary));
                             ui.weak(format!("{}@{}", host.user, host.host));
                         });
-                        if ui.button("删除").on_hover_text("删除该主机").clicked() {
-                            remove_idx = Some(i);
-                        }
                     });
                 })
-                .response
-                .interact(egui::Sense::click());
+                .response;
+            // 整行点击区（显式 id + rect：Response::interact 的响应链在
+            // egui 0.36 下不可靠，点击无法命中，必须用 ui.interact 注册）。
+            let row_response = ui.interact(inner.rect.expand(2.0), row_id, egui::Sense::click());
+            // 删除图标（行右侧，最后注册保证可点）。
+            let del_rect = egui::Rect::from_min_size(
+                egui::pos2(inner.rect.right() - 26.0, inner.rect.top()),
+                egui::vec2(24.0, inner.rect.height()),
+            );
+            let del_resp = ui.interact(del_rect, row_id.with("del"), egui::Sense::click());
+            if del_resp.hovered() {
+                ui.painter().rect_filled(
+                    del_rect,
+                    crate::theme::miro::RADIUS_ITEM,
+                    egui::Color32::from_rgba_unmultiplied_const(0xff, 0x55, 0x55, 0x26),
+                );
+            }
+            ui.painter().text(
+                del_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "🗑",
+                egui::FontId::proportional(14.0),
+                theme.text_muted,
+            );
+            if del_resp.clicked() {
+                remove_idx = Some(i);
+            }
             if row_response.clicked() {
                 selected_host = Some(i);
-            }
-            // 双击条目直接连接（常见交互，也便于鼠标操作）。
-            if row_response.double_clicked() {
-                connect_idx = Some(i);
+                // 自实现双击检测（egui 多击计数会被无关点击污染）：
+                // 0.3s 内再次点击同一行 → 连接。
+                let now = ui.input(|i| i.time);
+                if let Some((t, idx)) = self.last_row_click {
+                    if idx == i && now - t < 0.3 {
+                        connect_idx = Some(i);
+                    }
+                }
+                self.last_row_click = Some((now, i));
             }
             // 选中/hover 行：accent-soft 底 + 圆角；选中时左侧 2px accent 指示条。
             if selected_host == Some(i) || row_response.hovered() {
@@ -481,16 +600,82 @@ impl KunApp {
         self.show_new_conn = open;
     }
 
+    /// 渲染标签页栏（新建/切换/关闭）。
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let theme = crate::theme::current_theme();
+        ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            let mut switch_to: Option<usize> = None;
+            let mut close_idx: Option<usize> = None;
+            for (i, tab) in self.tabs.iter().enumerate() {
+                // 每帧同步标签标题（会话标题可能变化）。
+                let title = tab.title();
+                let selected = i == self.active_tab;
+                let row = ui
+                    .scope_builder(egui::UiBuilder::new().id_salt(("tab", i)), |ui| {
+                        ui.horizontal(|ui| {
+                            // 标签主体：点击切换。
+                            if ui
+                                .selectable_label(
+                                    selected,
+                                    egui::RichText::new(&title).color(if selected {
+                                        theme.text_primary
+                                    } else {
+                                        theme.text_muted
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                switch_to = Some(i);
+                            }
+                            // 关闭按钮。
+                            if ui.small_button("×").on_hover_text("关闭标签页").clicked() {
+                                close_idx = Some(i);
+                            }
+                        });
+                    })
+                    .response;
+                // 未选中标签 hover 高亮。
+                if !selected && row.hovered() {
+                    ui.painter().rect_filled(
+                        row.rect.expand(2.0),
+                        crate::theme::miro::RADIUS_ITEM,
+                        theme.accent_soft,
+                    );
+                }
+            }
+            // 新建本地终端标签。
+            if ui
+                .add(
+                    egui::Button::new("＋")
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(crate::theme::miro::RADIUS_ITEM),
+                )
+                .on_hover_text("新建本地终端（⌘T）")
+                .clicked()
+            {
+                self.new_local_tab(ui.ctx());
+            }
+            if let Some(i) = switch_to {
+                self.active_tab = i;
+            }
+            if let Some(i) = close_idx {
+                self.close_tab(i);
+            }
+        });
+    }
+
     /// 渲染状态栏。
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            if let Some(terminal) = &self.terminal {
-                let session = terminal.session();
+            if let Some(tab) = self.tabs.get(self.active_tab) {
+                let session = tab.terminal.session();
                 let title = session.title();
                 ui.label(
                     egui::RichText::new(if title.is_empty() {
-                        "本地终端".to_string()
+                        tab.label.clone()
                     } else {
                         title
                     })
@@ -499,19 +684,20 @@ impl KunApp {
                 if session.has_exited() {
                     ui.colored_label(egui::Color32::from_rgb(0xff, 0x55, 0x55), "会话已退出");
                 }
+                if tab.sftp.is_some() {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0x50, 0xfa, 0x7b),
+                        format!("SFTP · {}", self.sftp_host),
+                    );
+                }
             }
-            if self.sftp.is_some() {
-                ui.separator();
-                ui.colored_label(
-                    egui::Color32::from_rgb(0x50, 0xfa, 0x7b),
-                    format!("SFTP · {}", self.sftp_host),
-                );
-            } else if self.pending_sftp.is_some() {
+            if self.pending_sftp.is_some() {
                 ui.separator();
                 ui.weak("SFTP 连接中…");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak("⌘N 新建连接  ⌘1 本地终端");
+                ui.weak("⌘B 主机  ⌘T 新建终端  ⌘W 关闭  ⌘1-9 切换  ⌘N 连接  ⌥1-4 主题");
             });
         });
     }
@@ -522,9 +708,20 @@ impl eframe::App for KunApp {
         let ctx = ui.ctx().clone();
 
         // ==================== 快捷键 ====================
-        // ⌘N 新建连接、⌘1 本地终端、⌥1-4 切换主题。
+        // ⌘N 新建连接、⌘T 新建本地终端、⌘W 关闭标签、⌘1-9 切换标签、⌥1-4 切换主题。
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
             self.show_new_conn = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T)) {
+            self.new_local_tab(&ctx);
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)) {
+            self.sidebar_open = !self.sidebar_open;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
+            && !self.tabs.is_empty()
+        {
+            self.close_tab(self.active_tab);
         }
         for (key, theme_idx) in [
             (egui::Key::Num1, 0),
@@ -540,15 +737,22 @@ impl eframe::App for KunApp {
                 ));
             }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1)) {
-            // 切换本地终端。
-            let repaint_ctx = ctx.clone();
-            let on_event = Arc::new(move |_ev: &SessionEvent| {
-                repaint_ctx.request_repaint();
-            });
-            if let Ok(session) = Session::spawn_local(SessionOptions::default(), 80, 24, on_event) {
-                self.terminal = Some(TerminalView::new(session));
-                self.sftp = None;
+        // ⌘1-9 切换到对应标签页。
+        for (key, idx) in [
+            (egui::Key::Num1, 0usize),
+            (egui::Key::Num2, 1),
+            (egui::Key::Num3, 2),
+            (egui::Key::Num4, 3),
+            (egui::Key::Num5, 4),
+            (egui::Key::Num6, 5),
+            (egui::Key::Num7, 6),
+            (egui::Key::Num8, 7),
+            (egui::Key::Num9, 8),
+        ] {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, key))
+                && idx < self.tabs.len()
+            {
+                self.active_tab = idx;
             }
         }
 
@@ -557,18 +761,20 @@ impl eframe::App for KunApp {
         self.poll_sftp();
         self.poll_update();
 
-        // ==================== 左侧主机栏 ====================
-        let sidebar_frame = egui::Frame::new()
-            .fill(crate::theme::current_theme().bg_panel)
-            .inner_margin(egui::Margin::symmetric(10, 10))
-            .stroke(egui::Stroke::new(1.0, crate::theme::current_theme().border));
-        egui::Panel::left("hosts")
-            .default_size(220.0)
-            .resizable(true)
-            .frame(sidebar_frame)
-            .show(ui, |ui| {
-                self.host_sidebar(ui);
-            });
+        // ==================== 左侧主机栏（可折叠，默认收起） ====================
+        if self.sidebar_open {
+            let sidebar_frame = egui::Frame::new()
+                .fill(crate::theme::current_theme().bg_panel)
+                .inner_margin(egui::Margin::symmetric(10, 10))
+                .stroke(egui::Stroke::new(1.0, crate::theme::current_theme().border));
+            egui::Panel::left("hosts")
+                .default_size(220.0)
+                .resizable(true)
+                .frame(sidebar_frame)
+                .show(ui, |ui| {
+                    self.host_sidebar(ui);
+                });
+        }
 
         // ==================== 顶部工具栏 ====================
         let toolbar_frame = egui::Frame::new()
@@ -581,6 +787,15 @@ impl eframe::App for KunApp {
                 self.toolbar(ui);
             });
 
+        // ==================== 标签页栏 ====================
+        let tab_frame = egui::Frame::new()
+            .fill(crate::theme::current_theme().bg_header)
+            .inner_margin(egui::Margin::symmetric(10, 3))
+            .stroke(egui::Stroke::new(1.0, crate::theme::current_theme().border));
+        egui::Panel::top("tabs").frame(tab_frame).show(ui, |ui| {
+            self.tab_bar(ui);
+        });
+
         // ==================== 状态栏 ====================
         let status_frame = egui::Frame::new()
             .fill(crate::theme::current_theme().bg_panel)
@@ -592,16 +807,16 @@ impl eframe::App for KunApp {
                 self.status_bar(ui);
             });
 
-        // ==================== 中央区：终端 | SFTP 分栏 ====================
+        // ==================== 中央区：当前标签页（终端 | SFTP 分栏） ====================
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(_pending) = &self.pending {
                 ui.centered_and_justified(|ui| {
                     ui.spinner();
                     ui.label(format!("正在连接 {} …", self.pending_label));
                 });
-            } else if let Some(terminal) = &mut self.terminal {
-                // SFTP 面板存在时水平分栏（终端左，SFTP 右，可拖拽）。
-                if self.sftp.is_some() {
+            } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                // 该标签页存在 SFTP 面板时水平分栏（终端左，SFTP 右，可拖拽）。
+                if let Some(sftp) = &mut tab.sftp {
                     let sftp_frame = egui::Frame::new()
                         .fill(crate::theme::current_theme().bg_panel)
                         .inner_margin(egui::Margin::symmetric(10, 8))
@@ -611,22 +826,24 @@ impl eframe::App for KunApp {
                         .resizable(true)
                         .frame(sftp_frame)
                         .show(ui, |ui| {
-                            if let Some(sftp) = &mut self.sftp {
-                                sftp.show(ui);
-                            }
+                            sftp.show(ui);
                         });
                 }
-                terminal.show(ui);
+                tab.terminal.show(ui);
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.label("本地终端启动失败，请查看日志。");
+                    if ui.button("新建本地终端").clicked() {
+                        self.new_local_tab(&ctx);
+                    }
                 });
             }
         });
 
-        // ==================== SFTP 对话框 ====================
-        if let Some(sftp) = &mut self.sftp {
-            sftp.show_dialog(&ctx);
+        // ==================== SFTP 对话框（当前标签页） ====================
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            if let Some(sftp) = &mut tab.sftp {
+                sftp.show_dialog(&ctx);
+            }
         }
 
         // ==================== 新建连接对话框 ====================
@@ -846,11 +1063,14 @@ mod app_tests {
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
         harness.run();
+        // 展开侧栏（默认折叠）。
+        harness.get_by_label("◧").click();
+        for _ in 0..3 {
+            harness.step();
+        }
 
-        // 点击工具栏"新建连接"按钮（工具栏与侧栏各有一个同名按钮，取第一个）。
-        let buttons: Vec<_> = harness.query_all_by_label("新建连接").collect();
-        assert!(buttons.len() >= 2, "工具栏与侧栏应各有一个新建连接按钮");
-        buttons[0].click();
+        // 点击侧栏"新建连接"按钮（工具栏按钮已移除，侧栏为唯一入口）。
+        harness.get_by_label("新建连接").click();
         // 终端持续请求重绘（光标闪烁），用 step 代替 run。
         for _ in 0..8 {
             harness.step();
@@ -950,11 +1170,27 @@ mod connect_tests {
         };
         config.save(&config_path).expect("写入测试配置失败");
 
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        // 步长 1/60s：两次点击间隔需小于双击检测窗口（0.3s），默认 step_dt=0.25s 会超时。
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(1.0 / 60.0)
+            .build_eframe(|cc| KunApp::new(cc));
         harness.run();
+        // 展开侧栏（默认折叠）。
+        harness.get_by_label("◧").click();
+        for _ in 0..3 {
+            harness.step();
+        }
 
-        // 点击侧栏条目的"连接"按钮。
-        harness.get_by_label("连接").click();
+        // 双击主机条目触发连接（单击选中，双击连接；两次点击间需跨帧）。
+        {
+            let host_row = harness.get_by_label("链路测试");
+            host_row.click();
+        }
+        harness.step();
+        {
+            let host_row = harness.get_by_label("链路测试");
+            host_row.click();
+        }
 
         // 轮询等待 SFTP 面板出现（连接完成）。
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -1044,9 +1280,26 @@ mod snapshot_tests {
         };
         config.save(&config_path).expect("写入测试配置失败");
 
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        // 步长 1/60s：保证双击检测窗口（0.3s）内完成两次点击。
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(1.0 / 60.0)
+            .build_eframe(|cc| KunApp::new(cc));
         harness.run();
-        harness.get_by_label("连接").click();
+        // 展开侧栏（默认折叠）。
+        harness.get_by_label("◧").click();
+        for _ in 0..3 {
+            harness.step();
+        }
+        // 双击主机条目触发连接（两次点击间需跨帧）。
+        {
+            let host_row = harness.get_by_label("链路测试");
+            host_row.click();
+        }
+        harness.step();
+        {
+            let host_row = harness.get_by_label("链路测试");
+            host_row.click();
+        }
 
         // 等待 SFTP 面板出现（并发测试可能竞争配置文件，失败时重写重试）。
         let mut connected = false;
@@ -1072,9 +1325,25 @@ mod snapshot_tests {
             }
             // 配置可能被并发测试删除，重新写入并重启应用。
             config.save(&config_path).ok();
-            harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+            harness = egui_kittest::Harness::builder()
+                .with_step_dt(1.0 / 60.0)
+                .build_eframe(|cc| KunApp::new(cc));
             harness.run();
-            harness.get_by_label("连接").click();
+            // 展开侧栏（默认折叠）。
+            harness.get_by_label("◧").click();
+            for _ in 0..3 {
+                harness.step();
+            }
+            // 双击主机条目触发连接（两次点击间需跨帧）。
+            {
+                let host_row = harness.get_by_label("链路测试");
+                host_row.click();
+            }
+            harness.step();
+            {
+                let host_row = harness.get_by_label("链路测试");
+                host_row.click();
+            }
         }
         assert!(connected, "连接失败，无法生成截图");
 
@@ -1124,5 +1393,272 @@ mod theme_tests {
             img.save(&out).expect("保存截图失败");
             eprintln!("已保存：{out}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    /// 标签栏"＋"按钮应新建标签页（而非替换）：关闭按钮数量 1 → 2。
+    #[test]
+    fn 新建本地终端标签页() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run();
+        assert_eq!(
+            harness.query_all_by_label("×").count(),
+            1,
+            "初始应有一个标签页"
+        );
+
+        // 标签栏"＋"按钮（工具栏"本地终端"按钮已移除）。
+        harness.get_by_label("＋").click();
+        for _ in 0..4 {
+            harness.step();
+        }
+        assert_eq!(
+            harness.query_all_by_label("×").count(),
+            2,
+            "点击后应有 2 个标签页"
+        );
+    }
+
+    /// ⌘T 新建标签页、⌘W 关闭当前标签页。
+    #[test]
+    fn 快捷键新建与关闭标签页() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run();
+
+        // ⌘T 新建。
+        harness.event(egui::Event::Key {
+            key: egui::Key::T,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..4 {
+            harness.step();
+        }
+        assert_eq!(
+            harness.query_all_by_label("×").count(),
+            2,
+            "⌘T 后应有 2 个标签页"
+        );
+
+        // ⌘W 关闭当前。
+        harness.event(egui::Event::Key {
+            key: egui::Key::W,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..4 {
+            harness.step();
+        }
+        assert_eq!(
+            harness.query_all_by_label("×").count(),
+            1,
+            "⌘W 后应回到 1 个标签页"
+        );
+        // 全部关闭后不应崩溃。
+        harness.event(egui::Event::Key {
+            key: egui::Key::W,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..4 {
+            harness.step();
+        }
+        assert_eq!(
+            harness.query_all_by_label("×").count(),
+            0,
+            "全部关闭后应无标签页"
+        );
+    }
+
+    /// 本地会话默认工作目录为 home（Finder 启动 cwd=/ 时终端应落在 ~）。
+    #[test]
+    fn 本地会话默认home目录() {
+        let opts = local_session_options();
+        assert_eq!(
+            opts.working_directory,
+            std::env::var("HOME").ok().map(PathBuf::from),
+            "本地会话应默认在 home 目录"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dblclick_probe {
+    use eframe::egui;
+
+    /// 最小复现：kittest 两次 click 是否触发 double_clicked。
+    #[test]
+    fn 双击检测探针() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(1.0 / 60.0)
+            .build_ui(|ui| {
+                let btn = ui.button("目标");
+                if btn.double_clicked() {
+                    ui.label("双击了");
+                }
+            });
+        harness.step();
+        {
+            let b = harness.get_by_label("目标");
+            b.click();
+        }
+        harness.step();
+        {
+            let b = harness.get_by_label("目标");
+            b.click();
+        }
+        harness.step();
+        assert!(
+            harness.root().query_all_by_label("双击了").next().is_some(),
+            "双击未触发"
+        );
+    }
+
+    /// 方案 G：显式 ui.interact(rect, id) 的单击/双击。
+    #[test]
+    fn 显式interact探针() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(1.0 / 60.0)
+            .build_ui(|ui| {
+                let inner = ui.scope_builder(egui::UiBuilder::new().id_salt("row"), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("行内标签");
+                        let _ = ui.button("其他");
+                    });
+                });
+                let row = ui.interact(
+                    inner.response.rect,
+                    egui::Id::new("row"),
+                    egui::Sense::click(),
+                );
+                if row.clicked() {
+                    ui.label("单击了");
+                }
+                if row.double_clicked() {
+                    ui.label("双击了");
+                }
+            });
+        harness.step();
+        {
+            let b = harness.get_by_label("行内标签");
+            b.click();
+        }
+        harness.step();
+        {
+            let b = harness.get_by_label("行内标签");
+            b.click();
+        }
+        harness.step();
+        assert!(
+            harness.root().query_all_by_label("双击了").next().is_some(),
+            "显式 interact 双击未触发"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::*;
+
+    /// 侧栏默认折叠（"主机"标题不可见），点 ◧ 展开，再点收起。
+    #[test]
+    fn 侧栏默认折叠可展开收起() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run();
+
+        // 默认折叠：无"新建连接"侧栏按钮。
+        assert!(
+            harness
+                .root()
+                .query_all_by_label("新建连接")
+                .next()
+                .is_none(),
+            "侧栏默认应折叠（新建连接按钮不可见）"
+        );
+
+        // 点击 ◧ 展开。
+        harness.get_by_label("◧").click();
+        for _ in 0..3 {
+            harness.step();
+        }
+        assert!(
+            harness
+                .root()
+                .query_all_by_label("新建连接")
+                .next()
+                .is_some(),
+            "展开后新建连接按钮应可见"
+        );
+        harness.get_by_label("新建连接");
+
+        // 再点 ◧ 收起。
+        harness.get_by_label("◧").click();
+        for _ in 0..3 {
+            harness.step();
+        }
+        assert!(
+            harness
+                .root()
+                .query_all_by_label("新建连接")
+                .next()
+                .is_none(),
+            "收起后新建连接按钮应不可见"
+        );
+    }
+
+    /// ⌘B 切换侧栏折叠。
+    #[test]
+    fn 快捷键切换侧栏() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run();
+        assert!(
+            harness
+                .root()
+                .query_all_by_label("新建连接")
+                .next()
+                .is_none(),
+            "默认折叠"
+        );
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..3 {
+            harness.step();
+        }
+        assert!(
+            harness
+                .root()
+                .query_all_by_label("新建连接")
+                .next()
+                .is_some(),
+            "⌘B 应展开侧栏"
+        );
     }
 }

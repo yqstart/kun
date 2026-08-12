@@ -61,12 +61,20 @@ crates/
 - 边框统一 5% 半透明白（`BORDER_SUBTLE`）；圆角 10px（按钮/输入）/6px（列表项）
 - 面板用 `Panel::frame(Frame)` 指定背景与边框；主按钮用 accent 填充
 - 终端背景在 TerminalView 里绘制 `BG_TERMINAL`；SFTP/主机列表行 hover/选中用 `ACCENT_SOFT` 圆角底
-- 主机条目支持单击选中、双击连接
+- 终端内容内边距 `PADDING=10`（`terminal_view.rs`）：背景铺满 `ui.max_rect()`，文本/光标在内边距内绘制。**注意 egui 陷阱：`ui.min_rect()` 是"已用内容"包围盒，无子项时为 0x0**——背景/点击区域必须用 `ui.max_rect()`（布局分配区域），否则背景画不出来、点击无法重新聚焦
+- 主机条目支持单击选中、双击连接；条目样式：**accent 圆形头像（主机名首字符）+ 名称 + 🗑 删除图标**（行右侧，hover 红底）
+- **egui 0.36 交互坑：`Response::interact()`（scope_builder(...).response.interact(...)）的点击无法命中**（响应链问题，kittest 实测 clicked/hovered 恒 false）——必须用 `ui.interact(rect, id, sense)` 显式注册交互区，删除按钮等行内控件最后注册以覆盖行点击区
 - 终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）在渲染层解析（`theme.rs::TERM_PALETTE_16`/`xterm256`），优先级：Spec > OSC 覆盖（term.colors）> 内置调色板；`Term.colors` 默认全 None，不设调色板则全部渲染为白色
 - 工具栏底部有紫→青渐变指示线（`draw_gradient_line`）；选中主机条目左侧 2px accent 竖条
 - **四套主题**（`theme.rs::THEMES`，对齐 MiroCode）：Miro 深色（紫）/ Dawn 浅色 / Midnight 深蓝 / Cyberpunk 霓虹；每套含 UI token + 终端调色板（16 色 + fg/bg/cursor）；`current_theme()` 静态读取，工具栏 ComboBox 切换（`set_theme`）
 - 主题切换后需重新渲染终端（terminal_view 每帧读 `current_theme()`）
 - 终端输入/回车功能验证正常；若用户"回车不执行"多为中文输入法（IME）激活时回车被输入法消费（确认拼音候选），切英文输入法即可（所有终端应用共性）
+- **"删除键插入空格"（微信输入法 wetype 等）**：退格/删除键按下时输入法会伴随发送"空格类" Text 事件（ASCII 空格/零宽），写入终端表现为插入空格——已修复：`suppress_next_text` 跨帧标记 + 退格后一帧内的空白类 Text 丢弃（只影响空白字符，不误伤正常输入）；回归测试 `退格伴随空格文本不插入`
+- 顶部工具栏：左侧「◧」主机列表折叠开关（默认**收起**，启动直接进终端，⌘B 切换）、右侧主题 ComboBox + 检查更新；「kun」标题、「新建连接」「本地终端」按钮已按用户要求移除——新建连接走左侧栏按钮/⌘N，新建本地终端走标签栏 ＋/⌘T
+- 主机行双击连接为**自实现检测**（`last_row_click`：0.3s 内同行的第二次点击）：egui 多击计数会把无关点击（如 ◧ 折叠按钮）计入序列导致 count=3 而 `double_clicked`（count==2）失效
+- **多标签页**（warp 风格）：`KunApp` 持 `tabs: Vec<TerminalTab>`（`label + TerminalView + sftp`），SFTP 按标签页挂载（远程 tab 独享）；标签栏在工具栏下方（`Panel::top("tabs")`），当前标签 accent-soft 高亮，支持点击切换/×关闭/＋新建；快捷键 ⌘T 新建本地、⌘W 关闭当前、⌘1-9 切换、⌘N 新建连接、⌥1-4 主题
+- 本地终端默认工作目录为 **home**（`local_session_options`：`working_directory = $HOME`）——Finder/Dock 启动时进程 cwd 为 `/`，不指定会导致终端落在根目录；远程会话不受影响（由 sshd 决定）
+- 终端内容颜色：prompt 彩色来自 shell 主题（如 oh-my-zsh robbyrussell 的绿/青/蓝/黄）；`ls` 无色是 macOS 默认行为（需 `alias ls='ls -G'`），kun 不篡改 shell 输出
 - 浅色主题兼容：终端背景强制跟随主题（忽略 OSC 11 背景覆盖——zsh 主题常设深色背景会破坏浅色主题）；`apply_theme` 同步系统主题（`ctx.set_theme`）使 macOS 标题栏跟随浅/深色
 - 主题快捷键：⌥1-⌥4 快速切换四套主题
 
@@ -74,14 +82,16 @@ crates/
 
 - 集成测试依赖本地测试 sshd：`/usr/sbin/sshd -f /tmp/kun-test-sshd/sshd_config`（端口 2222、公钥认证、含 sftp subsystem）
 - 配置文件：`~/.config/kun/hosts.toml`（toml 中 enum 用内部标记：`[hosts.auth.Key]`）
-- 字体：仅 Monospace/Proportional 族加载 CJK fallback（STHeiti），否则中文显示豆腐块
+- 应用图标：`assets/icon.png`（渐变紫 K，make-icon.swift 生成）→ `load_icon()` 解码为 IconData → `ViewportBuilder::with_icon`——**eframe 在 macOS 上通过 NSApp 运行时设置 Dock 图标**，无 .app bundle 的 debug 构建也能生效；`.app` 安装版的 Dock 图标由 package-macos.sh 的 kun.icns 提供（同一设计）
+- 字体：Monospace 族 = SF Mono（主）+ **Menlo（符号 fallback）** + STHeiti（CJK）+ egui 默认；Proportional 族 = SF 主 + STHeiti。**SF Mono 缺 `➜`(U+279C)/`❯`(U+276F)/`⚡` 等常用 zsh 提示符符号**，缺字形会被 egui 渲染为 `?` 替换符；Menlo 同为等宽且完整覆盖（宽度一致不漂移），必须排在 CJK fallback 之前。**禁止加载 Apple Color Emoji.ttc**（192MB 彩色位图字体，ab_glyph 无法解析 → egui panic）
+- 提示符 `?➜` 中的 `?` 是 oh-my-zsh robbyrussell 主题 `%1{➜%}` 语法在 zsh 5.9 的真实输出（script 捕获字节流验证：`0x3F E2 9E 9C`），Terminal.app 同样显示，**非 kun 渲染问题，勿尝试"修复"**
 - egui 0.36 API 注意：`App::ui` 替代 `update`、`Panel::top/left` 替代 `TopBottomPanel`、`Fonts` 需要 `fonts_mut`、`Event::Key` 无 `text` 字段（Text 独立事件）
 - 终端视图使用固定 `focus_id` 管理键盘焦点；对话框打开时自动聚焦首个输入框
 
 ## 验证
 
 ```bash
-cargo test --workspace         # 17 个测试（单元 + ssh 集成 + sftp 集成 + UI 渲染）
+cargo test --workspace         # 36 个测试（单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页 + 双击交互）
 cargo clippy --workspace --all-targets   # 零警告
 cargo fmt --all
 ```
