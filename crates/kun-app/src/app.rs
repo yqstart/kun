@@ -522,3 +522,141 @@ mod tests {
         harness.get_by_label("终端区域");
     }
 }
+
+#[cfg(test)]
+mod dialog_tests {
+    use super::*;
+
+    /// 完整渲染"新建连接"对话框（含密码/私钥切换、自动聚焦），不应崩溃。
+    #[test]
+    fn 新建连接对话框完整渲染() {
+        use kittest::Queryable;
+        let mut form = ConnectForm {
+            name: "测试".into(),
+            host: "127.0.0.1".into(),
+            port: "22".into(),
+            user: "root".into(),
+            auth_kind: 0,
+            password: String::new(),
+            key_path: String::new(),
+            passphrase: String::new(),
+            name_focused: false,
+        };
+        let mut show = true;
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            let mut open = show;
+            egui::Window::new("新建连接")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("conn_form")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("名称");
+                            let name_id = egui::Id::new("conn_form_name");
+                            ui.add(egui::TextEdit::singleline(&mut form.name).id(name_id));
+                            if !form.name_focused {
+                                ui.memory_mut(|m| m.request_focus(name_id));
+                                form.name_focused = true;
+                            }
+                            ui.end_row();
+                            ui.label("主机");
+                            ui.text_edit_singleline(&mut form.host);
+                            ui.end_row();
+                            ui.label("端口");
+                            ui.text_edit_singleline(&mut form.port);
+                            ui.end_row();
+                            ui.label("用户名");
+                            ui.text_edit_singleline(&mut form.user);
+                            ui.end_row();
+                            ui.label("认证方式");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut form.auth_kind, 0, "密码");
+                                ui.selectable_value(&mut form.auth_kind, 1, "私钥");
+                            });
+                            ui.end_row();
+                            if form.auth_kind == 0 {
+                                ui.label("密码");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.password).password(true),
+                                );
+                                ui.end_row();
+                            } else {
+                                ui.label("私钥路径");
+                                ui.text_edit_singleline(&mut form.key_path);
+                                ui.end_row();
+                                ui.label("口令（可选）");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.passphrase).password(true),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let _ = ui.button("连接");
+                        let _ = ui.button("取消");
+                    });
+                });
+            show = open;
+        });
+        harness.run();
+
+        // 渲染完成，切换到私钥模式再渲染一帧。
+        harness.get_by_label("私钥").click();
+        harness.run();
+        harness.get_by_label("私钥路径");
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    /// 完整应用：点击"新建连接"按钮打开对话框，不应崩溃。
+    /// （回归测试：用户报告点击新建连接直接闪退）
+    #[test]
+    fn 点击新建连接不崩溃() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run();
+
+        // 点击工具栏"新建连接"按钮（工具栏与侧栏各有一个同名按钮，取第一个）。
+        let buttons: Vec<_> = harness.query_all_by_label("新建连接").collect();
+        assert!(buttons.len() >= 2, "工具栏与侧栏应各有一个新建连接按钮");
+        buttons[0].click();
+        // 终端持续请求重绘（光标闪烁），用 step 代替 run。
+        for _ in 0..8 {
+            harness.step();
+        }
+
+        // 对话框应出现且可交互（多个同名节点时取任意一个）。
+        assert!(
+            harness.query_all_by_label("名称").next().is_some(),
+            "名称字段缺失"
+        );
+        assert!(
+            harness.query_all_by_label("端口").next().is_some(),
+            "端口字段缺失"
+        );
+        assert!(
+            harness.query_all_by_label("用户名").next().is_some(),
+            "用户名字段缺失"
+        );
+        assert!(
+            harness.query_all_by_label("认证方式").next().is_some(),
+            "认证方式缺失"
+        );
+        assert!(
+            harness.query_all_by_label("连接").next().is_some(),
+            "连接按钮缺失"
+        );
+        assert!(
+            harness.query_all_by_label("取消").next().is_some(),
+            "取消按钮缺失"
+        );
+    }
+}

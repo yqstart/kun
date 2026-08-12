@@ -16,5 +16,5 @@ alacritty_terminal = "0.26"
 rfd = "0.15"
 
 [dev-dependencies]
-egui_kittest = "0.36.1"
+egui_kittest = { version = "0.36.1", features = ["eframe"] }
 kittest = "0.4"

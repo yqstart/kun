@@ -441,6 +441,12 @@ impl TerminalView {
                         if mods.ctrl || mods.alt {
                             continue;
                         }
+                        // 过滤不可打印字符（控制符/私有区/零宽字符等）。
+                        // 某些输入法或平台在退格等按键时会产生零宽空格（\u{200b}），
+                        // 直接写入会在终端插入空格。
+                        if !text.chars().all(is_printable_text_char) {
+                            continue;
+                        }
                         session.write(text.as_bytes());
                     }
                     egui::Event::Paste(text) => {
@@ -606,6 +612,16 @@ fn build_job(segments: &[Segment], font_size: f32) -> LayoutJob {
     job
 }
 
+/// 判断字符是否可安全写入终端（过滤控制符/私有区/零宽字符）。
+fn is_printable_text_char(c: char) -> bool {
+    !c.is_ascii_control()
+        && !('\u{e000}'..='\u{f8ff}').contains(&c) // 私有使用区
+        && !('\u{200b}'..='\u{200f}').contains(&c) // 零宽空格/左右连接符
+        && !('\u{2060}'..='\u{2064}').contains(&c) // 单词连接符等
+        && !('\u{fe00}'..='\u{fe0f}').contains(&c) // 变体选择符
+        && c != '\u{feff}' // BOM/零宽不换行空格
+}
+
 /// egui 键 → 终端字符键（仅无文本时兜底使用）。
 fn map_char_key(key: &egui::Key) -> Option<Key> {
     use egui::Key as E;
@@ -668,5 +684,160 @@ fn map_special_key(key: &egui::Key) -> Option<Key> {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kun_core::terminal::{Session, SessionOptions};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// 将终端可见区域转为文本。
+    fn grid_text(session: &Session) -> String {
+        use alacritty_terminal::term::cell::Flags;
+        let term_arc = session.term();
+        let guard = term_arc.lock();
+        let content = guard.renderable_content();
+        let mut lines: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut current_line = usize::MAX;
+        for item in content.display_iter {
+            let cell = item.cell;
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
+                continue;
+            }
+            if item.point.line.0 as usize != current_line {
+                if current_line != usize::MAX {
+                    lines.push(current.trim_end().to_string());
+                }
+                current = String::new();
+                current_line = item.point.line.0 as usize;
+            }
+            current.push(cell.c);
+        }
+        if current_line != usize::MAX {
+            lines.push(current.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    /// 等待终端文本包含子串。
+    fn wait_text(
+        view: &Rc<RefCell<TerminalView>>,
+        harness: &mut egui_kittest::Harness,
+        needle: &str,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            harness.step();
+            let text = grid_text(view.borrow().session());
+            if text.contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        false
+    }
+
+    /// 模拟真实按键：Key 事件 + Text 事件（与 egui-winit 行为一致）。
+    fn send_key(harness: &mut egui_kittest::Harness, key: egui::Key, text: Option<&str>) {
+        harness.event(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        if let Some(t) = text {
+            harness.event(egui::Event::Text(t.to_string()));
+        }
+    }
+
+    /// 退格键应删除已输入字符（回归测试：曾出现删除键异常）。
+    #[test]
+    fn 退格键删除输入字符() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+
+        // 等待 zsh 提示符出现。
+        assert!(
+            wait_text(&view, &mut harness, "kun"),
+            "zsh 未就绪，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+
+        // 输入 abc。
+        send_key(&mut harness, egui::Key::A, Some("a"));
+        send_key(&mut harness, egui::Key::B, Some("b"));
+        send_key(&mut harness, egui::Key::C, Some("c"));
+        assert!(
+            wait_text(&view, &mut harness, "abc"),
+            "输入 abc 失败，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+
+        // 按退格：模拟真实环境的 Key 事件 + 输入法产生的零宽空格 Text 事件。
+        send_key(&mut harness, egui::Key::Backspace, Some("\u{200b}"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut deleted = false;
+        while Instant::now() < deadline {
+            harness.step();
+            let text = grid_text(view.borrow().session());
+            // zsh 回显行应变为 "ab"（末尾 abc → ab），且不应出现多余空格。
+            if let Some(line) = text.lines().find(|l| l.ends_with("ab")) {
+                if !line.ends_with("abc") {
+                    deleted = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            deleted,
+            "退格未删除字符（或插入了异常字符），终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+    }
+
+    /// 普通字符键不应产生重复或异常字节。
+    #[test]
+    fn 普通字符单次写入() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        assert!(wait_text(&view, &mut harness, "kun"), "zsh 未就绪");
+
+        send_key(&mut harness, egui::Key::A, Some("a"));
+        assert!(
+            wait_text(&view, &mut harness, "a"),
+            "字符 a 未显示，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+        // 不应有重复 "aa"。
+        let text = grid_text(view.borrow().session());
+        assert!(!text.contains("aa"), "字符重复写入，终端内容：\n{text}");
     }
 }

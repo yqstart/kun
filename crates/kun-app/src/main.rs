@@ -71,6 +71,26 @@ fn setup_fonts(ctx: &egui::Context) {
 fn main() -> eframe::Result {
     env_logger::init();
 
+    // ==================== 崩溃日志捕获 ====================
+    // panic 信息写入文件，便于排查闪退问题（闪退时 stderr 不可见）。
+    let panic_log = std::env::temp_dir().join("kun-panic.log");
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "未知位置".into());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let msg = format!(
+            "=== kun 崩溃时间：{} ===\n位置：{location}\n信息：{info}\n堆栈：\n{backtrace}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_else(|_| "未知".into())
+        );
+        let _ = std::fs::write(&panic_log, &msg);
+        eprintln!("kun 发生崩溃，详情已写入 {}", panic_log.display());
+    }));
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
