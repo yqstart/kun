@@ -9,7 +9,9 @@ use kun_core::ssh::{ConnectResult, connect_remote};
 use kun_core::terminal::{Session, SessionEvent, SessionOptions};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::views::sftp_view::SftpView;
 use crate::views::terminal_view::TerminalView;
+use kun_core::ssh::sftp::{connect_sftp, SftpEvent, SftpHandle};
 
 /// 新建连接表单状态。
 #[derive(Default)]
@@ -40,6 +42,12 @@ pub struct KunApp {
     pending_label: String,
     /// 提示消息（消息, 是否错误）。
     toast: Option<(String, bool)>,
+    /// SFTP 面板（远程连接时存在）。
+    sftp: Option<SftpView>,
+    /// 进行中的 SFTP 连接。
+    pending_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>)>,
+    /// 远程连接的主机名（用于 SFTP 面板标题）。
+    sftp_host: String,
     dark_mode: bool,
 }
 
@@ -74,6 +82,9 @@ impl KunApp {
             pending: None,
             pending_label: String::new(),
             toast: None,
+            sftp: None,
+            pending_sftp: None,
+            sftp_host: String::new(),
             dark_mode: true,
         }
     }
@@ -111,7 +122,7 @@ impl KunApp {
         }
     }
 
-    /// 发起远程连接。
+    /// 发起远程连接（同时启动 SFTP 连接）。
     fn start_connect(&mut self, ctx: &egui::Context, profile: HostProfile) {
         let label = profile.name.clone();
         let ctx = ctx.clone();
@@ -120,7 +131,37 @@ impl KunApp {
         });
         let (_thread, rx) = connect_remote(&profile, 80, 24, on_event);
         self.pending = Some(rx);
-        self.pending_label = label;
+        self.pending_label = label.clone();
+
+        // 并行建立 SFTP 连接。
+        let (_sftp_thread, sftp_handle, sftp_rx) = connect_sftp(&profile);
+        self.sftp_host = label;
+        self.pending_sftp = Some((sftp_handle, sftp_rx));
+        self.sftp = None;
+    }
+
+    /// 处理 SFTP 连接结果。
+    fn poll_sftp(&mut self) {
+        let mut ready = false;
+        let mut failed: Option<String> = None;
+        if let Some((_handle, rx)) = &mut self.pending_sftp {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    SftpEvent::Ready => ready = true,
+                    SftpEvent::Failed(e) => failed = Some(e),
+                    _ => {}
+                }
+            }
+        }
+        if ready {
+            if let Some((handle, rx)) = self.pending_sftp.take() {
+                self.sftp = Some(SftpView::new(&self.sftp_host, handle, rx));
+            }
+        }
+        if let Some(e) = failed {
+            self.pending_sftp = None;
+            self.toast = Some((format!("SFTP 连接失败：{e}"), true));
+        }
     }
 
     /// 渲染顶部工具栏。
@@ -307,6 +348,7 @@ impl eframe::App for KunApp {
 
         // ==================== 处理连接结果 ====================
         self.poll_connection(&ctx);
+        self.poll_sftp();
 
         // ==================== 左侧主机栏 ====================
         egui::Panel::left("hosts").default_size(220.0).resizable(true).show(ui, |ui| {
@@ -323,7 +365,7 @@ impl eframe::App for KunApp {
             self.status_bar(ui);
         });
 
-        // ==================== 中央终端区 ====================
+        // ==================== 中央区：终端 | SFTP 分栏 ====================
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(_pending) = &self.pending {
                 ui.centered_and_justified(|ui| {
@@ -331,6 +373,17 @@ impl eframe::App for KunApp {
                     ui.label(format!("正在连接 {} …", self.pending_label));
                 });
             } else if let Some(terminal) = &mut self.terminal {
+                // SFTP 面板存在时水平分栏（终端左，SFTP 右，可拖拽）。
+                if self.sftp.is_some() {
+                    egui::Panel::right("sftp_panel")
+                        .default_size(360.0)
+                        .resizable(true)
+                        .show(ui, |ui| {
+                            if let Some(sftp) = &mut self.sftp {
+                                sftp.show(ui);
+                            }
+                        });
+                }
                 terminal.show(ui);
             } else {
                 ui.centered_and_justified(|ui| {
@@ -338,6 +391,11 @@ impl eframe::App for KunApp {
                 });
             }
         });
+
+        // ==================== SFTP 对话框 ====================
+        if let Some(sftp) = &mut self.sftp {
+            sftp.show_dialog(&ctx);
+        }
 
         // ==================== 新建连接对话框 ====================
         self.connect_dialog(&ctx);
@@ -381,12 +439,12 @@ mod tests {
         let mut harness = Harness::new_ui(|ui| {
             egui::Panel::left("hosts").default_size(220.0).resizable(true).show(ui, |ui| {
                 ui.heading("主机");
-                ui.button("新建连接");
+                let _ = ui.button("新建连接");
                 ui.weak("暂无已保存主机");
             });
             egui::Panel::top("toolbar").show(ui, |ui| {
                 ui.label(egui::RichText::new("kun").strong());
-                ui.button("本地终端");
+                let _ = ui.button("本地终端");
             });
             egui::Panel::bottom("status").show(ui, |ui| {
                 ui.label("状态栏");

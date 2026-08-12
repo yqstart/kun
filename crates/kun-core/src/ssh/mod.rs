@@ -38,7 +38,7 @@ pub enum ConnectResult {
 }
 
 /// russh 客户端 Handler（MVP：接受所有服务器密钥）。
-struct ClientHandler;
+pub(crate) struct ClientHandler;
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
@@ -88,36 +88,11 @@ pub fn connect_remote(
                     }
                 };
 
-            let authed = match &profile.auth {
-                Auth::Password(password) => {
-                    match handle.authenticate_password(&profile.user, password).await {
-                        Ok(result) => result.success(),
-                        Err(e) => {
-                            let _ = tx.send(ConnectResult::Failed(format!("认证失败：{e}")));
-                            return;
-                        }
-                    }
-                }
-                Auth::Key { path, passphrase } => {
-                    match load_private_key(path, passphrase.as_deref()) {
-                        Ok(key) => {
-                            let key =
-                                PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
-                            match handle.authenticate_publickey(&profile.user, key).await {
-                                Ok(result) => result.success(),
-                                Err(e) => {
-                                    let _ = tx.send(ConnectResult::Failed(format!(
-                                        "公钥认证失败：{e}"
-                                    )));
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(ConnectResult::Failed(format!("加载私钥失败：{e}")));
-                            return;
-                        }
-                    }
+            let authed = match authenticate(&mut handle, &profile).await {
+                Ok(ok) => ok,
+                Err(e) => {
+                    let _ = tx.send(ConnectResult::Failed(e));
+                    return;
                 }
             };
             if !authed {
@@ -273,4 +248,28 @@ fn load_private_key(
 ) -> Result<russh::keys::PrivateKey, String> {
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     decode_secret_key(&content, passphrase).map_err(|e| e.to_string())
+}
+
+/// 执行认证（密码或私钥），返回是否成功。
+pub(crate) async fn authenticate(
+    handle: &mut client::Handle<ClientHandler>,
+    profile: &crate::config::HostProfile,
+) -> Result<bool, String> {
+    let authed = match &profile.auth {
+        Auth::Password(password) => handle
+            .authenticate_password(&profile.user, password)
+            .await
+            .map_err(|e| format!("认证失败：{e}"))?
+            .success(),
+        Auth::Key { path, passphrase } => {
+            let key = load_private_key(path, passphrase.as_deref()).map_err(|e| format!("加载私钥失败：{e}"))?;
+            let key = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
+            handle
+                .authenticate_publickey(&profile.user, key)
+                .await
+                .map_err(|e| format!("公钥认证失败：{e}"))?
+                .success()
+        }
+    };
+    Ok(authed)
 }

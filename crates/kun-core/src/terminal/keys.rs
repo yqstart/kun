@@ -231,7 +231,8 @@ mod tests {
     }
 
     #[test]
-    fn shiftTab反向制表() {
+    #[allow(non_snake_case)]
+    fn shift_tab_reverse() {
         let mods = Mods { shift: true, ..Default::default() };
         assert_eq!(encode_key(Key::Tab, mods, TermMode::NONE).unwrap(), b"\x1b[Z");
     }
