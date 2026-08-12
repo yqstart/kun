@@ -23,17 +23,17 @@
 | 工具 | 要求 |
 |---|---|
 | Rust | stable（推荐 1.80+） |
-| 系统 | macOS / Windows / Linux |
+| 系统 | macOS 12+（Apple Silicon / Intel） |
 
-## 平台支持状态
+## 平台支持
 
-| 平台 | 状态 | 说明 |
-|---|---|---|
-| macOS（ARM / Intel） | ✅ 完整支持 | 开发主平台，本地充分验证（含打包 dmg） |
-| Linux x64 | ✅ 编译通过 | 交叉编译检查通过；字体/配置路径已适配（依赖系统 CJK 字体） |
-| Windows x64 | 🚧 待 CI 验证 | 代码无平台特有问题，本地无法交叉编译（ring 需 MSVC 工具链），首次发布由 CI windows-latest 原生构建验证 |
+**仅支持 macOS**（Apple Silicon + Intel），发布产物为 `.dmg` 安装包。
 
-> 说明：本地（macOS）可交叉检查 Linux 目标；Windows 需真实 Windows 环境或 CI 验证。若 Windows 构建发现问题，会在首个 Release 的 CI 日志中暴露并修复。
+## 自动更新
+
+- 启动后自动检查 GitHub Releases 最新版本（后台，不阻塞）
+- 工具栏「检查更新」可手动检查
+- 发现新版本时弹出提示（版本号 + 更新说明），一键跳转下载页
 
 ## 快速开始
 
@@ -73,21 +73,13 @@ xattr -cr "/Applications/kun.app"
 
 然后右键 → **打开** 即可。原因：产物未签名 / 未公证。
 
-### Windows 安装提示「已保护你的电脑」
-
-SmartScreen 拦截时点 **更多信息** → **仍要运行**；或解除下载标记：
-
-```powershell
-Unblock-File -LiteralPath "$env:USERPROFILE\Downloads\kun-*.zip"
-```
-
 ## 文档
 
 | 文档 | 说明 |
 |---|---|
 | [使用说明](docs/使用说明.md) | 功能与快捷键全览 |
 | [技术架构](docs/技术架构.md) | 选型、分层、数据流设计 |
-| [多平台发布](docs/多平台发布.md) | GitHub Actions 打包 macOS / Win / Linux |
+| [多平台发布](docs/多平台发布.md) | GitHub Actions 打包 macOS 安装包 |
 | [贡献指南](CONTRIBUTING.md) | 开发环境与 PR 约定 |
 | [安全政策](SECURITY.md) | 漏洞报告方式 |
 | [更新日志](CHANGELOG.md) | 版本变更 |

@@ -540,6 +540,17 @@ mod tests {
         use kun_core::ssh::sftp::connect_sftp;
         use std::time::{Duration, Instant};
 
+        // 测试 sshd 不可达时跳过（CI 无测试 sshd）。
+        if std::net::TcpStream::connect_timeout(
+            &"127.0.0.1:2222".parse().unwrap(),
+            Duration::from_millis(500),
+        )
+        .is_err()
+        {
+            eprintln!("跳过：测试 sshd 未运行");
+            return;
+        }
+
         let profile = test_profile();
         if let kun_core::config::Auth::Key { path, .. } = &profile.auth {
             if !path.exists() {

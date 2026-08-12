@@ -67,13 +67,6 @@ impl HostConfig {
 
 /// 默认配置文件路径：`~/.config/kun/hosts.toml`。
 pub fn default_config_path() -> PathBuf {
-    // Windows 用 %APPDATA%；其余平台用 ~/.config。
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("kun").join("hosts.toml");
-        }
-    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home)
         .join(".config")

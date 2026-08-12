@@ -12,6 +12,8 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
+ureq = "3"
+regex = "1"
 
 [dependencies.russh]
 version = "0.62"

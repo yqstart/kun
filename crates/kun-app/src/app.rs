@@ -7,6 +7,7 @@ use eframe::egui;
 use kun_core::config::{default_config_path, Auth, HostConfig, HostProfile};
 use kun_core::ssh::{connect_remote, ConnectResult};
 use kun_core::terminal::{Session, SessionEvent, SessionOptions};
+use kun_core::updater::{check_for_update, UpdateInfo};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::views::sftp_view::SftpView;
@@ -26,6 +27,20 @@ struct ConnectForm {
     passphrase: String,
     /// 名称输入框是否已聚焦（对话框打开时自动聚焦）。
     name_focused: bool,
+}
+
+/// 更新检查状态。
+enum UpdateState {
+    /// 未检查。
+    Idle,
+    /// 检查中。
+    Checking,
+    /// 发现新版本。
+    Available(UpdateInfo),
+    /// 已是最新。
+    UpToDate,
+    /// 检查失败（静默，不打扰用户）。
+    Failed,
 }
 
 /// 应用状态。
@@ -50,6 +65,10 @@ pub struct KunApp {
     pending_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>)>,
     /// 远程连接的主机名（用于 SFTP 面板标题）。
     sftp_host: String,
+    /// 更新检查状态。
+    update_state: UpdateState,
+    /// 更新检查结果接收端。
+    update_rx: Option<std::sync::mpsc::Receiver<Result<Option<UpdateInfo>, String>>>,
 }
 
 impl KunApp {
@@ -74,7 +93,7 @@ impl KunApp {
             }
         };
 
-        Self {
+        let mut app = Self {
             terminal,
             config,
             config_path,
@@ -86,6 +105,47 @@ impl KunApp {
             sftp: None,
             pending_sftp: None,
             sftp_host: String::new(),
+            update_state: UpdateState::Idle,
+            update_rx: None,
+        };
+        // 启动时自动检查更新（后台线程，延迟 3 秒）。
+        app.start_update_check(true);
+        app
+    }
+
+    /// 启动后台更新检查（delay=true 时延迟 3 秒，避免影响启动）。
+    fn start_update_check(&mut self, delay: bool) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        std::thread::spawn(move || {
+            if delay {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+            let result = check_for_update(&current, kun_core::updater::DEFAULT_REPO);
+            let _ = tx.send(result);
+        });
+        self.update_rx = Some(rx);
+        self.update_state = UpdateState::Checking;
+    }
+
+    /// 处理更新检查结果。
+    fn poll_update(&mut self) {
+        let mut result = None;
+        if let Some(rx) = &self.update_rx {
+            while let Ok(r) = rx.try_recv() {
+                result = Some(r);
+            }
+        }
+        if let Some(result) = result {
+            self.update_rx = None;
+            self.update_state = match result {
+                Ok(Some(info)) => UpdateState::Available(info),
+                Ok(None) => UpdateState::UpToDate,
+                Err(e) => {
+                    log::debug!("检查更新失败：{e}");
+                    UpdateState::Failed
+                }
+            };
         }
     }
 
@@ -194,6 +254,18 @@ impl KunApp {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 手动检查更新。
+                let update_btn = match &self.update_state {
+                    UpdateState::Checking => "检查中…".to_string(),
+                    UpdateState::Available(_) => "新版本可用".to_string(),
+                    UpdateState::UpToDate => "已是最新".to_string(),
+                    UpdateState::Failed => "检查失败".to_string(),
+                    UpdateState::Idle => "检查更新".to_string(),
+                };
+                if ui.button(update_btn).clicked() {
+                    self.start_update_check(false);
+                }
+                ui.separator();
                 // 主题切换（四套皮肤循环）。
                 let themes = &crate::theme::THEMES;
                 let current = crate::theme::current_theme().name;
@@ -483,6 +555,7 @@ impl eframe::App for KunApp {
         // ==================== 处理连接结果 ====================
         self.poll_connection(&ctx);
         self.poll_sftp();
+        self.poll_update();
 
         // ==================== 左侧主机栏 ====================
         let sidebar_frame = egui::Frame::new()
@@ -558,6 +631,52 @@ impl eframe::App for KunApp {
 
         // ==================== 新建连接对话框 ====================
         self.connect_dialog(&ctx);
+
+        // ==================== 更新提示弹窗 ====================
+        if let UpdateState::Available(info) = &self.update_state {
+            let mut dismiss = false;
+            egui::Window::new("发现新版本")
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "kun {} 已发布（当前 v{}）",
+                            info.version,
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .strong(),
+                    );
+                    ui.add_space(6.0);
+                    if !info.notes.is_empty() {
+                        let preview: String = info.notes.chars().take(400).collect();
+                        ui.label(
+                            egui::RichText::new(preview)
+                                .color(crate::theme::current_theme().text_secondary),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("前往下载")
+                                    .fill(crate::theme::current_theme().accent)
+                                    .stroke(egui::Stroke::NONE),
+                            )
+                            .clicked()
+                        {
+                            ctx.open_url(egui::OpenUrl::same_tab(info.url.clone()));
+                            dismiss = true;
+                        }
+                        if ui.button("稍后").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+            if dismiss {
+                self.update_state = UpdateState::Idle;
+            }
+        }
 
         // ==================== 提示消息 ====================
         if let Some((message, is_error)) = &self.toast {

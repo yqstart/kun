@@ -27,7 +27,4 @@
 ### 安装
 
 - **macOS**：下载 `kun-<版本>-macos.dmg`，打开并拖入"应用程序"；首次打开若提示未认证，右键 → 打开
-- **Linux**：下载 `kun-<版本>-linux-x64.tar.gz`，解压后运行 `kun-app`
-- **Windows**：下载 `kun-<版本>-windows-x64.zip`，解压后运行 `kun-app.exe`
-
-> 注：当前版本未签名/未公证，macOS 首次打开需在"系统设置 → 隐私与安全性"中允许；Windows 可能出现 SmartScreen 提示。
+> 注：当前版本未签名/未公证，macOS 首次打开需在"系统设置 → 隐私与安全性"中允许。

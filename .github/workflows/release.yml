@@ -1,7 +1,6 @@
-# ==================== kun 多平台发布 ====================
+# ==================== kun 发布（macOS） ====================
 # 触发：推送 v* 标签（如 v0.1.0），或 Actions 页手动 Run workflow。
-# 流程：四平台矩阵原生构建（macOS ARM/Intel、Linux x64、Windows x64）→
-#       macOS 打 .app + dmg、Linux tar.gz、Windows zip → 上传 GitHub Release。
+# 流程：macOS ARM / Intel 原生构建 → .app + dmg → 上传 GitHub Release。
 # 说明：产物未签名/未公证（可后续配置）；版本号取自 git tag。
 
 name: Release
@@ -35,25 +34,11 @@ jobs:
             platform: macos-15-intel
             artifact: kun-macos-x64
             package: dmg
-          - name: Linux x64
-            platform: ubuntu-22.04
-            artifact: kun-linux-x64
-            package: targz
-          - name: Windows x64
-            platform: windows-latest
-            artifact: kun-windows-x64
-            package: zip
 
     runs-on: ${{ matrix.platform }}
 
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -83,37 +68,6 @@ jobs:
           path: |
             target/release/kun-*.dmg
             target/release/kun.icns
-
-      # ============ Linux：tar.gz ============
-      - name: Package Linux (tar.gz)
-        if: matrix.package == 'targz'
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-          tar -czf "dist/kun-${VERSION}-linux-x64.tar.gz" -C target/release kun-app
-
-      - name: Upload Linux artifact
-        if: matrix.package == 'targz'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/kun-*.tar.gz
-
-      # ============ Windows：zip ============
-      - name: Package Windows (zip)
-        if: matrix.package == 'zip'
-        shell: pwsh
-        run: |
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
-          New-Item -ItemType Directory -Force -Path dist
-          Compress-Archive -Path target/release/kun-app.exe -DestinationPath "dist/kun-$version-windows-x64.zip"
-
-      - name: Upload Windows artifact
-        if: matrix.package == 'zip'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/kun-*.zip
 
   # ============ 汇总发布到 GitHub Release ============
   publish:
