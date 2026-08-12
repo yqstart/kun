@@ -201,10 +201,12 @@ impl KunApp {
                     .selected_text(current)
                     .show_ui(ui, |ui| {
                         for (i, theme) in themes.iter().enumerate() {
-                            if ui.selectable_label(
-                                crate::theme::current_theme().name == theme.name,
-                                theme.name,
-                            ).clicked()
+                            if ui
+                                .selectable_label(
+                                    crate::theme::current_theme().name == theme.name,
+                                    theme.name,
+                                )
+                                .clicked()
                             {
                                 crate::theme::set_theme(ui.ctx(), i);
                             }
@@ -212,7 +214,6 @@ impl KunApp {
                     });
             });
         });
-
     }
 
     /// 渲染左侧主机列表。
@@ -240,7 +241,10 @@ impl KunApp {
         ui.separator();
 
         if self.config.hosts.is_empty() {
-            ui.label(egui::RichText::new("暂无已保存主机").color(crate::theme::current_theme().text_muted));
+            ui.label(
+                egui::RichText::new("暂无已保存主机")
+                    .color(crate::theme::current_theme().text_muted),
+            );
         }
         let mut remove_idx: Option<usize> = None;
         let mut connect_idx: Option<usize> = None;
@@ -446,9 +450,23 @@ impl eframe::App for KunApp {
         let ctx = ui.ctx().clone();
 
         // ==================== 快捷键 ====================
-        // ⌘N 新建连接、⌘1 本地终端、Esc 关闭对话框。
+        // ⌘N 新建连接、⌘1 本地终端、⌥1-4 切换主题。
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
             self.show_new_conn = true;
+        }
+        for (key, theme_idx) in [
+            (egui::Key::Num1, 0),
+            (egui::Key::Num2, 1),
+            (egui::Key::Num3, 2),
+            (egui::Key::Num4, 3),
+        ] {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, key)) {
+                crate::theme::set_theme(&ctx, theme_idx);
+                self.toast = Some((
+                    format!("主题：{}", crate::theme::current_theme().name),
+                    false,
+                ));
+            }
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1)) {
             // 切换本地终端。

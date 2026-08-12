@@ -136,8 +136,11 @@ impl TerminalView {
             let guard = term_arc.lock();
             let content = guard.renderable_content();
             let colors = content.colors;
-            let default_fg = colors[NamedColor::Foreground].unwrap_or(crate::theme::current_theme().term_fg);
-            let default_bg = colors[NamedColor::Background].unwrap_or(crate::theme::current_theme().term_bg);
+            let default_fg =
+                colors[NamedColor::Foreground].unwrap_or(crate::theme::current_theme().term_fg);
+            // 背景色强制跟随主题（忽略 OSC 背景覆盖——zsh 主题常设置深色背景，
+            // 会导致浅色主题下终端仍为深色）。
+            let default_bg = crate::theme::current_theme().term_bg;
             self.last_mode = content.mode;
             let mode = content.mode;
             let cursor = content.cursor;
@@ -287,7 +290,8 @@ impl TerminalView {
             if cursor_visible && cursor.shape != CursorShape::Hidden {
                 let (line, col) = (cursor.point.line.0 as usize, cursor.point.column.0);
                 if line < self.rows as usize && col < self.cols as usize {
-                    let color = colors[NamedColor::Cursor].unwrap_or(crate::theme::current_theme().term_cursor);
+                    let color = colors[NamedColor::Cursor]
+                        .unwrap_or(crate::theme::current_theme().term_cursor);
                     cursor_color = Some(to_egui(color));
                     cursor_rect = Some(Rect::from_min_size(
                         ui.min_rect().min
@@ -522,13 +526,18 @@ fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Co
     match color {
         AColor::Spec(rgb) => to_egui(rgb),
         AColor::Named(n) => {
-            // OSC 覆盖优先（终端程序动态改色）。
+            // 背景始终用主题色（OSC 11 背景覆盖不生效——zsh 主题常设深色背景，
+            // 否则浅色主题下终端仍为深色）。
+            if n == NamedColor::Background {
+                return to_egui(crate::theme::current_theme().term_bg);
+            }
+            // OSC 覆盖优先（其余颜色仍尊重终端程序动态改色）。
             if let Some(rgb) = colors[n as usize] {
                 return to_egui(rgb);
             }
             match n {
                 NamedColor::Foreground => to_egui(default),
-                NamedColor::Background => to_egui(default),
+                NamedColor::Background => unreachable!(),
                 NamedColor::Cursor => to_egui(crate::theme::current_theme().term_cursor),
                 _ => {
                     let mut idx = n as usize;
@@ -540,7 +549,10 @@ fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Co
                         to_egui(crate::theme::current_theme().term_palette[idx])
                     } else {
                         // 其余命名色（Dim 系等）用 256 色表兜底。
-                        to_egui(crate::theme::xterm256(idx as u8, crate::theme::current_theme().term_palette))
+                        to_egui(crate::theme::xterm256(
+                            idx as u8,
+                            crate::theme::current_theme().term_palette,
+                        ))
                     }
                 }
             }
@@ -550,7 +562,10 @@ fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Co
             if let Some(rgb) = colors[i as usize] {
                 return to_egui(rgb);
             }
-            to_egui(crate::theme::xterm256(i, crate::theme::current_theme().term_palette))
+            to_egui(crate::theme::xterm256(
+                i,
+                crate::theme::current_theme().term_palette,
+            ))
         }
     }
 }
@@ -1050,5 +1065,55 @@ mod enter_tests {
             "回车未执行命令，终端内容：\n{}",
             grid_text(view.borrow().session())
         );
+    }
+}
+
+#[cfg(test)]
+mod osc_tests {
+    use super::*;
+
+    /// 浅色主题兼容：终端程序（如 zsh 主题）通过 OSC 11 设置深色背景时，
+    /// 背景应强制跟随主题色（否则浅色主题下终端仍为深色）。
+    #[test]
+    #[allow(non_snake_case)]
+    fn 背景色忽略OSC覆盖() {
+        use alacritty_terminal::term::color::Colors as TermColors;
+        use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor as Named};
+
+        let mut colors = TermColors::default();
+        // 模拟 zsh 主题发送 OSC 11 设置深色背景。
+        colors[Named::Background] = Some(Rgb {
+            r: 0x1a,
+            g: 0x1a,
+            b: 0x1a,
+        });
+
+        // 任意主题下：背景应为主题色，而非 OSC 深色。
+        let theme_bg = crate::theme::current_theme().term_bg;
+        let resolved = resolve_color(
+            TermColor::Named(Named::Background),
+            &colors,
+            theme_bg,
+            false,
+        );
+        assert_eq!(
+            resolved,
+            Color32::from_rgb(theme_bg.r, theme_bg.g, theme_bg.b),
+            "背景应跟随主题，忽略 OSC 覆盖"
+        );
+
+        // 前景仍尊重 OSC（程序控制文字颜色是合理行为）。
+        colors[Named::Foreground] = Some(Rgb {
+            r: 0x00,
+            g: 0xff,
+            b: 0x00,
+        });
+        let resolved_fg = resolve_color(
+            TermColor::Named(Named::Foreground),
+            &colors,
+            theme_bg,
+            false,
+        );
+        assert_eq!(resolved_fg, Color32::from_rgb(0x00, 0xff, 0x00));
     }
 }

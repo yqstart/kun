@@ -256,6 +256,8 @@ pub fn apply_dark(ctx: &Context) {
 pub struct Theme {
     /// 显示名称。
     pub name: &'static str,
+    /// 是否为浅色主题（用于系统标题栏/滚动条跟随）。
+    pub light: bool,
     // ---- UI token ----
     pub bg_app: Color32,
     pub bg_header: Color32,
@@ -293,6 +295,12 @@ pub fn set_theme(ctx: &Context, index: usize) {
 
 /// 应用指定主题。
 pub fn apply_theme(ctx: &Context, theme: &Theme) {
+    // 同步系统主题（macOS 标题栏/滚动条跟随浅色/深色）。
+    ctx.set_theme(if theme.light {
+        egui::ThemePreference::Light
+    } else {
+        egui::ThemePreference::Dark
+    });
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     let mut visuals = Visuals::dark();
 
@@ -346,88 +354,345 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
 
 /// miro-dark：Catppuccin Mocha（默认，紫调）。
 const PALETTE_MIRO: [Rgb; 16] = [
-    Rgb { r: 0x45, g: 0x47, b: 0x5a },
-    Rgb { r: 0xf3, g: 0x8b, b: 0xa8 },
-    Rgb { r: 0xa6, g: 0xe3, b: 0xa1 },
-    Rgb { r: 0xf9, g: 0xe2, b: 0xaf },
-    Rgb { r: 0x89, g: 0xb4, b: 0xfa },
-    Rgb { r: 0xf5, g: 0xc2, b: 0xe7 },
-    Rgb { r: 0x94, g: 0xe2, b: 0xd5 },
-    Rgb { r: 0xba, g: 0xc2, b: 0xde },
-    Rgb { r: 0x58, g: 0x5b, b: 0x70 },
-    Rgb { r: 0xf3, g: 0x8b, b: 0xa8 },
-    Rgb { r: 0xa6, g: 0xe3, b: 0xa1 },
-    Rgb { r: 0xf9, g: 0xe2, b: 0xaf },
-    Rgb { r: 0x89, g: 0xb4, b: 0xfa },
-    Rgb { r: 0xf5, g: 0xc2, b: 0xe7 },
-    Rgb { r: 0x94, g: 0xe2, b: 0xd5 },
-    Rgb { r: 0xa6, g: 0xad, b: 0xc8 },
+    Rgb {
+        r: 0x45,
+        g: 0x47,
+        b: 0x5a,
+    },
+    Rgb {
+        r: 0xf3,
+        g: 0x8b,
+        b: 0xa8,
+    },
+    Rgb {
+        r: 0xa6,
+        g: 0xe3,
+        b: 0xa1,
+    },
+    Rgb {
+        r: 0xf9,
+        g: 0xe2,
+        b: 0xaf,
+    },
+    Rgb {
+        r: 0x89,
+        g: 0xb4,
+        b: 0xfa,
+    },
+    Rgb {
+        r: 0xf5,
+        g: 0xc2,
+        b: 0xe7,
+    },
+    Rgb {
+        r: 0x94,
+        g: 0xe2,
+        b: 0xd5,
+    },
+    Rgb {
+        r: 0xba,
+        g: 0xc2,
+        b: 0xde,
+    },
+    Rgb {
+        r: 0x58,
+        g: 0x5b,
+        b: 0x70,
+    },
+    Rgb {
+        r: 0xf3,
+        g: 0x8b,
+        b: 0xa8,
+    },
+    Rgb {
+        r: 0xa6,
+        g: 0xe3,
+        b: 0xa1,
+    },
+    Rgb {
+        r: 0xf9,
+        g: 0xe2,
+        b: 0xaf,
+    },
+    Rgb {
+        r: 0x89,
+        g: 0xb4,
+        b: 0xfa,
+    },
+    Rgb {
+        r: 0xf5,
+        g: 0xc2,
+        b: 0xe7,
+    },
+    Rgb {
+        r: 0x94,
+        g: 0xe2,
+        b: 0xd5,
+    },
+    Rgb {
+        r: 0xa6,
+        g: 0xad,
+        b: 0xc8,
+    },
 ];
 
 /// midnight：深蓝（Catppuccin 蓝调）。
 const PALETTE_MIDNIGHT: [Rgb; 16] = [
-    Rgb { r: 0x3b, g: 0x42, b: 0x68 },
-    Rgb { r: 0xf7, g: 0x76, b: 0x8e },
-    Rgb { r: 0x9e, g: 0xce, b: 0x6a },
-    Rgb { r: 0xe0, g: 0xaf, b: 0x68 },
-    Rgb { r: 0x7a, g: 0xa2, b: 0xf7 },
-    Rgb { r: 0xbb, g: 0x9a, b: 0xf7 },
-    Rgb { r: 0x7d, g: 0xcf, b: 0xff },
-    Rgb { r: 0xa9, g: 0xb1, b: 0xd6 },
-    Rgb { r: 0x41, g: 0x48, b: 0x68 },
-    Rgb { r: 0xf7, g: 0x76, b: 0x8e },
-    Rgb { r: 0x9e, g: 0xce, b: 0x6a },
-    Rgb { r: 0xe0, g: 0xaf, b: 0x68 },
-    Rgb { r: 0x7a, g: 0xa2, b: 0xf7 },
-    Rgb { r: 0xbb, g: 0x9a, b: 0xf7 },
-    Rgb { r: 0x7d, g: 0xcf, b: 0xff },
-    Rgb { r: 0xc0, g: 0xca, b: 0xf5 },
+    Rgb {
+        r: 0x3b,
+        g: 0x42,
+        b: 0x68,
+    },
+    Rgb {
+        r: 0xf7,
+        g: 0x76,
+        b: 0x8e,
+    },
+    Rgb {
+        r: 0x9e,
+        g: 0xce,
+        b: 0x6a,
+    },
+    Rgb {
+        r: 0xe0,
+        g: 0xaf,
+        b: 0x68,
+    },
+    Rgb {
+        r: 0x7a,
+        g: 0xa2,
+        b: 0xf7,
+    },
+    Rgb {
+        r: 0xbb,
+        g: 0x9a,
+        b: 0xf7,
+    },
+    Rgb {
+        r: 0x7d,
+        g: 0xcf,
+        b: 0xff,
+    },
+    Rgb {
+        r: 0xa9,
+        g: 0xb1,
+        b: 0xd6,
+    },
+    Rgb {
+        r: 0x41,
+        g: 0x48,
+        b: 0x68,
+    },
+    Rgb {
+        r: 0xf7,
+        g: 0x76,
+        b: 0x8e,
+    },
+    Rgb {
+        r: 0x9e,
+        g: 0xce,
+        b: 0x6a,
+    },
+    Rgb {
+        r: 0xe0,
+        g: 0xaf,
+        b: 0x68,
+    },
+    Rgb {
+        r: 0x7a,
+        g: 0xa2,
+        b: 0xf7,
+    },
+    Rgb {
+        r: 0xbb,
+        g: 0x9a,
+        b: 0xf7,
+    },
+    Rgb {
+        r: 0x7d,
+        g: 0xcf,
+        b: 0xff,
+    },
+    Rgb {
+        r: 0xc0,
+        g: 0xca,
+        b: 0xf5,
+    },
 ];
 
 /// cyberpunk：霓虹（紫粉 + 青）。
 const PALETTE_CYBER: [Rgb; 16] = [
-    Rgb { r: 0x2a, g: 0x1a, b: 0x3e },
-    Rgb { r: 0xff, g: 0x5c, b: 0x8a },
-    Rgb { r: 0x00, g: 0xff, b: 0x9f },
-    Rgb { r: 0xff, g: 0xd3, b: 0x00 },
-    Rgb { r: 0x00, g: 0xd4, b: 0xff },
-    Rgb { r: 0xff, g: 0x71, b: 0xce },
-    Rgb { r: 0x00, g: 0xff, b: 0xe0 },
-    Rgb { r: 0xe0, g: 0xe0, b: 0xff },
-    Rgb { r: 0x4a, g: 0x2a, b: 0x6e },
-    Rgb { r: 0xff, g: 0x5c, b: 0x8a },
-    Rgb { r: 0x00, g: 0xff, b: 0x9f },
-    Rgb { r: 0xff, g: 0xd3, b: 0x00 },
-    Rgb { r: 0x00, g: 0xd4, b: 0xff },
-    Rgb { r: 0xff, g: 0x71, b: 0xce },
-    Rgb { r: 0x00, g: 0xff, b: 0xe0 },
-    Rgb { r: 0xff, g: 0xff, b: 0xff },
+    Rgb {
+        r: 0x2a,
+        g: 0x1a,
+        b: 0x3e,
+    },
+    Rgb {
+        r: 0xff,
+        g: 0x5c,
+        b: 0x8a,
+    },
+    Rgb {
+        r: 0x00,
+        g: 0xff,
+        b: 0x9f,
+    },
+    Rgb {
+        r: 0xff,
+        g: 0xd3,
+        b: 0x00,
+    },
+    Rgb {
+        r: 0x00,
+        g: 0xd4,
+        b: 0xff,
+    },
+    Rgb {
+        r: 0xff,
+        g: 0x71,
+        b: 0xce,
+    },
+    Rgb {
+        r: 0x00,
+        g: 0xff,
+        b: 0xe0,
+    },
+    Rgb {
+        r: 0xe0,
+        g: 0xe0,
+        b: 0xff,
+    },
+    Rgb {
+        r: 0x4a,
+        g: 0x2a,
+        b: 0x6e,
+    },
+    Rgb {
+        r: 0xff,
+        g: 0x5c,
+        b: 0x8a,
+    },
+    Rgb {
+        r: 0x00,
+        g: 0xff,
+        b: 0x9f,
+    },
+    Rgb {
+        r: 0xff,
+        g: 0xd3,
+        b: 0x00,
+    },
+    Rgb {
+        r: 0x00,
+        g: 0xd4,
+        b: 0xff,
+    },
+    Rgb {
+        r: 0xff,
+        g: 0x71,
+        b: 0xce,
+    },
+    Rgb {
+        r: 0x00,
+        g: 0xff,
+        b: 0xe0,
+    },
+    Rgb {
+        r: 0xff,
+        g: 0xff,
+        b: 0xff,
+    },
 ];
 
 /// dawn：浅色（日间）。
 const PALETTE_DAWN: [Rgb; 16] = [
-    Rgb { r: 0x8a, g: 0x8a, b: 0x8a },
-    Rgb { r: 0xd2, g: 0x4d, b: 0x3d },
-    Rgb { r: 0x2e, g: 0x8b, b: 0x57 },
-    Rgb { r: 0xb5, g: 0x8f, b: 0x00 },
-    Rgb { r: 0x25, g: 0x63, b: 0xeb },
-    Rgb { r: 0xa5, g: 0x5e, b: 0xe0 },
-    Rgb { r: 0x0e, g: 0x9f, b: 0x9a },
-    Rgb { r: 0x4a, g: 0x4a, b: 0x4a },
-    Rgb { r: 0x9a, g: 0x9a, b: 0x9a },
-    Rgb { r: 0xd2, g: 0x4d, b: 0x3d },
-    Rgb { r: 0x2e, g: 0x8b, b: 0x57 },
-    Rgb { r: 0xb5, g: 0x8f, b: 0x00 },
-    Rgb { r: 0x25, g: 0x63, b: 0xeb },
-    Rgb { r: 0xa5, g: 0x5e, b: 0xe0 },
-    Rgb { r: 0x0e, g: 0x9f, b: 0x9a },
-    Rgb { r: 0x4a, g: 0x4a, b: 0x4a },
+    Rgb {
+        r: 0x8a,
+        g: 0x8a,
+        b: 0x8a,
+    },
+    Rgb {
+        r: 0xd2,
+        g: 0x4d,
+        b: 0x3d,
+    },
+    Rgb {
+        r: 0x2e,
+        g: 0x8b,
+        b: 0x57,
+    },
+    Rgb {
+        r: 0xb5,
+        g: 0x8f,
+        b: 0x00,
+    },
+    Rgb {
+        r: 0x25,
+        g: 0x63,
+        b: 0xeb,
+    },
+    Rgb {
+        r: 0xa5,
+        g: 0x5e,
+        b: 0xe0,
+    },
+    Rgb {
+        r: 0x0e,
+        g: 0x9f,
+        b: 0x9a,
+    },
+    Rgb {
+        r: 0x4a,
+        g: 0x4a,
+        b: 0x4a,
+    },
+    Rgb {
+        r: 0x9a,
+        g: 0x9a,
+        b: 0x9a,
+    },
+    Rgb {
+        r: 0xd2,
+        g: 0x4d,
+        b: 0x3d,
+    },
+    Rgb {
+        r: 0x2e,
+        g: 0x8b,
+        b: 0x57,
+    },
+    Rgb {
+        r: 0xb5,
+        g: 0x8f,
+        b: 0x00,
+    },
+    Rgb {
+        r: 0x25,
+        g: 0x63,
+        b: 0xeb,
+    },
+    Rgb {
+        r: 0xa5,
+        g: 0x5e,
+        b: 0xe0,
+    },
+    Rgb {
+        r: 0x0e,
+        g: 0x9f,
+        b: 0x9a,
+    },
+    Rgb {
+        r: 0x4a,
+        g: 0x4a,
+        b: 0x4a,
+    },
 ];
 
 /// 四套主题（对齐 MiroCode：miro-dark / dawn / midnight / cyberpunk）。
 pub static THEMES: [Theme; 4] = [
     Theme {
         name: "Miro 深色",
+        light: false,
         bg_app: Color32::from_rgb(0x0a, 0x0a, 0x0d),
         bg_header: Color32::from_rgb(0x14, 0x14, 0x18),
         bg_panel: Color32::from_rgb(0x1c, 0x1c, 0x22),
@@ -440,13 +705,26 @@ pub static THEMES: [Theme; 4] = [
         accent_soft: Color32::from_rgba_unmultiplied_const(0x8b, 0x5c, 0xf6, 0x29),
         success: Color32::from_rgb(0x34, 0xd3, 0x99),
         danger: Color32::from_rgb(0xf8, 0x71, 0x71),
-        term_bg: Rgb { r: 0x11, g: 0x11, b: 0x1b }, // crust（更深的紫调）
-        term_fg: Rgb { r: 0xcd, g: 0xd6, b: 0xf4 },
-        term_cursor: Rgb { r: 0xf5, g: 0xc2, b: 0xe7 },
+        term_bg: Rgb {
+            r: 0x11,
+            g: 0x11,
+            b: 0x1b,
+        }, // crust（更深的紫调）
+        term_fg: Rgb {
+            r: 0xcd,
+            g: 0xd6,
+            b: 0xf4,
+        },
+        term_cursor: Rgb {
+            r: 0xf5,
+            g: 0xc2,
+            b: 0xe7,
+        },
         term_palette: PALETTE_MIRO,
     },
     Theme {
         name: "Dawn 浅色",
+        light: true,
         bg_app: Color32::from_rgb(0xf5, 0xf5, 0xf7),
         bg_header: Color32::from_rgb(0xec, 0xec, 0xf0),
         bg_panel: Color32::from_rgb(0xe8, 0xe8, 0xed),
@@ -459,13 +737,26 @@ pub static THEMES: [Theme; 4] = [
         accent_soft: Color32::from_rgba_unmultiplied_const(0x25, 0x63, 0xeb, 0x1f),
         success: Color32::from_rgb(0x16, 0xa3, 0x4a),
         danger: Color32::from_rgb(0xd2, 0x4d, 0x3d),
-        term_bg: Rgb { r: 0xff, g: 0xff, b: 0xff },
-        term_fg: Rgb { r: 0x1d, g: 0x1d, b: 0x1f },
-        term_cursor: Rgb { r: 0x25, g: 0x63, b: 0xeb },
+        term_bg: Rgb {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+        },
+        term_fg: Rgb {
+            r: 0x1d,
+            g: 0x1d,
+            b: 0x1f,
+        },
+        term_cursor: Rgb {
+            r: 0x25,
+            g: 0x63,
+            b: 0xeb,
+        },
         term_palette: PALETTE_DAWN,
     },
     Theme {
         name: "Midnight 深蓝",
+        light: false,
         bg_app: Color32::from_rgb(0x07, 0x0b, 0x16),
         bg_header: Color32::from_rgb(0x0d, 0x13, 0x22),
         bg_panel: Color32::from_rgb(0x11, 0x18, 0x2b),
@@ -478,13 +769,26 @@ pub static THEMES: [Theme; 4] = [
         accent_soft: Color32::from_rgba_unmultiplied_const(0x38, 0xbd, 0xf8, 0x26),
         success: Color32::from_rgb(0x2d, 0xd4, 0xbf),
         danger: Color32::from_rgb(0xf4, 0x71, 0x71),
-        term_bg: Rgb { r: 0x0a, g: 0x0f, b: 0x1e },
-        term_fg: Rgb { r: 0xc0, g: 0xca, b: 0xf5 },
-        term_cursor: Rgb { r: 0x7d, g: 0xcf, b: 0xff },
+        term_bg: Rgb {
+            r: 0x0a,
+            g: 0x0f,
+            b: 0x1e,
+        },
+        term_fg: Rgb {
+            r: 0xc0,
+            g: 0xca,
+            b: 0xf5,
+        },
+        term_cursor: Rgb {
+            r: 0x7d,
+            g: 0xcf,
+            b: 0xff,
+        },
         term_palette: PALETTE_MIDNIGHT,
     },
     Theme {
         name: "Cyberpunk 霓虹",
+        light: false,
         bg_app: Color32::from_rgb(0x0b, 0x05, 0x0f),
         bg_header: Color32::from_rgb(0x16, 0x0a, 0x1e),
         bg_panel: Color32::from_rgb(0x1e, 0x0e, 0x2a),
@@ -497,9 +801,21 @@ pub static THEMES: [Theme; 4] = [
         accent_soft: Color32::from_rgba_unmultiplied_const(0x22, 0xd3, 0xee, 0x29),
         success: Color32::from_rgb(0x00, 0xff, 0x9f),
         danger: Color32::from_rgb(0xff, 0x5c, 0x8a),
-        term_bg: Rgb { r: 0x12, g: 0x08, b: 0x1a },
-        term_fg: Rgb { r: 0xe0, g: 0xe0, b: 0xff },
-        term_cursor: Rgb { r: 0x00, g: 0xff, b: 0xe0 },
+        term_bg: Rgb {
+            r: 0x12,
+            g: 0x08,
+            b: 0x1a,
+        },
+        term_fg: Rgb {
+            r: 0xe0,
+            g: 0xe0,
+            b: 0xff,
+        },
+        term_cursor: Rgb {
+            r: 0x00,
+            g: 0xff,
+            b: 0xe0,
+        },
         term_palette: PALETTE_CYBER,
     },
 ];

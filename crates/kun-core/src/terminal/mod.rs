@@ -149,7 +149,10 @@ pub struct Session {
     shuttor: Shuttor,
     /// 本地会话的 PTY 读取线程（远程会话为 None）。
     pty_thread: Option<
-        JoinHandle<(EventLoop<tty::Pty, Listener>, alacritty_terminal::event_loop::State)>,
+        JoinHandle<(
+            EventLoop<tty::Pty, Listener>,
+            alacritty_terminal::event_loop::State,
+        )>,
     >,
 }
 

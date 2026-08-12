@@ -67,6 +67,8 @@ crates/
 - **四套主题**（`theme.rs::THEMES`，对齐 MiroCode）：Miro 深色（紫）/ Dawn 浅色 / Midnight 深蓝 / Cyberpunk 霓虹；每套含 UI token + 终端调色板（16 色 + fg/bg/cursor）；`current_theme()` 静态读取，工具栏 ComboBox 切换（`set_theme`）
 - 主题切换后需重新渲染终端（terminal_view 每帧读 `current_theme()`）
 - 终端输入/回车功能验证正常；若用户"回车不执行"多为中文输入法（IME）激活时回车被输入法消费（确认拼音候选），切英文输入法即可（所有终端应用共性）
+- 浅色主题兼容：终端背景强制跟随主题（忽略 OSC 11 背景覆盖——zsh 主题常设深色背景会破坏浅色主题）；`apply_theme` 同步系统主题（`ctx.set_theme`）使 macOS 标题栏跟随浅/深色
+- 主题快捷键：⌥1-⌥4 快速切换四套主题
 
 ## 关键约定
 
