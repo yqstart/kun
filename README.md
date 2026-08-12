@@ -61,6 +61,28 @@ crates/
 | 启动时间 | < 300 ms | 冷启动 |
 | 运行内存 | ~220 MB | wgpu + 终端缓存（可优化） |
 
+## 发布
+
+推送 `v*` 标签即触发多平台发布（GitHub Actions）：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+自动构建并发布到 GitHub Release：
+
+| 平台 | 产物 |
+|---|---|
+| macOS Apple Silicon / Intel | `kun-<版本>-macos.dmg` |
+| Linux x64 | `kun-<版本>-linux-x64.tar.gz` |
+| Windows x64 | `kun-<版本>-windows-x64.zip` |
+
+- 版本号取自 tag（`v0.1.0` → `0.1.0`），Release 正文从 `CHANGELOG.md` 提取
+- 产物未签名/未公证：macOS 首次打开需右键 → 打开；Windows 可能提示 SmartScreen
+- 本地预览打包产物：`./scripts/package-macos.sh <版本>`（生成 .app + dmg）
+- CI（push/PR）自动跑构建、测试、clippy、fmt
+
 ## 已知限制（Roadmap）
 
 - 密码明文存于 hosts.toml（后续接入 macOS Keychain）

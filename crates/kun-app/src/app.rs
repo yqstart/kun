@@ -770,6 +770,17 @@ mod connect_tests {
     use super::*;
     use kun_core::config::Auth;
 
+    /// 测试 sshd 是否可达（127.0.0.1:2222）；不可达时跳过网络测试。
+    fn sshd_available() -> bool {
+        use std::net::TcpStream;
+        use std::time::Duration;
+        TcpStream::connect_timeout(
+            &"127.0.0.1:2222".parse().unwrap(),
+            Duration::from_millis(500),
+        )
+        .is_ok()
+    }
+
     /// 测试主机（需本地测试 sshd 运行，见 scripts/test-sshd.sh）。
     fn test_profile() -> HostProfile {
         let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
@@ -800,6 +811,11 @@ mod connect_tests {
     fn 点击连接建立远程会话() {
         use kittest::Queryable;
         use std::time::{Duration, Instant};
+
+        if !sshd_available() {
+            eprintln!("跳过：测试 sshd 未运行（scripts/test-sshd.sh start）");
+            return;
+        }
 
         // 预写主机配置（测试后清理）。
         let profile = test_profile();
@@ -853,12 +869,28 @@ mod connect_tests {
 mod snapshot_tests {
     use super::*;
 
+    /// 测试 sshd 是否可达（127.0.0.1:2222）；不可达时跳过网络测试。
+    fn sshd_available() -> bool {
+        use std::net::TcpStream;
+        use std::time::Duration;
+        TcpStream::connect_timeout(
+            &"127.0.0.1:2222".parse().unwrap(),
+            Duration::from_millis(500),
+        )
+        .is_ok()
+    }
+
     /// 连接测试 sshd 后渲染应用界面并保存截图（供视觉验证）。
     #[test]
     fn 生成连接后样式截图() {
         use kittest::Queryable;
         use kun_core::config::Auth;
         use std::time::{Duration, Instant};
+
+        if !sshd_available() {
+            eprintln!("跳过：测试 sshd 未运行");
+            return;
+        }
 
         let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
             format!(
