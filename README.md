@@ -1,91 +1,93 @@
-# kun —— 轻量终端 + SFTP 可视化工具
+# kun
 
-原生 GUI 终端工具：本地/远程（SSH）终端 + 可视化 SFTP 文件管理，参照 Termius/WindTerm 的双栏分屏交互。
+基于 Rust + egui 的轻量级终端与 SFTP 可视化工具。
 
-## 特性
+**许可证：[MIT](LICENSE)** · 纯开源免费
 
-- **本地终端**：基于 alacritty_terminal 内核（生产级 VT 仿真），支持 256 色、宽字符、滚动、括号粘贴、闪烁光标
+## 产品定位
+
+主打**轻量、快速、美观**的终端体验：本地 / 远程（SSH）终端 + 可视化 SFTP 文件管理，交互参照 Termius / WindTerm 的双栏分屏。核心功能集已收敛，后续迭代围绕性能、流畅度与视觉细节持续打磨。
+
+## 功能概览
+
+- **本地终端**：基于 [alacritty_terminal](https://github.com/alacritty/alacritty) 生产级内核（VT 仿真 + PTY），256 色、宽字符、滚动、括号粘贴、闪烁光标
 - **SSH 远程终端**：密码 / 私钥认证（支持口令），xterm-256color PTY
-- **SFTP 可视化**：双栏分屏（终端 | SFTP 可拖拽），目录导航、上传/下载带进度条、删除/重命名/新建目录（带确认对话框）
-- **主机管理**：主机配置持久化（`~/.config/kun/hosts.toml`）
-- **界面**：Dracula 系深色主题（可切浅色）、SF Mono + 中文 fallback 字体、macOS 原生窗口
+- **SFTP 可视化**：终端 | SFTP 双栏分屏（可拖拽），目录导航、上传 / 下载带进度条、删除 / 重命名 / 新建目录（带确认对话框）
+- **主机管理**：主机配置持久化（`~/.config/kun/hosts.toml`），单击选中、双击连接
+- **四套主题**：`Miro 深色`（默认）/ `Dawn 浅色` / `Midnight 深蓝` / `Cyberpunk 霓虹`，每套含独立终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）
+- **快捷键**：⌘N 新建连接、⌘1 本地终端、⌥1-⌥4 切换主题
+- **全 Rust 无 C 依赖**：单二进制、启动 < 300ms
 
-## 快捷键
+## 环境要求
 
-| 快捷键 | 功能 |
+| 工具 | 要求 |
 |---|---|
-| ⌘N | 新建连接 |
-| ⌘1 | 切回本地终端 |
+| Rust | stable（推荐 1.80+） |
+| 系统 | macOS / Windows / Linux |
 
-## 构建与运行
+## 快速开始
 
 ```bash
 cargo build --release
 ./target/release/kun-app
 ```
 
-## 测试
+开发模式：
 
 ```bash
-cargo test --workspace          # 单元 + 集成测试
+cargo run
+```
+
+测试与静态检查：
+
+```bash
+cargo test --workspace
 cargo clippy --workspace --all-targets
-cargo fmt --all
+cargo fmt --all --check
 ```
 
-集成测试（`crates/kun-core/tests/`）连接本地测试 sshd（127.0.0.1:2222），可用环境变量覆盖：
+集成测试（SSH / SFTP 链路）需要本地测试 sshd，一键脚本：
 
 ```bash
-KUN_TEST_HOST=127.0.0.1 KUN_TEST_PORT=2222 KUN_TEST_USER=yanqi KUN_TEST_KEY=~/.ssh/id_ed25519
+./scripts/test-sshd.sh start
+cargo test --workspace
 ```
 
-## 架构
+### macOS 安装提示「已损坏」
 
-```
-crates/
-├── kun-core/       # 纯引擎（无 UI 依赖）
-│   ├── terminal/   # 会话封装（alacritty_terminal 内核）+ 键盘编码
-│   ├── ssh/        # 远程终端会话 + SFTP 客户端（russh）
-│   └── config/     # 主机配置模型与持久化
-└── kun-app/        # egui 应用
-    ├── views/      # terminal_view（cell 渲染）/ sftp_view（文件面板）
-    └── theme.rs    # Dracula 主题
-```
-
-详细设计见 [AGENTS.md](AGENTS.md)。
-
-## 性能（macOS arm64, release）
-
-| 指标 | 数值 | 说明 |
-|---|---|---|
-| 二进制大小 | 21 MB | 单二进制 |
-| 启动时间 | < 300 ms | 冷启动 |
-| 运行内存 | ~220 MB | wgpu + 终端缓存（可优化） |
-
-## 发布
-
-推送 `v*` 标签即触发多平台发布（GitHub Actions）：
+从 Release 安装后若提示「kun 已损坏，无法打开」，在终端执行：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+xattr -cr "/Applications/kun.app"
 ```
 
-自动构建并发布到 GitHub Release：
+然后右键 → **打开** 即可。原因：产物未签名 / 未公证。
 
-| 平台 | 产物 |
+### Windows 安装提示「已保护你的电脑」
+
+SmartScreen 拦截时点 **更多信息** → **仍要运行**；或解除下载标记：
+
+```powershell
+Unblock-File -LiteralPath "$env:USERPROFILE\Downloads\kun-*.zip"
+```
+
+## 文档
+
+| 文档 | 说明 |
 |---|---|
-| macOS Apple Silicon / Intel | `kun-<版本>-macos.dmg` |
-| Linux x64 | `kun-<版本>-linux-x64.tar.gz` |
-| Windows x64 | `kun-<版本>-windows-x64.zip` |
+| [使用说明](docs/使用说明.md) | 功能与快捷键全览 |
+| [技术架构](docs/技术架构.md) | 选型、分层、数据流设计 |
+| [多平台发布](docs/多平台发布.md) | GitHub Actions 打包 macOS / Win / Linux |
+| [贡献指南](CONTRIBUTING.md) | 开发环境与 PR 约定 |
+| [安全政策](SECURITY.md) | 漏洞报告方式 |
+| [更新日志](CHANGELOG.md) | 版本变更 |
+| [开源许可](LICENSE) | MIT |
+| [第三方声明](THIRD-PARTY-NOTICES.md) | 依赖许可证聚合 |
 
-- 版本号取自 tag（`v0.1.0` → `0.1.0`），Release 正文从 `CHANGELOG.md` 提取
-- 产物未签名/未公证：macOS 首次打开需右键 → 打开；Windows 可能提示 SmartScreen
-- 本地预览打包产物：`./scripts/package-macos.sh <版本>`（生成 .app + dmg）
-- CI（push/PR）自动跑构建、测试、clippy、fmt
+## 参与贡献
 
-## 已知限制（Roadmap）
+欢迎 Issue 与 PR，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。参与即同意 [行为准则](CODE_OF_CONDUCT.md)。
 
-- 密码明文存于 hosts.toml（后续接入 macOS Keychain）
-- 主机密钥未校验（后续支持 known_hosts）
-- SFTP 单连接（后续与终端共用 SSH 连接）
-- 多标签页 / 分屏会话（后续版本）
+## 许可证
+
+[MIT](LICENSE) © yqstart
