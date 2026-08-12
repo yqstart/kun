@@ -213,12 +213,6 @@ impl KunApp {
             });
         });
 
-        // 工具栏底部 accent 渐变细线（紫 → 青）。
-        let rect = egui::Rect::from_min_max(
-            ui.min_rect().left_top(),
-            egui::pos2(ui.min_rect().right(), ui.min_rect().top() + 2.0),
-        );
-        draw_gradient_line(ui, rect);
     }
 
     /// 渲染左侧主机列表。
@@ -444,28 +438,6 @@ impl KunApp {
                 ui.weak("⌘N 新建连接  ⌘1 本地终端");
             });
         });
-    }
-}
-
-/// 绘制 accent 渐变横线（紫 → 青）。
-fn draw_gradient_line(ui: &egui::Ui, rect: egui::Rect) {
-    let painter = ui.painter();
-    let steps = 6;
-    let colors = [
-        egui::Color32::from_rgb(0x8b, 0x5c, 0xf6), // 紫
-        egui::Color32::from_rgb(0x9a, 0x6c, 0xf0),
-        egui::Color32::from_rgb(0xa9, 0x7c, 0xea),
-        egui::Color32::from_rgb(0x7c, 0xa8, 0xf0),
-        egui::Color32::from_rgb(0x4f, 0xd4, 0xf6),
-        egui::Color32::from_rgb(0x22, 0xd3, 0xee), // 青
-    ];
-    let w = rect.width() / steps as f32;
-    for (i, color) in colors.iter().enumerate() {
-        let seg = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + w * i as f32, rect.top()),
-            egui::pos2(rect.left() + w * (i + 1) as f32, rect.bottom()),
-        );
-        painter.rect_filled(seg, 0.0, *color);
     }
 }
 
