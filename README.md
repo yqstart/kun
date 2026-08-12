@@ -25,6 +25,16 @@
 | Rust | stable（推荐 1.80+） |
 | 系统 | macOS / Windows / Linux |
 
+## 平台支持状态
+
+| 平台 | 状态 | 说明 |
+|---|---|---|
+| macOS（ARM / Intel） | ✅ 完整支持 | 开发主平台，本地充分验证（含打包 dmg） |
+| Linux x64 | ✅ 编译通过 | 交叉编译检查通过；字体/配置路径已适配（依赖系统 CJK 字体） |
+| Windows x64 | 🚧 待 CI 验证 | 代码无平台特有问题，本地无法交叉编译（ring 需 MSVC 工具链），首次发布由 CI windows-latest 原生构建验证 |
+
+> 说明：本地（macOS）可交叉检查 Linux 目标；Windows 需真实 Windows 环境或 CI 验证。若 Windows 构建发现问题，会在首个 Release 的 CI 日志中暴露并修复。
+
 ## 快速开始
 
 ```bash

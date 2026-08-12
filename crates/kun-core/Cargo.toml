@@ -16,7 +16,9 @@ tokio = { workspace = true }
 [dependencies.russh]
 version = "0.62"
 default-features = false
-features = ["default", "rsa", "ring"]
+# 纯 Rust 后端（ring）替代默认 aws-lc-rs（C 库，交叉编译困难）；
+# flate2 用于 SSH 压缩协商兼容。
+features = ["ring", "rsa", "flate2"]
 
 [dependencies.russh-sftp]
 version = "2.4"

@@ -13,16 +13,40 @@ fn setup_fonts(ctx: &egui::Context) {
 
     let mut fonts = FontDefinitions::default();
 
-    // 等宽主字体候选（依次尝试）。
+    // ==================== 等宽主字体与中文 fallback（按平台） ====================
+    #[cfg(target_os = "macos")]
     let mono_candidates = [
         "/System/Library/Fonts/SFNSMono.ttf", // SF Mono
         "/System/Library/Fonts/Menlo.ttc",    // Menlo
         "/System/Library/Fonts/Supplemental/Menlo.ttc",
     ];
-    // 中文 fallback 候选（用于中文等宽显示）。
+    #[cfg(target_os = "windows")]
+    let mono_candidates = [
+        "C:\\Windows\\Fonts\\CascadiaMono.ttf", // Cascadia Code
+        "C:\\Windows\\Fonts\\consola.ttf",      // Consolas
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mono_candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", // DejaVu Sans Mono
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    ];
+
+    #[cfg(target_os = "macos")]
     let cjk_candidates = [
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
+    ];
+    #[cfg(target_os = "windows")]
+    let cjk_candidates = [
+        "C:\\Windows\\Fonts\\msyh.ttc", // 微软雅黑
+        "C:\\Windows\\Fonts\\msyhbd.ttc",
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let cjk_candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", // Noto Sans CJK
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",         // 文泉驿微米黑
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     ];
 
     let mut loaded_mono = false;
