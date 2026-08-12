@@ -1,10 +1,11 @@
 #!/bin/bash
 # ==================== macOS 打包：生成 .app bundle + dmg ====================
-# 用法：scripts/package-macos.sh [版本号]
+# 用法：scripts/package-macos.sh [版本号] [架构: arm64|x64]
 # 依赖：已执行 cargo build --release；iconset 由 make-icon.swift 生成。
 set -e
 
 VERSION="${1:-0.1.0}"
+ARCH="${2:-arm64}"
 BIN="target/release/kun-app"
 APP_NAME="kun"
 APP_DIR="target/release/${APP_NAME}.app"
@@ -62,8 +63,8 @@ EOF
 
 echo ".app bundle 完成：$APP_DIR"
 
-# ==================== 3. 制作 dmg ====================
-DMG="target/release/kun-${VERSION}-macos.dmg"
+# ==================== 3. 制作 dmg（文件名含架构，避免 ARM/Intel 产物互相覆盖） ====================
+DMG="target/release/kun-${VERSION}-macos-${ARCH}.dmg"
 rm -f "$DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG" > /dev/null
 echo "dmg 完成：$DMG"

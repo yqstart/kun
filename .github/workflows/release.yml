@@ -30,10 +30,12 @@ jobs:
             platform: macos-latest
             artifact: kun-macos-arm64
             package: dmg
+            arch: arm64
           - name: macOS Intel
             platform: macos-15-intel
             artifact: kun-macos-x64
             package: dmg
+            arch: x64
 
     runs-on: ${{ matrix.platform }}
 
@@ -58,7 +60,8 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          bash scripts/package-macos.sh "$VERSION"
+          bash scripts/package-macos.sh "$VERSION" "${{ matrix.arch }}"
+          ls -lh target/release/*.dmg
 
       - name: Upload macOS artifact
         if: matrix.package == 'dmg'
