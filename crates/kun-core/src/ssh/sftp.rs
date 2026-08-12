@@ -1,5 +1,4 @@
-//! SSH 连接与 SFTP 文件传输（基于 russh / russh-sftp）。
-//! M3 里程碑实现。
+//! SFTP 客户端（基于 russh-sftp）。M3 里程碑实现。
 
 /// 远程文件条目。
 #[derive(Debug, Clone, PartialEq, Eq)]

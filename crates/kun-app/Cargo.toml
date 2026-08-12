@@ -13,3 +13,7 @@ log = { workspace = true }
 env_logger = { workspace = true }
 tokio = { workspace = true }
 alacritty_terminal = "0.26"
+
+[dev-dependencies]
+egui_kittest = "0.36.1"
+kittest = "0.4"
