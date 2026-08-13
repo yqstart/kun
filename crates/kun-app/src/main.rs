@@ -214,14 +214,23 @@ mod font_tests {
             .get(&FontFamily::Monospace)
             .expect("Monospace 族缺失");
         assert!(
-            mono.iter().any(|f| f == "kun_mono_sym"),
-            "Monospace 族应包含 kun_mono_sym，实际：{mono:?}"
+            mono.iter().any(|f| f == "kun_mono"),
+            "Monospace 族应包含主等宽字体 kun_mono，实际：{mono:?}"
         );
-        // 符号 fallback 必须排在中文 fallback 之前（缺字形时优先命中等宽符号）。
-        let pos_sym = mono.iter().position(|f| f == "kun_mono_sym");
-        let pos_cjk = mono.iter().position(|f| f == "kun_cjk");
-        if let (Some(s), Some(c)) = (pos_sym, pos_cjk) {
-            assert!(s < c, "kun_mono_sym 应排在 kun_cjk 之前，实际：{mono:?}");
+        // Menlo 符号 fallback 仅 macOS 加载（SF Mono 缺 ➜/❯ 等字形）；
+        // Linux/Windows 使用自带等宽字体，不适用该断言。
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                mono.iter().any(|f| f == "kun_mono_sym"),
+                "Monospace 族应包含 kun_mono_sym，实际：{mono:?}"
+            );
+            // 符号 fallback 必须排在中文 fallback 之前（缺字形时优先命中等宽符号）。
+            let pos_sym = mono.iter().position(|f| f == "kun_mono_sym");
+            let pos_cjk = mono.iter().position(|f| f == "kun_cjk");
+            if let (Some(s), Some(c)) = (pos_sym, pos_cjk) {
+                assert!(s < c, "kun_mono_sym 应排在 kun_cjk 之前，实际：{mono:?}");
+            }
         }
     }
 }
