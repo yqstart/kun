@@ -54,23 +54,25 @@ crates/
 - 远程连接后台线程必须持有 runtime 直到会话关闭（`Notify` 等待 remote_loop 结束），否则 tokio::spawn 的任务被取消
 - `Session` 实现 `Drop` → 发 Shutdown 优雅关闭
 
-## 样式体系（借鉴 MiroCode / Warp）
+## 样式体系（Warp 风格）
 
-- 设计 token 在 `theme.rs::miro`：分层背景 `#0a0a0d`（应用）/`#141418`（标题栏）/`#1c1c22`（面板）/`#28282f`（浮层）/`#06060a`（终端，最深）
-- 文字三阶 `#f5f5f7/#c7c7cc/#8e8e93`；accent `#8b5cf6` + `ACCENT_SOFT`（16% 透明）做 hover/选中底
-- 边框统一 5% 半透明白（`BORDER_SUBTLE`）；圆角 10px（按钮/输入）/6px（列表项）
+- 设计 token 在 `theme.rs::tokens`：分层背景 `#0e0e11`（应用）/`#151519`（标题栏）/`#1a1a20`（面板）/`#24242c`（浮层）/`#0b0b0f`（终端，最深）
+- 文字三阶 `#f4f4f6/#bcbcc4/#80808a`；accent `#8b5cf6` + `ACCENT_SOFT`（15% 透明）做 hover/选中底；品牌渐变紫→青（`accent2 #22d3ee`）
+- 边框统一半透明白（`BORDER_SUBTLE`）；圆角 8px（按钮/输入）/7px（列表项/标签页）
 - 面板用 `Panel::frame(Frame)` 指定背景与边框；主按钮用 accent 填充
 - 终端背景在 TerminalView 里绘制 `BG_TERMINAL`；SFTP/主机列表行 hover/选中用 `ACCENT_SOFT` 圆角底
+- **动效**（`anim.rs`，无第三方依赖）：`smooth/smooth_bool` 指数平滑（状态存 ctx 临时数据，收敛中自动 request_repaint）、`paint_shimmer_line` 扫光 Mesh、`paint_rounded_gradient` 圆角渐变三角扇、`paint_glow` 辉光；工具栏底部扫光仅在 hover/更新活跃时持续重绘（省电）
 - 终端内容内边距 `PADDING=10`（`terminal_view.rs`）：背景铺满 `ui.max_rect()`，文本/光标在内边距内绘制。**注意 egui 陷阱：`ui.min_rect()` 是"已用内容"包围盒，无子项时为 0x0**——背景/点击区域必须用 `ui.max_rect()`（布局分配区域），否则背景画不出来、点击无法重新聚焦
 - 主机条目支持单击选中、双击连接；条目样式：**accent 圆形头像（主机名首字符）+ 名称 + 🗑 删除图标**（行右侧，hover 红底）
 - **egui 0.36 交互坑：`Response::interact()`（scope_builder(...).response.interact(...)）的点击无法命中**（响应链问题，kittest 实测 clicked/hovered 恒 false）——必须用 `ui.interact(rect, id, sense)` 显式注册交互区，删除按钮等行内控件最后注册以覆盖行点击区
 - 终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）在渲染层解析（`theme.rs::TERM_PALETTE_16`/`xterm256`），优先级：Spec > OSC 覆盖（term.colors）> 内置调色板；`Term.colors` 默认全 None，不设调色板则全部渲染为白色
-- 工具栏底部有紫→青渐变指示线（`draw_gradient_line`）；选中主机条目左侧 2px accent 竖条
-- **四套主题**（`theme.rs::THEMES`，对齐 MiroCode）：Miro 深色（紫）/ Dawn 浅色 / Midnight 深蓝 / Cyberpunk 霓虹；每套含 UI token + 终端调色板（16 色 + fg/bg/cursor）；`current_theme()` 静态读取，工具栏 ComboBox 切换（`set_theme`）
+- 工具栏底部有紫→青循环扫光；选中主机条目左侧 2px accent 竖条；标签页底部有选中指示条（宽度动画）
+- **四套主题**（`theme.rs::THEMES`）：Warp 深色（紫）/ Dawn 浅色 / Midnight 深蓝 / Cyberpunk 霓虹；每套含 UI token + 终端调色板（16 色 + fg/bg/cursor）；`current_theme()` 静态读取，工具栏 ComboBox 切换（`set_theme`）
 - 主题切换后需重新渲染终端（terminal_view 每帧读 `current_theme()`）
 - 终端输入/回车功能验证正常；若用户"回车不执行"多为中文输入法（IME）激活时回车被输入法消费（确认拼音候选），切英文输入法即可（所有终端应用共性）
 - **"删除键插入空格"（微信输入法 wetype 等）**：退格/删除键按下时输入法会伴随发送"空格类" Text 事件（ASCII 空格/零宽），写入终端表现为插入空格——已修复：`suppress_next_text` 跨帧标记 + 退格后一帧内的空白类 Text 丢弃（只影响空白字符，不误伤正常输入）；回归测试 `退格伴随空格文本不插入`
-- 顶部工具栏：左侧「◧」主机列表折叠开关（默认**收起**，启动直接进终端，⌘B 切换）、右侧主题 ComboBox + 检查更新；「kun」标题、「新建连接」「本地终端」按钮已按用户要求移除——新建连接走左侧栏按钮/⌘N，新建本地终端走标签栏 ＋/⌘T
+- 顶部工具栏：左侧品牌区（渐变 logo + kun + 版本号）与「◧」主机列表折叠开关（默认**收起**，启动直接进终端，⌘B 切换）、右侧主题 ComboBox + 更新状态圆点/检查更新按钮；新建连接走左侧栏按钮/⌘N，新建本地终端走标签栏 ＋/⌘T
+- **应用内更新**（`kun-core::updater` + `app.rs` 状态机）：版本检查走 `releases.atom`（不受 API 限流），资产直链按 `kun-{版本}-macos-{arm64|x64}.dmg` 构造并流式下载（进度回调）；安装由后台 shell 脚本完成——`hdiutil attach` 挂载 → `pgrep -x kun-app` 等待主进程退出 → `ditto` 替换 `/Applications/kun.app`（失败回退 `~/Applications`）→ `open` 重启；`installed` 状态延时 0.9s 后 `ViewportCommand::Close`
 - 主机行双击连接为**自实现检测**（`last_row_click`：0.3s 内同行的第二次点击）：egui 多击计数会把无关点击（如 ◧ 折叠按钮）计入序列导致 count=3 而 `double_clicked`（count==2）失效
 - **多标签页**（warp 风格）：`KunApp` 持 `tabs: Vec<TerminalTab>`（`label + TerminalView + sftp`），SFTP 按标签页挂载（远程 tab 独享）；标签栏在工具栏下方（`Panel::top("tabs")`），当前标签 accent-soft 高亮，支持点击切换/×关闭/＋新建；快捷键 ⌘T 新建本地、⌘W 关闭当前、⌘1-9 切换、⌘N 新建连接、⌥1-4 主题
 - 本地终端默认工作目录为 **home**（`local_session_options`：`working_directory = $HOME`）——Finder/Dock 启动时进程 cwd 为 `/`，不指定会导致终端落在根目录；远程会话不受影响（由 sshd 决定）

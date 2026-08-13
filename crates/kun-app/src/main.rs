@@ -1,5 +1,6 @@
 //! kun 应用入口。
 
+pub mod anim;
 mod app;
 pub mod theme;
 pub mod views;

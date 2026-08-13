@@ -1,16 +1,22 @@
-//! 自动更新检查：查询 GitHub Releases 最新版本并比较。
+//! 自动更新：查询 GitHub Releases 最新版本、下载资产。
 //!
 //! 轻量实现（ureq 同步 HTTP），在后台线程调用，不阻塞 UI。
+//! 版本检查走 releases.atom（不受 API 限流影响），资产下载走
+//! releases/download 直链（带进度回调，供 UI 显示进度条）。
 
 /// 更新信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateInfo {
     /// 最新版本号（如 "0.2.0"）。
     pub version: String,
-    /// 下载页面（GitHub Release）。
+    /// 发布页面（GitHub Release）。
     pub url: String,
     /// 发布说明摘要。
     pub notes: String,
+    /// 当前平台的 dmg 直链下载地址。
+    pub asset_url: String,
+    /// 资产文件名（如 `kun-0.2.0-macos-arm64.dmg`）。
+    pub asset_name: String,
 }
 
 /// 默认仓库（可被测试覆盖）。
@@ -20,61 +26,151 @@ pub const DEFAULT_REPO: &str = "yqstart/kun";
 ///
 /// 返回 `Ok(None)` 表示已是最新；`Ok(Some(info))` 表示有新版；
 /// `Err(msg)` 表示检查失败（网络/API 错误等，UI 可静默处理）。
-pub fn check_for_update(current_version: &str, repo: &str) -> Result<Option<UpdateInfo>, String> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(10)))
-        .build()
-        .new_agent();
+pub fn check_for_update(
+    current_version: &str,
+    repo: &str,
+    arch: &str,
+) -> Result<Option<UpdateInfo>, String> {
+    // 走 releases.atom（HTML feed）而非 REST API：API 未认证限流（60 次/小时/IP）
+    // 极容易被共享出口 IP 耗尽导致检查永远失败；feed 不受该限流影响。
+    let url = format!("https://github.com/{repo}/releases.atom");
+    let agent = make_agent();
     let mut response = agent
         .get(&url)
         .header("User-Agent", format!("kun/{current_version}"))
-        .header("Accept", "application/vnd.github+json")
+        .header("Accept", "application/atom+xml")
         .call()
         .map_err(|e| format!("请求失败：{e}"))?;
 
     let status = response.status();
     if status == 404 {
-        // 仓库无任何 Release。
-        return Ok(None);
-    }
-    if status == 403 || status == 429 {
-        // 未认证 API 限流：静默视为无更新，避免打扰用户。
+        // 仓库不存在或无任何 Release。
         return Ok(None);
     }
     if !status.is_success() {
-        return Err(format!("GitHub API 返回 {status}"));
+        return Err(format!("GitHub 返回 {status}"));
     }
 
-    // 解析 JSON（手写轻量提取，避免引入 serde_json 依赖）。
     let body = response
         .body_mut()
         .read_to_string()
         .map_err(|e| format!("读取响应失败：{e}"))?;
-    let latest = parse_latest_release(&body)?;
+    // 首个 <entry> 即最新发布（feed 按发布时间倒序）；无 entry 视为无 Release。
+    let Some(latest) = parse_latest_entry(&body) else {
+        return Ok(None);
+    };
     let latest_version = latest.tag_name.trim_start_matches('v').to_string();
 
     if version_newer(&latest_version, current_version) {
+        let asset_name = asset_name_for(&latest_version, arch);
+        let asset_url = asset_url_for(repo, &latest.tag_name, &latest_version, arch);
         Ok(Some(UpdateInfo {
             version: latest_version,
             url: latest.html_url,
             notes: latest.body,
+            asset_url,
+            asset_name,
         }))
     } else {
         Ok(None)
     }
 }
 
-/// 解析 GitHub latest release API 响应中的 tag_name / html_url / body。
-fn parse_latest_release(body: &str) -> Result<ReleaseFields, String> {
-    let tag_name =
-        extract_json_string(body, "tag_name").ok_or_else(|| "响应缺少 tag_name".to_string())?;
-    let html_url =
-        extract_json_string(body, "html_url").ok_or_else(|| "响应缺少 html_url".to_string())?;
-    let notes = extract_json_string(body, "body").unwrap_or_default();
-    Ok(ReleaseFields {
+/// 统一的 ureq Agent 配置。
+fn make_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        // 手动处理 4xx/5xx，否则 ureq 默认把状态码转成 Err，404 等分支不可达。
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+}
+
+/// 当前平台资产的 dmg 文件名。
+fn asset_name_for(version: &str, arch: &str) -> String {
+    format!("kun-{version}-macos-{arch}.dmg")
+}
+
+/// 当前平台资产的下载直链。
+fn asset_url_for(repo: &str, tag: &str, version: &str, arch: &str) -> String {
+    format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        repo.trim_end_matches('/'),
+        tag,
+        asset_name_for(version, arch)
+    )
+}
+
+/// 下载资产到本地文件，并持续回调 `(已下载字节, 总字节)`。
+///
+/// GitHub 的下载直链会 302 到 S3，ureq 默认跟随重定向。
+pub fn download_asset(
+    url: &str,
+    dest: &std::path::Path,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+
+    let agent = make_agent();
+    let mut response = agent
+        .get(url)
+        .header("User-Agent", "kun-updater")
+        .call()
+        .map_err(|e| format!("下载请求失败：{e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("下载失败：HTTP {status}"));
+    }
+
+    let total = response
+        .headers()
+        .get("Content-Length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
+    }
+    let mut file = std::fs::File::create(dest).map_err(|e| format!("创建文件失败：{e}"))?;
+    let mut reader = response.body_mut().as_reader();
+    let mut buf = [0u8; 256 * 1024];
+    let mut downloaded: u64 = 0;
+    on_progress(0, total);
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("下载中断：{e}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("写入文件失败：{e}"))?;
+        downloaded += n as u64;
+        on_progress(downloaded, total);
+    }
+    file.sync_all().map_err(|e| format!("落盘失败：{e}"))?;
+    Ok(())
+}
+
+/// 解析 releases.atom 首个 `<entry>`（GitHub 按发布时间倒序，首个即最新）。
+///
+/// 返回 `None` 表示 feed 中没有任何发布。
+fn parse_latest_entry(body: &str) -> Option<ReleaseFields> {
+    let entry_start = body.find("<entry")?;
+    let entry_end = entry_start + body[entry_start..].find("</entry>")?;
+    let entry = &body[entry_start..entry_end];
+
+    // 发布页链接：<link rel="alternate" type="text/html" href=".../releases/tag/vX.Y.Z"/>
+    let url = extract_attr(entry, "href")?;
+    // 版本 tag 即 href 最后一个路径段（形如 v0.1.1）。
+    let tag_name = url.rsplit('/').next()?.to_string();
+    // 发布说明：<content ...>HTML</content>，转纯文本便于弹窗预览。
+    let notes = extract_text(entry, "content").unwrap_or_default();
+    let notes = html_to_text(&notes);
+
+    Some(ReleaseFields {
         tag_name,
-        html_url,
+        html_url: url,
         body: notes,
     })
 }
@@ -85,40 +181,55 @@ struct ReleaseFields {
     body: String,
 }
 
-/// 从 JSON 对象中提取字符串字段值（`"key": "value"`，处理转义）。
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{key}\"\\s*:");
-    let re = regex::Regex::new(&pattern).ok()?;
-    let m = re.find(json)?;
-    let rest = &json[m.end()..];
-    let rest = rest.trim_start();
-    if !rest.starts_with('"') {
-        return None;
-    }
+/// 提取 `<link ...>` 元素中指定属性的值（如 `href="..."`）。
+fn extract_attr(s: &str, name: &str) -> Option<String> {
+    let link = s.find("<link")?;
+    let link_end = link + s[link..].find('>')?;
+    let link_tag = &s[link..=link_end];
+    let key = format!("{name}=\"");
+    let start = link_tag.find(&key)? + key.len();
+    let rest = &link_tag[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// 提取 `<tag ...>内容</tag>` 的文本内容。
+fn extract_text(s: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let start = s.find(&open)?;
+    let content_start = start + s[start..].find('>')? + 1;
+    let close = format!("</{tag}>");
+    let end = content_start + s[content_start..].find(&close)?;
+    Some(s[content_start..end].to_string())
+}
+
+/// 将 HTML 片段转纯文本：先还原实体，再剥离所有标签并归一空白。
+fn html_to_text(html: &str) -> String {
+    let unescaped = unescape_html_entities(html);
     let mut out = String::new();
-    let mut chars = rest[1..].chars();
-    while let Some(c) = chars.next() {
+    let mut in_tag = false;
+    for c in unescaped.chars() {
         match c {
-            '"' => return Some(out),
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    out.push(match next {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        'u' => {
-                            // 简单处理：跳过 unicode 转义（保持原文近似）。
-                            let _ = chars.by_ref().take(4).count();
-                            '?'
-                        }
-                        other => other,
-                    });
-                }
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                // 标签边界补空格，避免相邻 <li> 内容粘连。
+                out.push(' ');
             }
-            other => out.push(other),
+            _ if !in_tag => out.push(c),
+            _ => {}
         }
     }
-    None
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 还原常见 HTML 实体（GitHub atom 的 `<content>` 为 HTML 转义文本）。
+fn unescape_html_entities(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 /// 语义化版本比较：`newer > current` 时返回 true。
@@ -173,15 +284,43 @@ mod tests {
     }
 
     #[test]
-    fn 解析release响应() {
-        let json = "{\n  \"tag_name\": \"v0.2.0\",\n  \"html_url\": \"https://github.com/yqstart/kun/releases/tag/v0.2.0\",\n  \"body\": \"## 更新\\n- 新增功能\\n- 修复问题\"\n}";
-        let fields = parse_latest_release(json).unwrap();
+    fn 解析atom首个entry() {
+        let feed = "<?xml version=\"1.0\"?>\n\
+            <feed xmlns=\"http://www.w3.org/2005/Atom\">\n\
+              <title>Release notes from kun</title>\n\
+              <entry>\n\
+                <link rel=\"alternate\" type=\"text/html\" href=\"https://github.com/yqstart/kun/releases/tag/v0.2.0\"/>\n\
+                <title>kun v0.2.0</title>\n\
+                <content type=\"html\">&lt;h2&gt;[0.2.0]&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;新增功能&lt;/li&gt;&lt;/ul&gt;</content>\n\
+              </entry>\n\
+            </feed>";
+        let fields = parse_latest_entry(feed).unwrap();
         assert_eq!(fields.tag_name, "v0.2.0");
         assert_eq!(
             fields.html_url,
             "https://github.com/yqstart/kun/releases/tag/v0.2.0"
         );
         assert!(fields.body.contains("新增功能"));
+        // 标签与实体应被清理干净。
+        assert!(!fields.body.contains('<') && !fields.body.contains('&'));
+    }
+
+    #[test]
+    fn 无entry返回none() {
+        let feed = "<feed xmlns=\"http://www.w3.org/2005/Atom\"><title>empty</title></feed>";
+        assert!(parse_latest_entry(feed).is_none());
+    }
+
+    #[test]
+    fn 资产地址按架构构造() {
+        assert_eq!(
+            asset_name_for("0.2.0", "arm64"),
+            "kun-0.2.0-macos-arm64.dmg"
+        );
+        assert_eq!(
+            asset_url_for("yqstart/kun", "v0.2.0", "0.2.0", "x64"),
+            "https://github.com/yqstart/kun/releases/download/v0.2.0/kun-0.2.0-macos-x64.dmg"
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 # ==================== macOS 打包：生成 .app bundle + dmg ====================
 # 用法：scripts/package-macos.sh [版本号] [架构: arm64|x64]
 # 依赖：已执行 cargo build --release；iconset 由 make-icon.swift 生成。
+# dmg 内含 kun.app + Applications 快捷方式（拖拽即安装，与常规 macOS 应用一致）。
 set -e
 
 VERSION="${1:-0.1.0}"
@@ -53,6 +54,8 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>LSApplicationCategoryType</key>
@@ -61,10 +64,51 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 </plist>
 EOF
 
+# ad-hoc 签名：未公证的本地构建也能获得稳定签名（下载后仍需解除隔离，见 docs）。
+codesign --force --sign - "$APP_DIR" > /dev/null 2>&1 || true
 echo ".app bundle 完成：$APP_DIR"
 
-# ==================== 3. 制作 dmg（文件名含架构，避免 ARM/Intel 产物互相覆盖） ====================
+# ==================== 3. 组装 dmg（含 Applications 快捷方式） ====================
 DMG="target/release/kun-${VERSION}-macos-${ARCH}.dmg"
+DMG_STAGE="target/release/dmg-stage"
+rm -rf "$DMG_STAGE"
+mkdir -p "$DMG_STAGE"
+cp -R "$APP_DIR" "$DMG_STAGE/"
+ln -s /Applications "$DMG_STAGE/Applications"
+
 rm -f "$DMG"
-hdiutil create -volname "$APP_NAME" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG" > /dev/null
+hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG" > /dev/null
 echo "dmg 完成：$DMG"
+
+# ==================== 4. 本机美化布局（CI 无 GUI 跳过，失败不影响产物） ====================
+if [ "${CI:-false}" != "true" ]; then
+    MOUNT_ROOT="$(mktemp -d)"
+    MOUNT_POINT="$MOUNT_ROOT/$APP_NAME"
+    mkdir -p "$MOUNT_POINT"
+    if hdiutil attach "$DMG" -nobrowse -readwrite -mountpoint "$MOUNT_POINT" -quiet > /dev/null 2>&1; then
+        osascript << 'EOF' > /dev/null 2>&1 || true
+tell application "Finder"
+    tell disk "kun"
+        open
+        set current view of container window to icon view
+        set toolbar visible of container window to false
+        set statusbar visible of container window to false
+        set the bounds of container window to {120, 120, 680, 480}
+        set viewOptions to the icon view options of container window
+        set arrangement of viewOptions to not arranged
+        set icon size of viewOptions to 96
+        set position of item "kun.app" of container window to {130, 170}
+        set position of item "Applications" of container window to {410, 170}
+        close
+        open
+        update without registering applications
+    end tell
+end tell
+EOF
+        hdiutil detach "$MOUNT_POINT" -quiet > /dev/null 2>&1 || true
+    fi
+    rm -rf "$MOUNT_ROOT"
+fi
+
+rm -rf "$DMG_STAGE"
+echo "dmg 布局完成：$DMG"
