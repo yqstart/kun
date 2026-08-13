@@ -21,7 +21,6 @@ use crate::views::sftp_view::SftpView;
 use crate::views::terminal_view::TerminalView;
 
 /// 新建连接表单状态。
-#[derive(Default)]
 struct ConnectForm {
     name: String,
     host: String,
@@ -33,6 +32,23 @@ struct ConnectForm {
     passphrase: String,
     /// 名称输入框是否已聚焦（对话框打开时自动聚焦）。
     name_focused: bool,
+}
+
+impl Default for ConnectForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            host: String::new(),
+            // 默认 root / 22 端口，可修改（大多数服务器默认入口）。
+            port: "22".into(),
+            user: "root".into(),
+            auth_kind: 0,
+            password: String::new(),
+            key_path: String::new(),
+            passphrase: String::new(),
+            name_focused: false,
+        }
+    }
 }
 
 /// 更新下载事件（后台线程 → UI）。
@@ -126,6 +142,8 @@ pub struct KunApp {
     pending_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>)>,
     /// SFTP 已就绪但 SSH 标签尚未创建，等待挂载。
     ready_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>)>,
+    /// SFTP 连接错误（状态栏持久显示，toast 易被忽略）。
+    sftp_error: Option<String>,
     sftp_host: String,
     update_state: UpdateState,
     update_rx: Option<std::sync::mpsc::Receiver<Result<Option<UpdateInfo>, String>>>,
@@ -134,12 +152,24 @@ pub struct KunApp {
     manual_update: bool,
     /// 安装脚本已启动，到该时间点关闭应用重启。
     restart_at: Option<f64>,
+    /// 应用内动态 logo 的 ikun 形象纹理（assets/ikun_face.png 抠图，
+    /// 透明背景；在紫金渐变圆底 + 弹跳篮球之上叠加显示）。
+    logo_texture: Option<egui::TextureHandle>,
 }
 
-/// 本地终端会话选项：默认工作目录为 home。
+/// 本地终端会话选项：默认工作目录为 home，注入 CLICOLOR 使 `ls` 输出彩色。
 fn local_session_options() -> SessionOptions {
     SessionOptions {
         working_directory: std::env::var("HOME").ok().map(PathBuf::from),
+        // macOS `ls` 默认不输出颜色（无 CLICOLOR 环境变量），文件/目录全白；
+        // 注入后按 LSCOLORS 着色区分（与 Terminal.app/iTerm2 行为一致，不篡改 shell）。
+        // LSCOLORS 为深色终端优化：目录=亮青、符号链接=紫红、可执行=红、
+        // socket=绿、管道=黄、块/字符设备=蓝（默认底色）。
+        env: [
+            ("CLICOLOR".to_string(), "1".to_string()),
+            ("LSCOLORS".to_string(), "Gxfxcxdxbxegedabagacad".to_string()),
+        ]
+        .into(),
         ..Default::default()
     }
 }
@@ -207,6 +237,10 @@ impl KunApp {
         let config_path = default_config_path();
         let config = HostConfig::load(&config_path).unwrap_or_default();
 
+        // 加载 ikun 形象抠图（assets/ikun_face.png 透明背景，see scripts/extract-ikun.swift）。
+        // 失败时降级为 None，draw_logo_mark 会回退到程序绘制的简化形象。
+        let logo_texture = load_logo_texture(&cc.egui_ctx);
+
         let mut app = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -222,12 +256,14 @@ impl KunApp {
             toast: None,
             pending_sftp: None,
             ready_sftp: None,
+            sftp_error: None,
             sftp_host: String::new(),
             update_state: UpdateState::Idle,
             update_rx: None,
             download_rx: None,
             manual_update: false,
             restart_at: None,
+            logo_texture,
         };
         // 启动时自动检查更新（后台线程，延迟 3 秒，静默）。
         app.start_update_check(true);
@@ -469,6 +505,7 @@ impl KunApp {
 
         let (_sftp_thread, sftp_handle, sftp_rx) = connect_sftp(&profile);
         self.sftp_host = label;
+        self.sftp_error = None;
         self.pending_sftp = Some((sftp_handle, sftp_rx));
         self.ready_sftp = None;
         self.pending_tab = None;
@@ -489,11 +526,15 @@ impl KunApp {
     fn poll_sftp(&mut self) {
         let mut ready = false;
         let mut failed: Option<String> = None;
+        let mut closed = false;
         if let Some((_handle, rx)) = &mut self.pending_sftp {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     SftpEvent::Ready => ready = true,
                     SftpEvent::Failed(e) => failed = Some(e),
+                    // 连接中途关闭（如被服务器断开）：不能继续等待，
+                    // 否则状态栏会永远停在"SFTP 连接中…"。
+                    SftpEvent::Closed => closed = true,
                     _ => {}
                 }
             }
@@ -502,10 +543,13 @@ impl KunApp {
             self.ready_sftp = self.pending_sftp.take();
             self.mount_ready_sftp();
         }
-        if let Some(e) = failed {
+        let err = failed.or(closed.then(|| "连接中断".to_string()));
+        if let Some(e) = err {
             self.pending_sftp = None;
             self.ready_sftp = None;
-            self.show_toast(format!("SFTP 连接失败：{e}"), true);
+            // 状态栏持久显示（toast 一闪而过容易忽略）。
+            self.sftp_error = Some(format!("SFTP 连接失败：{e}"));
+            self.show_toast(self.sftp_error.clone().unwrap(), true);
         }
     }
 
@@ -516,7 +560,7 @@ impl KunApp {
             ui.add_space(2.0);
             // 品牌：渐变 logo + 应用名 + 版本。
             let brand_start = ui.cursor().min;
-            draw_logo_mark(ui, 28.0);
+            draw_logo_mark(ui, 28.0, self.logo_texture.as_ref());
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.add_space(1.0);
@@ -544,6 +588,7 @@ impl KunApp {
                     egui::Id::new("sidebar_logo_toggle"),
                     egui::Sense::click(),
                 )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(if self.sidebar_open {
                     "收起主机列表（⌘B）"
                 } else {
@@ -554,10 +599,25 @@ impl KunApp {
                 self.sidebar_open = !self.sidebar_open;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 主题切换。
+                // 主题切换：渐变圆点图标 + 主题名。
+                // （此前用 ◐ 字符，SF 字体缺字形渲染为方块，改为自绘渐变圆。）
                 let current = crate::theme::current_theme().name;
+                let (dot_rect, dot_resp) =
+                    ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                anim::paint_rounded_gradient(
+                    ui.painter(),
+                    dot_rect,
+                    6.0,
+                    theme.accent,
+                    theme.accent2,
+                );
+                if dot_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                dot_resp.on_hover_text("切换主题");
+                ui.add_space(4.0);
                 egui::ComboBox::from_id_salt("theme_switcher")
-                    .selected_text(egui::RichText::new(format!("◐ {current}")))
+                    .selected_text(egui::RichText::new(current))
                     .show_ui(ui, |ui| {
                         for (i, t) in crate::theme::THEMES.iter().enumerate() {
                             let selected = current == t.name;
@@ -679,6 +739,8 @@ impl KunApp {
         let mut remove_idx: Option<usize> = None;
         let mut connect_idx: Option<usize> = None;
         let mut selected_host: Option<usize> = None;
+        // 行内容可用宽度：面板宽 - 内边距（供文本截断用，避免长名称换行）。
+        let row_avail_w = ui.available_width() - 34.0;
         for (i, host) in self.config.hosts.iter().enumerate() {
             let row_id = egui::Id::new(("host_row", i));
             // 行内容（头像 + 名称）。
@@ -706,16 +768,25 @@ impl KunApp {
                             egui::Color32::WHITE,
                         );
                         ui.add_space(8.0);
+                        // 文本宽度固定，超长截断不换行。
                         ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(&host.name)
-                                    .size(13.0)
-                                    .color(theme.text_primary),
+                            ui.add_sized(
+                                [row_avail_w, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(&host.name)
+                                        .size(13.0)
+                                        .color(theme.text_primary),
+                                )
+                                .truncate(),
                             );
-                            ui.label(
-                                egui::RichText::new(format!("{}@{}", host.user, host.host))
-                                    .size(11.0)
-                                    .color(theme.text_muted),
+                            ui.add_sized(
+                                [row_avail_w, 16.0],
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{}@{}", host.user, host.host))
+                                        .size(11.0)
+                                        .color(theme.text_muted),
+                                )
+                                .truncate(),
                             );
                         });
                     });
@@ -723,17 +794,22 @@ impl KunApp {
                 .response;
 
             // 整行点击区（显式 interact：egui 0.36 响应链不可靠）。
-            let row_response = ui.interact(
-                inner.rect.expand2(egui::vec2(2.0, 4.0)),
-                row_id,
-                egui::Sense::click(),
+            // 点击区横向扩展到面板可用宽度，保证短名称主机也能整行点击。
+            let row_rect = egui::Rect::from_min_max(
+                inner.rect.min,
+                egui::pos2(ui.max_rect().right() - 4.0, inner.rect.bottom()),
             );
-            // 删除图标（行右侧，最后注册保证可点）。
+            let row_response = ui
+                .interact(row_rect, row_id, egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            // 删除图标（行右缘，最后注册保证可点）。
             let del_rect = egui::Rect::from_min_size(
-                egui::pos2(inner.rect.right() - 24.0, inner.rect.top() + 3.0),
+                egui::pos2(row_rect.right() - 26.0, row_rect.top() + 3.0),
                 egui::vec2(22.0, 22.0),
             );
-            let del_resp = ui.interact(del_rect, row_id.with("del"), egui::Sense::click());
+            let del_resp = ui
+                .interact(del_rect, row_id.with("del"), egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
             if del_resp.hovered() {
                 ui.painter().rect_filled(
                     del_rect,
@@ -776,7 +852,7 @@ impl KunApp {
             let alpha = (hover_alpha * 0.72).max(sel_alpha);
             if alpha > 0.01 {
                 ui.painter().rect_filled(
-                    inner.rect.expand2(egui::vec2(2.0, 4.0)),
+                    row_rect.expand2(egui::vec2(0.0, 4.0)),
                     crate::theme::tokens::RADIUS_ITEM,
                     theme.accent_soft.gamma_multiply(alpha),
                 );
@@ -784,8 +860,8 @@ impl KunApp {
             if sel_alpha > 0.01 {
                 ui.painter().rect_filled(
                     egui::Rect::from_min_max(
-                        egui::pos2(inner.rect.left() + 1.0, inner.rect.top() + 4.0),
-                        egui::pos2(inner.rect.left() + 3.0, inner.rect.bottom() - 4.0),
+                        egui::pos2(row_rect.left() + 1.0, row_rect.top() + 4.0),
+                        egui::pos2(row_rect.left() + 3.0, row_rect.bottom() - 4.0),
                     ),
                     1.5,
                     theme.accent.gamma_multiply(sel_alpha),
@@ -817,7 +893,7 @@ impl KunApp {
             .collapsible(false)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    draw_logo_mark(ui, 42.0);
+                    draw_logo_mark(ui, 42.0, self.logo_texture.as_ref());
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new("建立安全连接")
@@ -848,11 +924,13 @@ impl KunApp {
                         .size(11.0)
                         .color(theme.text_muted),
                 );
-                ui.add_sized(
-                    [field_width, 28.0],
-                    egui::TextEdit::singleline(&mut self.form.name)
-                        .id(name_id)
-                        .hint_text("连接名称（可选）"),
+                form_input(
+                    ui,
+                    name_id,
+                    &mut self.form.name,
+                    "连接名称（可选）",
+                    field_width,
+                    false,
                 );
                 ui.add_space(5.0);
                 ui.label(
@@ -860,9 +938,13 @@ impl KunApp {
                         .size(11.0)
                         .color(theme.text_muted),
                 );
-                ui.add_sized(
-                    [field_width, 28.0],
-                    egui::TextEdit::singleline(&mut self.form.user).hint_text("用户名，例如 root"),
+                form_input(
+                    ui,
+                    egui::Id::new("conn_form_user"),
+                    &mut self.form.user,
+                    "用户名，例如 root",
+                    field_width,
+                    false,
                 );
                 ui.add_space(12.0);
                 ui.label(
@@ -877,9 +959,13 @@ impl KunApp {
                         .color(theme.text_muted),
                 );
                 ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [field_width - 76.0, 28.0],
-                        egui::TextEdit::singleline(&mut self.form.host).hint_text("主机名或 IP"),
+                    form_input(
+                        ui,
+                        egui::Id::new("conn_form_host"),
+                        &mut self.form.host,
+                        "主机名或 IP",
+                        field_width - 76.0,
+                        false,
                     );
                     ui.add_space(8.0);
                     ui.label(
@@ -887,9 +973,13 @@ impl KunApp {
                             .size(11.0)
                             .color(theme.text_muted),
                     );
-                    ui.add_sized(
-                        [68.0, 28.0],
-                        egui::TextEdit::singleline(&mut self.form.port).hint_text("22"),
+                    form_input(
+                        ui,
+                        egui::Id::new("conn_form_port"),
+                        &mut self.form.port,
+                        "22",
+                        68.0,
+                        false,
                     );
                 });
                 ui.add_space(12.0);
@@ -904,24 +994,31 @@ impl KunApp {
                 });
                 ui.add_space(5.0);
                 if self.form.auth_kind == 0 {
-                    ui.add_sized(
-                        [field_width, 28.0],
-                        egui::TextEdit::singleline(&mut self.form.password)
-                            .password(true)
-                            .hint_text("密码"),
+                    form_input(
+                        ui,
+                        egui::Id::new("conn_form_password"),
+                        &mut self.form.password,
+                        "密码",
+                        field_width,
+                        true,
                     );
                 } else {
-                    ui.add_sized(
-                        [field_width, 28.0],
-                        egui::TextEdit::singleline(&mut self.form.key_path)
-                            .hint_text("私钥文件路径"),
+                    form_input(
+                        ui,
+                        egui::Id::new("conn_form_key"),
+                        &mut self.form.key_path,
+                        "私钥文件路径",
+                        field_width,
+                        false,
                     );
                     ui.add_space(5.0);
-                    ui.add_sized(
-                        [field_width, 28.0],
-                        egui::TextEdit::singleline(&mut self.form.passphrase)
-                            .password(true)
-                            .hint_text("私钥口令（可选）"),
+                    form_input(
+                        ui,
+                        egui::Id::new("conn_form_pass"),
+                        &mut self.form.passphrase,
+                        "私钥口令（可选）",
+                        field_width,
+                        true,
                     );
                 }
                 ui.add_space(10.0);
@@ -1010,14 +1107,20 @@ impl KunApp {
                     .scope_builder(egui::UiBuilder::new().id_salt(("tab", i)), |ui| {
                         ui.horizontal(|ui| {
                             ui.add_space(2.0);
+                            // 无边框透明按钮（selectable_label 选中自带边框，
+                            // 与下方手绘高亮叠加会形成"双重框"）。
                             if ui
-                                .selectable_label(
-                                    selected,
-                                    egui::RichText::new(&title).size(12.5).color(if selected {
-                                        theme.text_primary
-                                    } else {
-                                        theme.text_muted
-                                    }),
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(&title).size(12.5).color(if selected {
+                                            theme.text_primary
+                                        } else {
+                                            theme.text_muted
+                                        }),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(crate::theme::tokens::RADIUS_ITEM),
                                 )
                                 .clicked()
                             {
@@ -1042,7 +1145,7 @@ impl KunApp {
                     })
                     .response;
 
-                // 选中底 / hover 底（动画过渡）。
+                // 选中底 / hover 底（动画过渡，唯一的高亮层）。
                 let hover = row.hovered() && !selected;
                 let hover_alpha = anim::smooth_bool(
                     ui.ctx(),
@@ -1061,12 +1164,6 @@ impl KunApp {
                         row.rect.expand2(egui::vec2(2.0, 3.0)),
                         crate::theme::tokens::RADIUS_ITEM,
                         theme.accent_soft.gamma_multiply(sel_alpha),
-                    );
-                    ui.painter().rect_stroke(
-                        row.rect.expand2(egui::vec2(1.0, 2.0)),
-                        crate::theme::tokens::RADIUS_ITEM,
-                        egui::Stroke::new(1.0, theme.accent.gamma_multiply(sel_alpha * 0.7)),
-                        egui::StrokeKind::Inside,
                     );
                 } else if hover_alpha > 0.01 {
                     ui.painter().rect_filled(
@@ -1157,17 +1254,44 @@ impl KunApp {
                         .color(theme.text_muted),
                 );
             }
+            if let Some(e) = &self.sftp_error {
+                ui.separator();
+                status_dot(ui, theme.danger, false);
+                ui.label(egui::RichText::new(e).size(11.5).color(theme.danger))
+                    .on_hover_text("重新连接主机可再次尝试");
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.available_width() > 460.0 {
-                    for hint in ["⌘B 主机", "⌘T 终端", "⌘W 关闭", "⌘N 连接", "⌥1-4 主题"]
-                    {
-                        ui.label(
-                            egui::RichText::new(hint)
-                                .monospace()
-                                .size(10.5)
-                                .color(theme.text_muted)
-                                .background_color(theme.bg_elevated),
-                        );
+                    // 快捷键提示：圆角深色块，按键 accent 色 + 动作次要色。
+                    for (key, action) in [
+                        ("⌘B", "主机"),
+                        ("⌘T", "终端"),
+                        ("⌘W", "关闭"),
+                        ("⌘N", "连接"),
+                        ("⌥1-3", "主题"),
+                    ] {
+                        egui::Frame::new()
+                            .fill(theme.bg_elevated)
+                            .stroke(egui::Stroke::new(1.0, theme.border))
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::symmetric(7, 2))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(key)
+                                            .monospace()
+                                            .size(10.5)
+                                            .color(theme.accent),
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText::new(action)
+                                            .size(10.5)
+                                            .color(theme.text_secondary),
+                                    );
+                                });
+                            });
+                        ui.add_space(2.0);
                     }
                 }
             });
@@ -1243,7 +1367,7 @@ impl KunApp {
             .show(ctx, |ui| {
                 // 头部。
                 ui.horizontal(|ui| {
-                    draw_logo_mark(ui, 28.0);
+                    draw_logo_mark(ui, 28.0, self.logo_texture.as_ref());
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
                         ui.label(
@@ -1328,11 +1452,26 @@ impl KunApp {
                             .max_height(170.0)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(notes)
-                                        .size(12.5)
-                                        .color(theme.text_secondary),
-                                );
+                                // release 说明逐行渲染：空行留段落间距，普通行紧凑排列。
+                                let mut first = true;
+                                let mut blank = false;
+                                for line in notes.lines() {
+                                    let text = line.trim();
+                                    if text.is_empty() {
+                                        blank = true;
+                                        continue;
+                                    }
+                                    if !first {
+                                        ui.add_space(if blank { 8.0 } else { 2.0 });
+                                    }
+                                    first = false;
+                                    blank = false;
+                                    ui.label(
+                                        egui::RichText::new(text)
+                                            .size(12.5)
+                                            .color(theme.text_secondary),
+                                    );
+                                }
                             });
                         ui.add_space(8.0);
                     }
@@ -1459,6 +1598,7 @@ impl KunApp {
                         egui::Id::new("toast_click"),
                         egui::Sense::click(),
                     )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
                     dismiss = true;
@@ -1474,7 +1614,7 @@ impl KunApp {
         let theme = crate::theme::current_theme();
         ui.centered_and_justified(|ui| {
             ui.vertical_centered(|ui| {
-                draw_logo_mark(ui, 48.0);
+                draw_logo_mark(ui, 48.0, self.logo_texture.as_ref());
                 ui.add_space(12.0);
                 ui.label(
                     egui::RichText::new("kun")
@@ -1507,35 +1647,151 @@ impl KunApp {
 
 // ==================== 绘制辅助 ====================
 
-/// ikun 品牌标记：篮球轨迹、K 字与紫金霓虹光环。
-fn draw_logo_mark(ui: &mut egui::Ui, size: f32) -> egui::Rect {
+/// 新建连接对话框的输入框统一样式：圆角深色底、垂直居中、焦点 accent 边框。
+///
+/// TextEdit 默认 `Align2::LEFT_TOP`（单行输入框文字偏上），这里改为垂直居中；
+/// 焦点时边框切换 accent 色高亮。
+///
+/// **egui 0.36 坑：提供自定义 frame 时 `.margin()` 被整体丢弃**
+/// （`frame.unwrap_or_else(|| Frame::new().inner_margin(margin))`），
+/// 而 `Frame::new()` 默认 `inner_margin` 为 ZERO——内边距必须挂在自定义 frame 上。
+fn form_input(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    value: &mut String,
+    hint: &str,
+    width: f32,
+    password: bool,
+) -> egui::Response {
+    let theme = crate::theme::current_theme();
+    let focused = ui.memory(|m| m.has_focus(id));
+    let frame = egui::Frame::new()
+        .fill(theme.bg_elevated)
+        .stroke(egui::Stroke::new(
+            if focused { 1.5 } else { 1.0 },
+            if focused { theme.accent } else { theme.border },
+        ))
+        .corner_radius(crate::theme::tokens::RADIUS_SM)
+        .inner_margin(egui::Margin::symmetric(10, 5));
+    let mut edit = egui::TextEdit::singleline(value)
+        .id(id)
+        .hint_text(hint)
+        .vertical_align(egui::Align::Center)
+        .frame(frame)
+        .text_color(theme.text_primary);
+    if password {
+        edit = edit.password(true);
+    }
+    ui.add_sized([width, 30.0], edit)
+}
+
+/// 解码 ikun 抠图 PNG 为 egui 纹理（透明背景 + ikun 形象），用于动态 logo。
+/// 失败时返回 None，draw_logo_mark 会回退到程序绘制的简化形象（黄色圆 + ikun 字）。
+fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let bytes = include_bytes!("../assets/ikun_face.png");
+    match image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [w as usize, h as usize],
+                &rgba.into_raw(),
+            );
+            Some(ctx.load_texture("kun_ikun_logo", color_image, Default::default()))
+        }
+        Err(e) => {
+            log::warn!("加载 ikun 抠图失败：{e}");
+            None
+        }
+    }
+}
+
+/// ikun 品牌标记：紫金渐变圆底 + 抠图纹理（assets/ikun_face.png）+ 篮球弹跳。
+///
+/// 形象直接取自用户提供的 ikun 参考图（白底→透明，see scripts/extract-ikun.swift），
+/// 通过 `Image::texture` 显示；叠加程序绘制的橙色篮球（按抛物线在脸下方
+/// 拍击，落地瞬间压扁、顶点拉长），周期 1.3s。
+/// 30fps 请求重绘，兼顾动效与省电。
+/// ikun 品牌标记：紫金渐变圆底 + 白色 "K" 字 + 橙色篮球循环弹跳（持续动画）。
+///
+/// K 字固定在圆底中央偏上，篮球按抛物线在 K 字下方拍击
+/// （落地瞬间压扁、顶点拉长，周期 1.3s）；30fps 请求重绘，兼顾动效与省电。
+///
+/// 预留 `logo` 参数：未来切换为自定义 logo 纹理时直接用 `painter.image`
+/// 替换 K 字部分即可，圆底+篮球层不动。
+#[allow(unused_variables)]
+fn draw_logo_mark(ui: &mut egui::Ui, size: f32, logo: Option<&egui::TextureHandle>) -> egui::Rect {
     let theme = crate::theme::current_theme();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let center = rect.center();
-        let radius = size * 0.38;
-        painter.circle_filled(center, radius, theme.accent);
-        painter.circle_stroke(
-            center,
+        let radius = size * 0.40;
+        // 圆底：accent → accent2 垂直渐变。
+        anim::paint_rounded_gradient(
+            painter,
+            egui::Rect::from_center_size(center, egui::vec2(radius * 2.0, radius * 2.0)),
             radius,
-            egui::Stroke::new(size * 0.055, theme.accent2),
+            theme.accent,
+            theme.accent2,
         );
-        painter.circle_stroke(
-            center,
-            radius * 0.72,
-            egui::Stroke::new(size * 0.045, egui::Color32::from_rgb(0xff, 0xd1, 0x66)),
-        );
+
+        // K 字：白色粗体，固定在圆底中央偏上。
         painter.text(
-            center,
+            egui::pos2(center.x, center.y - size * 0.04),
             egui::Align2::CENTER_CENTER,
             "K",
-            egui::FontId::proportional(size * 0.52),
+            egui::FontId::proportional(size * 0.46),
             egui::Color32::WHITE,
         );
+
+        // 篮球弹跳：p 为一个周期内的相位，h=0 顶点 / 1 落地。
+        let t = anim::now(ui.ctx()) as f32;
+        let p = (t / 1.3).fract();
+        let h = 1.0 - (2.0 * p - 1.0).abs();
+        let lift = (1.0 - h) * size * 0.16; // 弹起高度（球顶能触到 K 底边）
+        let squash = (1.0 - (p - 0.5).abs() * 3.6).clamp(0.0, 1.0); // 落地瞬间 1
+        let sy = 1.0 - 0.26 * squash;
+        let sx = 1.0 + 0.32 * squash;
+        let ball_r = size * 0.14;
+        let ball_center = egui::pos2(center.x, center.y + size * (0.28 - lift / size));
+        // 篮球：橙色椭圆（压扁/拉伸）+ 深色纹理弧线。
+        let ball_color = egui::Color32::from_rgb(0xff, 0x9e, 0x2c);
+        let line_color = egui::Color32::from_rgb(0x2b, 0x20, 0x33);
+        let bw = ball_r * sx;
+        let bh = ball_r * sy;
+        painter.add(egui::Shape::ellipse_filled(
+            ball_center,
+            egui::vec2(bw, bh),
+            ball_color,
+        ));
+        let line_w = (ball_r * 0.17).max(0.8);
+        let stroke = egui::Stroke::new(line_w, line_color);
+        // 竖弧 + 左右侧弧（经典篮球纹理）。
+        painter.line_segment(
+            [
+                egui::pos2(ball_center.x, ball_center.y - bh),
+                egui::pos2(ball_center.x, ball_center.y + bh),
+            ],
+            stroke,
+        );
+        let side_x = bw * 0.62;
+        let side_h = bh * 0.82;
+        for sign in [-1.0f32, 1.0] {
+            painter.line_segment(
+                [
+                    egui::pos2(ball_center.x + side_x * sign, ball_center.y - side_h),
+                    egui::pos2(ball_center.x + side_x * sign, ball_center.y + side_h),
+                ],
+                stroke,
+            );
+        }
         if response.hovered() {
             anim::paint_glow(painter, center, size * 0.9, theme.accent2);
         }
+        // 持续动画：30fps 重绘（仅 logo 可见时，且非测试环境由 kittest 控制帧）。
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
     }
     rect
 }
@@ -1705,7 +1961,8 @@ impl eframe::App for KunApp {
                         bottom: 10,
                     });
             egui::Panel::left("hosts")
-                .default_size(232.0)
+                .default_size(240.0)
+                .min_size(240.0)
                 .resizable(true)
                 .frame(sidebar_frame)
                 .show(ui, |ui| {
@@ -1757,6 +2014,31 @@ impl eframe::App for KunApp {
             });
 
         // ==================== 中央区：当前标签页 ====================
+        // SFTP 面板必须是顶层面板（先于 CentralPanel 注册）：
+        // egui 0.36 嵌套在 CentralPanel 内的 `Panel::right` 会把面板状态
+        // 计入顶层布局，导致面板错位覆盖终端（表现为"SFTP 面板打不开"）。
+        let has_sftp = self
+            .tabs
+            .get(self.active_tab)
+            .is_some_and(|t| t.sftp.is_some());
+        if has_sftp {
+            let sftp_frame = egui::Frame::new()
+                .fill(theme.bg_panel)
+                .inner_margin(egui::Margin::symmetric(10, 8));
+            egui::Panel::right("sftp_panel")
+                .default_size(360.0)
+                // 最小宽度保证面板始终可见可操作（此前可被拖到极窄）。
+                .min_size(240.0)
+                .resizable(true)
+                .frame(sftp_frame)
+                .show(ui, |ui| {
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        if let Some(sftp) = &mut tab.sftp {
+                            sftp.show(ui);
+                        }
+                    }
+                });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(_pending) = &self.pending {
                 ui.centered_and_justified(|ui| {
@@ -1772,18 +2054,6 @@ impl eframe::App for KunApp {
             } else if self.tabs.is_empty() {
                 self.empty_state(ui, &ctx);
             } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                if let Some(sftp) = &mut tab.sftp {
-                    let sftp_frame = egui::Frame::new()
-                        .fill(theme.bg_panel)
-                        .inner_margin(egui::Margin::symmetric(10, 8));
-                    egui::Panel::right("sftp_panel")
-                        .default_size(360.0)
-                        .resizable(true)
-                        .frame(sftp_frame)
-                        .show(ui, |ui| {
-                            sftp.show(ui);
-                        });
-                }
                 tab.terminal.show(ui);
             }
         });
@@ -1840,7 +2110,7 @@ mod tests {
                 ui.label("终端区域");
             });
         });
-        harness.run();
+        harness.run_steps(6);
 
         harness.get_by_label("主机");
         harness.get_by_label("新建连接");
@@ -1931,11 +2201,11 @@ mod dialog_tests {
                 });
             show = open;
         });
-        harness.run();
+        harness.run_steps(6);
 
         // 渲染完成，切换到私钥模式再渲染一帧。
         harness.get_by_label("私钥").click();
-        harness.run();
+        harness.run_steps(6);
         harness.get_by_label("私钥路径");
     }
 }
@@ -1944,13 +2214,97 @@ mod dialog_tests {
 mod app_tests {
     use super::*;
 
+    /// 本地终端输入命令前缀 → 补全浮层出现；Esc 关闭；Tab 确认补全。
+    #[test]
+    fn 输入触发补全浮层() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run_steps(6);
+
+        // 输入 "ca"（本地终端，初始即聚焦）。
+        harness.event(egui::Event::Text("ca".into()));
+        for _ in 0..6 {
+            harness.step();
+        }
+
+        // 浮层应出现命令候选（cat 一定在 PATH）。
+        let has_candidate = harness.root().query_all_by_label("cat").next().is_some();
+        assert!(has_candidate, "输入 ca 后应出现补全浮层（cat 候选）");
+
+        // Esc 关闭浮层。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            modifiers: egui::Modifiers::NONE,
+            repeat: false,
+            pressed: true,
+        });
+        for _ in 0..6 {
+            harness.step();
+        }
+        assert!(
+            harness.root().query_all_by_label("cat").next().is_none(),
+            "Esc 应关闭补全浮层"
+        );
+
+        // 再次输入 "ca"，Tab 确认补全（浮层关闭）。
+        // 先退格清空当前输入行（Esc 只关浮层不清输入；
+        // Ctrl+C 在 kittest 事件模拟中可能被 egui 消费为复制命令）。
+        for _ in 0..2 {
+            harness.event(egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                modifiers: egui::Modifiers::NONE,
+                repeat: false,
+                pressed: true,
+            });
+        }
+        for _ in 0..3 {
+            harness.step();
+        }
+        harness.event(egui::Event::Text("ca".into()));
+        for _ in 0..6 {
+            harness.step();
+        }
+        assert!(
+            harness.root().query_all_by_label("cat").next().is_some(),
+            "重新输入后浮层应再次出现"
+        );
+        harness.event(egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            modifiers: egui::Modifiers::NONE,
+            repeat: false,
+            pressed: true,
+        });
+        for _ in 0..6 {
+            harness.step();
+        }
+        assert!(
+            harness.root().query_all_by_label("cat").next().is_none(),
+            "Tab 确认补全后浮层应关闭"
+        );
+    }
+
+    /// 新建连接表单默认值：用户名 root、端口 22（可修改）。
+    #[test]
+    fn 表单默认root与22端口() {
+        let form = ConnectForm::default();
+        assert_eq!(form.user, "root");
+        assert_eq!(form.port, "22");
+        assert!(form.name.is_empty());
+        assert!(form.host.is_empty());
+        assert_eq!(form.port.trim().parse::<u16>().unwrap(), 22);
+    }
+
     /// 完整应用：点击"新建连接"按钮打开对话框，不应崩溃。
     #[test]
     fn 点击新建连接不崩溃() {
         use kittest::Queryable;
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
-        harness.run();
+        harness.run_steps(6);
         harness.get_by_label("kun").click();
         for _ in 0..3 {
             harness.step();
@@ -2053,7 +2407,7 @@ mod connect_tests {
         let mut harness = egui_kittest::Harness::builder()
             .with_step_dt(1.0 / 60.0)
             .build_eframe(|cc| KunApp::new(cc));
-        harness.run();
+        harness.run_steps(6);
         harness.get_by_label("kun").click();
         for _ in 0..3 {
             harness.step();
@@ -2155,7 +2509,7 @@ mod snapshot_tests {
         let mut harness = egui_kittest::Harness::builder()
             .with_step_dt(1.0 / 60.0)
             .build_eframe(|cc| KunApp::new(cc));
-        harness.run();
+        harness.run_steps(6);
         harness.get_by_label("kun").click();
         for _ in 0..3 {
             harness.step();
@@ -2195,7 +2549,7 @@ mod snapshot_tests {
             harness = egui_kittest::Harness::builder()
                 .with_step_dt(1.0 / 60.0)
                 .build_eframe(|cc| KunApp::new(cc));
-            harness.run();
+            harness.run_steps(6);
             harness.get_by_label("kun").click();
             for _ in 0..3 {
                 harness.step();
@@ -2211,6 +2565,25 @@ mod snapshot_tests {
             }
         }
         assert!(connected, "连接失败，无法生成截图");
+
+        // 布局断言：SFTP 面板应位于窗口右侧（终端 + 面板 + 侧栏三段式）。
+        let up = harness.get_by_label("上传");
+        let r = up.rect();
+        assert!(
+            r.left() > 400.0,
+            "SFTP 面板应位于窗口右半侧，实际上传按钮 x={}",
+            r.left()
+        );
+        let host_title = harness.get_by_label("主机");
+        assert!(
+            host_title.rect().left() < 200.0,
+            "侧栏应位于窗口左侧，实际主机标题 x={}",
+            host_title.rect().left()
+        );
+        // 多跑几帧让面板状态稳定后再截图（kittest 渲染器对首帧 shapes 输出有延迟）。
+        for _ in 0..30 {
+            harness.step();
+        }
 
         let img = harness.render().expect("渲染失败");
         let out = "/tmp/kun_style_sftp.png";
@@ -2229,7 +2602,7 @@ mod theme_tests {
         use kittest::Queryable;
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
-        harness.run();
+        harness.run_steps(6);
 
         for theme_name in ["深色", "深蓝", "霓虹"] {
             let combo = harness
@@ -2267,7 +2640,7 @@ mod tab_tests {
         use kittest::Queryable;
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
-        harness.run();
+        harness.run_steps(6);
         assert_eq!(
             harness.query_all_by_label("×").count(),
             1,
@@ -2291,7 +2664,7 @@ mod tab_tests {
         use kittest::Queryable;
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
-        harness.run();
+        harness.run_steps(6);
 
         harness.event(egui::Event::Key {
             key: egui::Key::T,
@@ -2441,7 +2814,7 @@ mod sidebar_tests {
         use kittest::Queryable;
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
-        harness.run();
+        harness.run_steps(6);
 
         assert!(
             harness
@@ -2486,7 +2859,7 @@ mod sidebar_tests {
         use kittest::Queryable;
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
-        harness.run();
+        harness.run_steps(6);
         assert!(
             harness
                 .root()

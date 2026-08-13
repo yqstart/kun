@@ -2,6 +2,7 @@
 
 pub mod anim;
 mod app;
+pub mod completion;
 pub mod theme;
 pub mod views;
 

@@ -258,6 +258,11 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
         color: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0xa0),
     };
 
+    // 所有可点击控件 hover 时显示小手光标（egui 默认不设置；
+    // Button/SelectableLabel/ComboBox 等标准控件读取该字段）。
+    // 注意：TextEdit 内部显式设置 I-beam，不受影响。
+    visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
+
     style.visuals = visuals;
     ctx.set_style_of(egui::Theme::Dark, style);
 }

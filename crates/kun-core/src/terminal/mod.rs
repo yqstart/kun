@@ -147,6 +147,8 @@ pub struct Session {
     writer: Writer,
     resizer: Resizer,
     shuttor: Shuttor,
+    /// 是否为远程会话（远程不启用本地补全：无本机文件系统对应）。
+    is_remote: bool,
     /// 本地会话的 PTY 读取线程（远程会话为 None）。
     pty_thread: Option<
         JoinHandle<(
@@ -163,6 +165,8 @@ pub struct SessionOptions {
     pub shell: Option<String>,
     /// 启动目录。
     pub working_directory: Option<PathBuf>,
+    /// 附加环境变量（追加到继承的环境，alacritty 为覆盖语义）。
+    pub env: HashMap<String, String>,
 }
 
 impl Session {
@@ -173,6 +177,7 @@ impl Session {
         writer: Writer,
         resizer: Resizer,
         shuttor: Shuttor,
+        is_remote: bool,
     ) -> Session {
         Session {
             term,
@@ -180,8 +185,14 @@ impl Session {
             writer,
             resizer,
             shuttor,
+            is_remote,
             pty_thread: None,
         }
+    }
+
+    /// 是否为远程会话（决定本地补全等本机能力是否可用）。
+    pub fn is_remote(&self) -> bool {
+        self.is_remote
     }
 
     /// 启动一个本地 PTY 会话。
@@ -204,7 +215,7 @@ impl Session {
             shell,
             working_directory: options.working_directory,
             drain_on_exit: true,
-            env: HashMap::new(),
+            env: options.env,
         };
         let window_size = WindowSize {
             num_lines: rows,
@@ -263,7 +274,7 @@ impl Session {
             let _ = shuttor_channel.send(Msg::Shutdown);
         });
 
-        let mut session = Session::new(term, shared, writer, resizer, shuttor);
+        let mut session = Session::new(term, shared, writer, resizer, shuttor, false);
         session.pty_thread = Some(pty_thread);
         Ok(session)
     }

@@ -203,24 +203,73 @@ fn extract_text(s: &str, tag: &str) -> Option<String> {
     Some(s[content_start..end].to_string())
 }
 
-/// 将 HTML 片段转纯文本：先还原实体，再剥离所有标签并归一空白。
+/// 将 HTML 片段转纯文本：还原实体、剥离标签，并保留段落/列表结构。
+///
+/// 块级标签边界（p/标题/li 等）产生换行，`<li>` 前补 `• ` 项目符号；
+/// 行内标签（a/strong/code 等）仅以空格分隔，避免相邻内容粘连。
 fn html_to_text(html: &str) -> String {
     let unescaped = unescape_html_entities(html);
     let mut out = String::new();
-    let mut in_tag = false;
-    for c in unescaped.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                // 标签边界补空格，避免相邻 <li> 内容粘连。
-                out.push(' ');
+    let mut chars = unescaped.chars();
+    while let Some(c) = chars.next() {
+        if c != '<' {
+            out.push(c);
+            continue;
+        }
+        // 收集完整标签名（不含 < >）。
+        let mut tag = String::new();
+        for c2 in chars.by_ref() {
+            if c2 == '>' {
+                break;
             }
-            _ if !in_tag => out.push(c),
-            _ => {}
+            tag.push(c2);
+        }
+        let name = tag
+            .trim_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        let is_close = tag.starts_with('/');
+        match name {
+            // 列表项：换行 + 项目符号（仅开始标签）。
+            "li" => {
+                if !is_close {
+                    out.push('\n');
+                    out.push_str("• ");
+                }
+            }
+            // 块级段落/标题/列表容器结束 → 换行。
+            "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol" | "blockquote" | "pre"
+            | "table" | "tr" | "div" => {
+                if is_close {
+                    out.push('\n');
+                }
+            }
+            // 自闭合换行标签。
+            "br" | "hr" => out.push('\n'),
+            // 行内标签 → 空格分隔。
+            _ => out.push(' '),
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    // 归一化：行内空白压缩、连续空行合并为单个段落间距、去首尾空行。
+    let mut result = String::new();
+    let mut blank = false;
+    for line in out.lines() {
+        let text = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            if !result.is_empty() && !blank {
+                result.push('\n');
+                blank = true;
+            }
+        } else {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&text);
+            blank = false;
+        }
+    }
+    result.trim_end().to_string()
 }
 
 /// 还原常见 HTML 实体（GitHub atom 的 `<content>` 为 HTML 转义文本）。
@@ -303,6 +352,24 @@ mod tests {
         assert!(fields.body.contains("新增功能"));
         // 标签与实体应被清理干净。
         assert!(!fields.body.contains('<') && !fields.body.contains('&'));
+    }
+
+    #[test]
+    fn html转文本保留段落与列表结构() {
+        let html =
+            "<h2>[0.3.0]</h2><p>本次更新</p><ul><li>SFTP 连接状态</li><li>输入法延迟</li></ul>";
+        let text = html_to_text(html);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["[0.3.0]", "本次更新", "", "• SFTP 连接状态", "• 输入法延迟"]
+        );
+        // 行内标签只产生空格分隔，不产生换行。
+        let inline = html_to_text("<p>支持 <code>ssh</code> 与 <strong>sftp</strong></p>");
+        assert_eq!(inline, "支持 ssh 与 sftp");
+        // 自闭合换行标签。
+        let br = html_to_text("第一行<br/>第二行");
+        assert_eq!(br.lines().count(), 2);
     }
 
     #[test]

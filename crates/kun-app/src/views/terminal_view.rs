@@ -62,11 +62,30 @@ pub struct TerminalView {
     /// （某些输入法（如微信输入法）退格时会伴随发送空格类文本，
     /// 写入终端表现为"删除键插入空格"；正常字符不受影响）
     suppress_blank_frames: u8,
+    /// 补全输入模型（本地会话启用；远程会话恒失效）。
+    input: crate::completion::InputModel,
+    /// 当前补全候选。
+    candidates: Vec<crate::completion::Candidate>,
+    /// 候选选中索引。
+    candidate_selected: usize,
+    /// 光标屏幕坐标（补全浮层定位）。
+    cursor_pos: Option<egui::Pos2>,
+    /// 上一帧终端是否持有焦点（焦点自动恢复用）。
+    had_focus: bool,
 }
 
 impl TerminalView {
     /// 创建终端视图并启动本地会话。
     pub fn new(session: Session) -> Self {
+        let is_remote = session.is_remote();
+        // 本地会话初始工作目录：会话启动目录（HOME）；远程不启用补全。
+        let cwd = if is_remote {
+            std::path::PathBuf::new()
+        } else {
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+        };
         Self {
             session,
             rows_cache: Vec::new(),
@@ -79,6 +98,11 @@ impl TerminalView {
             initialized: false,
             last_mode: TermMode::NONE,
             suppress_blank_frames: 0,
+            input: crate::completion::InputModel::new(cwd),
+            candidates: Vec::new(),
+            candidate_selected: 0,
+            cursor_pos: None,
+            had_focus: false,
         }
     }
 
@@ -311,6 +335,11 @@ impl TerminalView {
                         Vec2::new(cell_width, cell_height),
                     ));
                 }
+                // 光标屏幕位置（补全浮层定位：光标行底部）。
+                self.cursor_pos = Some(egui::pos2(
+                    inner.min.x + cursor.point.column.0 as f32 * cell_width,
+                    inner.min.y + (cursor.point.line.0 as usize as f32 + 1.0) * cell_height,
+                ));
             }
         }
 
@@ -376,6 +405,14 @@ impl TerminalView {
             ui.memory_mut(|m| m.request_focus(self.focus_id));
             self.initialized = true;
         }
+        // 焦点自动恢复：egui 0.36 在 Text/Key 事件帧后可能清除焦点
+        // （kittest 与部分平台；无事件时保持）。终端曾聚焦且当前无其他
+        // 焦点（对话框/输入框等）时恢复，保证输入连续性。
+        let has_focus_now = ui.memory(|m| m.has_focus(self.focus_id));
+        if !has_focus_now && self.had_focus && ui.memory(|m| m.focused().is_none()) {
+            ui.memory_mut(|m| m.request_focus(self.focus_id));
+        }
+        self.had_focus = has_focus_now;
         // 点击区域覆盖整个面板（min_rect 无子项时为 0x0，会导致点击无法重新聚焦）。
         let response = ui.interact(ui.max_rect(), self.focus_id, egui::Sense::click());
         if response.clicked() {
@@ -420,6 +457,8 @@ impl TerminalView {
         // 滚动后需要重绘；不能在 ui.input 闭包内调用 request_repaint
         // （Context 锁已被 input 持有，会自死锁 10 秒后 panic），用 flag 延后。
         let mut need_repaint = false;
+        // 本帧输入动作（闭包内只读 self 写入 PTY，闭包外统一同步补全模型）。
+        let mut actions: Vec<InputAction> = Vec::new();
 
         // 检测本帧是否有退格/删除键按下（含上一帧的抑制状态）。
         // 某些输入法（如微信输入法）在退格时会伴随发送"空格类" Text 事件，
@@ -459,6 +498,28 @@ impl TerminalView {
                         if modifiers.command {
                             continue;
                         }
+                        // 补全菜单打开时：Tab 确认、↑/↓ 选择、Esc 关闭（不转发给 shell）。
+                        if !self.candidates.is_empty() {
+                            match key {
+                                egui::Key::Tab => {
+                                    actions.push(InputAction::AcceptCompletion);
+                                    continue;
+                                }
+                                egui::Key::ArrowUp => {
+                                    actions.push(InputAction::SelectUp);
+                                    continue;
+                                }
+                                egui::Key::ArrowDown => {
+                                    actions.push(InputAction::SelectDown);
+                                    continue;
+                                }
+                                egui::Key::Escape => {
+                                    actions.push(InputAction::CloseMenu);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         let mods = Mods {
                             shift: modifiers.shift,
                             alt: modifiers.alt,
@@ -471,6 +532,7 @@ impl TerminalView {
                             if let Some(k) = map_char_key(key) {
                                 if let Some(bytes) = keys::encode_key(k, mods, mode) {
                                     session.write(&bytes);
+                                    actions.push(InputAction::Bytes(bytes));
                                 }
                                 continue;
                             }
@@ -478,6 +540,7 @@ impl TerminalView {
                         if let Some(k) = map_special_key(key) {
                             if let Some(bytes) = keys::encode_key(k, mods, mode) {
                                 session.write(&bytes);
+                                actions.push(InputAction::Bytes(bytes));
                             }
                         }
                     }
@@ -501,6 +564,7 @@ impl TerminalView {
                             continue;
                         }
                         session.write(text.as_bytes());
+                        actions.push(InputAction::Text(text.clone()));
                     }
                     egui::Event::Paste(text) => {
                         // 括号粘贴模式（bracketed paste）下包装转义序列。
@@ -510,6 +574,8 @@ impl TerminalView {
                             text.clone()
                         };
                         session.write(payload.as_bytes());
+                        // 粘贴内容不可逐字节信任（可能含控制序列），模型失效。
+                        actions.push(InputAction::Paste);
                     }
                     egui::Event::MouseWheel {
                         unit,
@@ -556,7 +622,220 @@ impl TerminalView {
         if need_repaint {
             ctx.request_repaint();
         }
+
+        // 闭包外统一应用输入动作，同步补全模型。
+        for action in actions {
+            self.apply_input_action(action);
+        }
+        // 渲染补全浮层（本地会话）。
+        if !self.candidates.is_empty() {
+            self.render_completion_popup(ui);
+        }
     }
+
+    /// 应用一帧内的输入动作（写入 PTY 的字节与拦截的按键）。
+    fn apply_input_action(&mut self, action: InputAction) {
+        match action {
+            InputAction::Bytes(bytes) => self.track_input_bytes(&bytes),
+            InputAction::Text(text) => {
+                self.input.push_text(&text);
+                self.recompute_candidates();
+            }
+            InputAction::Paste => {
+                // 粘贴内容不可逐字节信任，模型失效禁用补全直到回车。
+                self.input.invalidate();
+                self.candidates.clear();
+            }
+            InputAction::AcceptCompletion => self.accept_completion(),
+            InputAction::SelectUp => {
+                self.candidate_selected = self.candidate_selected.saturating_sub(1);
+            }
+            InputAction::SelectDown => {
+                let n = self.candidates.len().saturating_sub(1);
+                self.candidate_selected = (self.candidate_selected + 1).min(n);
+            }
+            InputAction::CloseMenu => {
+                self.candidates.clear();
+                self.candidate_selected = 0;
+            }
+        }
+    }
+
+    /// 分析写入 PTY 的字节并同步输入模型（本地会话）。
+    fn track_input_bytes(&mut self, bytes: &[u8]) {
+        if self.session.is_remote() {
+            return;
+        }
+        match bytes {
+            // 回车：执行命令（解析 cd），清空输入，模型恢复可靠。
+            b"\r" | b"\n" => {
+                self.input.execute();
+                self.candidates.clear();
+            }
+            // Ctrl+C：重置当前行。
+            b"\x03" => {
+                self.input.reset();
+                self.candidates.clear();
+            }
+            // 退格/删除。
+            b"\x7f" | b"\x08" => {
+                self.input.backspace();
+                self.recompute_candidates();
+            }
+            // Tab（shell 自身补全）：不改变输入内容。
+            b"\t" => {}
+            _ => {
+                // 可见文本（ASCII 可打印 / 空格 / 非 ASCII）。
+                if let Ok(s) = std::str::from_utf8(bytes) {
+                    if s.chars()
+                        .all(|c| c.is_ascii_graphic() || c == ' ' || !c.is_ascii())
+                    {
+                        self.input.push_text(s);
+                        self.recompute_candidates();
+                        return;
+                    }
+                }
+                // 控制序列/编辑键（箭头、Ctrl+U/W 等）：光标位置不可追踪，模型失效。
+                self.input.invalidate();
+                self.candidates.clear();
+            }
+        }
+    }
+
+    /// 重新计算补全候选。
+    fn recompute_candidates(&mut self) {
+        if self.session.is_remote() {
+            self.candidates.clear();
+            return;
+        }
+        self.candidates = crate::completion::compute_candidates(
+            &self.input,
+            crate::completion::command_index(),
+            8,
+        );
+        self.candidate_selected = 0;
+    }
+
+    /// 用选中候选替换输入中的当前 word（发送退格 + 候选文本到 PTY）。
+    fn accept_completion(&mut self) {
+        let Some(c) = self.candidates.get(self.candidate_selected).cloned() else {
+            return;
+        };
+        let (word_start, word) = crate::completion::last_word(&self.input.text);
+        // shell 中删除旧 word（按字符退格）再写入补全文本。
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend(std::iter::repeat_n(b'\x7f', word.chars().count()));
+        bytes.extend_from_slice(c.text.as_bytes());
+        self.session.write(&bytes);
+        // 同步模型。
+        self.input.text.truncate(word_start);
+        self.input.text.push_str(&c.text);
+        self.candidates.clear();
+        self.candidate_selected = 0;
+    }
+
+    /// 渲染补全浮层（输入行上方，Warp 风格候选列表）。
+    fn render_completion_popup(&mut self, ui: &Ui) {
+        let theme = crate::theme::current_theme();
+        let Some(cursor_pos) = self.cursor_pos else {
+            return;
+        };
+        let inner = ui.max_rect().shrink(PADDING);
+        let popup_w = 260.0;
+        let row_h = 22.0;
+        let rows = self.candidates.len().min(8) as f32;
+        let popup_h = rows * row_h + 12.0;
+        // 显示在光标行上方；空间不足时移到光标行下方。
+        let mut pos = egui::pos2(
+            (cursor_pos.x - popup_w * 0.35)
+                .clamp(inner.left(), ui.max_rect().right() - popup_w - 4.0),
+            cursor_pos.y - popup_h - 4.0,
+        );
+        if pos.y < inner.top() {
+            pos.y = cursor_pos.y + self.cell_height + 4.0;
+        }
+        egui::Area::new(egui::Id::new("completion_popup"))
+            .order(egui::Order::Foreground)
+            // 不拦截鼠标交互（interactable 的 Area 会导致终端焦点被释放）。
+            .interactable(false)
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme.bg_elevated)
+                    .stroke(egui::Stroke::new(1.0, theme.border))
+                    .corner_radius(crate::theme::tokens::RADIUS_SM)
+                    .inner_margin(egui::Margin::symmetric(6, 4))
+                    .show(ui, |ui| {
+                        let mut clicked: Option<usize> = None;
+                        for (i, c) in self.candidates.iter().enumerate().take(8) {
+                            let selected = i == self.candidate_selected;
+                            let (color, marker) = match c.kind {
+                                // 标记用 ASCII/常用字符（Proportional 字体无 Menlo fallback，
+                                // ⚙ 等符号有缺字形风险）。
+                                crate::completion::CandidateKind::Command => (theme.accent2, "$"),
+                                crate::completion::CandidateKind::Dir => (theme.accent, ">"),
+                                crate::completion::CandidateKind::File => {
+                                    (theme.text_secondary, "·")
+                                }
+                            };
+                            let row = ui
+                                .horizontal(|ui| {
+                                    ui.set_min_size(egui::vec2(popup_w, row_h));
+                                    if selected {
+                                        ui.painter().rect_filled(
+                                            ui.max_rect(),
+                                            crate::theme::tokens::RADIUS_ITEM,
+                                            theme.accent_soft,
+                                        );
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(marker).size(11.0).color(if selected {
+                                            theme.text_primary
+                                        } else {
+                                            color
+                                        }),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(&c.display).size(12.5).color(
+                                            if selected { theme.text_primary } else { color },
+                                        ),
+                                    );
+                                })
+                                .response
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if row.hovered() {
+                                self.candidate_selected = i;
+                            }
+                            if row.clicked() {
+                                clicked = Some(i);
+                            }
+                        }
+                        if let Some(i) = clicked {
+                            self.candidate_selected = i;
+                            self.accept_completion();
+                        }
+                    });
+            });
+    }
+}
+
+/// 一帧内的终端输入动作（闭包内收集，闭包外统一应用到补全模型）。
+enum InputAction {
+    /// 已写入 PTY 的字节。
+    Bytes(Vec<u8>),
+    /// 已写入的可见文本。
+    Text(String),
+    /// 粘贴（模型失效）。
+    Paste,
+    /// Tab 确认补全（拦截，不转发 shell）。
+    AcceptCompletion,
+    /// 候选上移。
+    SelectUp,
+    /// 候选下移。
+    SelectDown,
+    /// 关闭补全浮层。
+    CloseMenu,
 }
 
 // ==================== 辅助函数 ====================

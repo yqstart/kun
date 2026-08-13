@@ -174,7 +174,7 @@ pub fn connect_remote(
             });
 
             let _ = tx.send(ConnectResult::Connected(Session::new(
-                term, shared, writer, resizer, shuttor,
+                term, shared, writer, resizer, shuttor, true,
             )));
 
             // ============ 7. 等待会话关闭，保持 runtime 存活 ============
