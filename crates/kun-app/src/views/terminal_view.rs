@@ -61,7 +61,7 @@ pub struct TerminalView {
     /// 退格/删除键按下后，下一帧的"空白类" Text 事件应丢弃。
     /// （某些输入法（如微信输入法）退格时会伴随发送空格类文本，
     /// 写入终端表现为"删除键插入空格"；正常字符不受影响）
-    suppress_next_text: bool,
+    suppress_blank_frames: u8,
 }
 
 impl TerminalView {
@@ -78,7 +78,7 @@ impl TerminalView {
             focus_id: egui::Id::new("terminal_view"),
             initialized: false,
             last_mode: TermMode::NONE,
-            suppress_next_text: false,
+            suppress_blank_frames: 0,
         }
     }
 
@@ -436,8 +436,12 @@ impl TerminalView {
                 )
             })
         });
-        let suppress_blank_text = self.suppress_next_text || backspace_this_frame;
-        self.suppress_next_text = backspace_this_frame;
+        let suppress_blank_text = self.suppress_blank_frames > 0 || backspace_this_frame;
+        self.suppress_blank_frames = if backspace_this_frame {
+            2
+        } else {
+            self.suppress_blank_frames.saturating_sub(1)
+        };
 
         ui.input(|i| {
             for event in &i.events {

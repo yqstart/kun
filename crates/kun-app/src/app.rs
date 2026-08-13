@@ -124,6 +124,8 @@ pub struct KunApp {
     pending_label: String,
     toast: Option<Toast>,
     pending_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>)>,
+    /// SFTP 已就绪但 SSH 标签尚未创建，等待挂载。
+    ready_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>)>,
     sftp_host: String,
     update_state: UpdateState,
     update_rx: Option<std::sync::mpsc::Receiver<Result<Option<UpdateInfo>, String>>>,
@@ -219,6 +221,7 @@ impl KunApp {
             pending_label: String::new(),
             toast: None,
             pending_sftp: None,
+            ready_sftp: None,
             sftp_host: String::new(),
             update_state: UpdateState::Idle,
             update_rx: None,
@@ -440,6 +443,7 @@ impl KunApp {
                         .push(TerminalTab::new(self.pending_label.clone(), view));
                     self.active_tab = self.tabs.len() - 1;
                     self.pending_tab = Some(self.active_tab);
+                    self.mount_ready_sftp();
                     self.show_toast(format!("已连接到 {}", self.pending_label), false);
                     ctx.request_repaint();
                 }
@@ -466,7 +470,19 @@ impl KunApp {
         let (_sftp_thread, sftp_handle, sftp_rx) = connect_sftp(&profile);
         self.sftp_host = label;
         self.pending_sftp = Some((sftp_handle, sftp_rx));
+        self.ready_sftp = None;
         self.pending_tab = None;
+    }
+
+    /// 将已就绪的 SFTP 会话挂载到 SSH 标签页。
+    fn mount_ready_sftp(&mut self) {
+        let Some(idx) = self.pending_tab else { return };
+        let Some((handle, rx)) = self.ready_sftp.take() else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            tab.sftp = Some(SftpView::new(&self.sftp_host, handle, rx));
+        }
     }
 
     /// 处理 SFTP 连接结果。
@@ -483,16 +499,12 @@ impl KunApp {
             }
         }
         if ready {
-            if let Some((handle, rx)) = self.pending_sftp.take() {
-                if let Some(idx) = self.pending_tab {
-                    if let Some(tab) = self.tabs.get_mut(idx) {
-                        tab.sftp = Some(SftpView::new(&self.sftp_host, handle, rx));
-                    }
-                }
-            }
+            self.ready_sftp = self.pending_sftp.take();
+            self.mount_ready_sftp();
         }
         if let Some(e) = failed {
             self.pending_sftp = None;
+            self.ready_sftp = None;
             self.show_toast(format!("SFTP 连接失败：{e}"), true);
         }
     }
@@ -503,7 +515,8 @@ impl KunApp {
         ui.horizontal(|ui| {
             ui.add_space(2.0);
             // 品牌：渐变 logo + 应用名 + 版本。
-            draw_logo_mark(ui, 24.0);
+            let brand_start = ui.cursor().min;
+            draw_logo_mark(ui, 28.0);
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.add_space(1.0);
@@ -520,28 +533,26 @@ impl KunApp {
                 );
             });
             ui.add_space(10.0);
-            // 主机列表折叠开关。
-            let sidebar_btn =
-                egui::Button::new(egui::RichText::new("◧").color(if self.sidebar_open {
-                    theme.text_primary
-                } else {
-                    theme.text_muted
-                }))
-                .fill(if self.sidebar_open {
-                    theme.accent_soft
-                } else {
-                    egui::Color32::TRANSPARENT
-                })
-                .stroke(egui::Stroke::NONE)
-                .corner_radius(crate::theme::tokens::RADIUS_ITEM);
+            let brand_end = ui.cursor().min;
+            let brand_rect = egui::Rect::from_min_max(
+                brand_start,
+                egui::pos2(brand_end.x, brand_start.y + 34.0),
+            );
             if ui
-                .add(sidebar_btn)
-                .on_hover_text("主机列表（⌘B）")
+                .interact(
+                    brand_rect,
+                    egui::Id::new("sidebar_logo_toggle"),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(if self.sidebar_open {
+                    "收起主机列表（⌘B）"
+                } else {
+                    "展开主机列表（⌘B）"
+                })
                 .clicked()
             {
                 self.sidebar_open = !self.sidebar_open;
             }
-
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 主题切换。
                 let current = crate::theme::current_theme().name;
@@ -794,6 +805,8 @@ impl KunApp {
     /// 渲染新建连接对话框。
     fn connect_dialog(&mut self, ctx: &egui::Context) {
         let theme = crate::theme::current_theme();
+        let field_width = 300.0;
+        let mut port_error = false;
         let mut open = self.show_new_conn;
         let mut to_connect: Option<HostProfile> = None;
         let mut canceled = false;
@@ -803,52 +816,114 @@ impl KunApp {
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.add_space(2.0);
-                egui::Grid::new("conn_form")
-                    .num_columns(2)
-                    .spacing([10.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("名称");
-                        let name_id = egui::Id::new("conn_form_name");
-                        ui.add(egui::TextEdit::singleline(&mut self.form.name).id(name_id));
-                        if !self.form.name_focused {
-                            ui.memory_mut(|m| m.request_focus(name_id));
-                            self.form.name_focused = true;
-                        }
-                        ui.end_row();
-                        ui.label("主机");
-                        ui.text_edit_singleline(&mut self.form.host);
-                        ui.end_row();
-                        ui.label("端口");
-                        ui.text_edit_singleline(&mut self.form.port);
-                        ui.end_row();
-                        ui.label("用户名");
-                        ui.text_edit_singleline(&mut self.form.user);
-                        ui.end_row();
-                        ui.label("认证方式");
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut self.form.auth_kind, 0, "密码");
-                            ui.selectable_value(&mut self.form.auth_kind, 1, "私钥");
-                        });
-                        ui.end_row();
-                        if self.form.auth_kind == 0 {
-                            ui.label("密码");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.form.password).password(true),
-                            );
-                            ui.end_row();
-                        } else {
-                            ui.label("私钥路径");
-                            ui.text_edit_singleline(&mut self.form.key_path);
-                            ui.end_row();
-                            ui.label("口令（可选）");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.form.passphrase)
-                                    .password(true),
-                            );
-                            ui.end_row();
-                        }
-                    });
+                ui.vertical_centered(|ui| {
+                    draw_logo_mark(ui, 42.0);
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("建立安全连接")
+                            .strong()
+                            .size(18.0)
+                            .color(theme.text_primary),
+                    );
+                    ui.label(
+                        egui::RichText::new("连接到你的远程工作空间")
+                            .size(11.0)
+                            .color(theme.text_muted),
+                    );
+                });
+                ui.add_space(14.0);
+                ui.label(
+                    egui::RichText::new("连接身份")
+                        .strong()
+                        .color(theme.accent2),
+                );
+                ui.add_space(4.0);
+                let name_id = egui::Id::new("conn_form_name");
+                if !self.form.name_focused {
+                    ui.memory_mut(|m| m.request_focus(name_id));
+                    self.form.name_focused = true;
+                }
+                ui.label(
+                    egui::RichText::new("名称")
+                        .size(11.0)
+                        .color(theme.text_muted),
+                );
+                ui.add_sized(
+                    [field_width, 28.0],
+                    egui::TextEdit::singleline(&mut self.form.name)
+                        .id(name_id)
+                        .hint_text("连接名称（可选）"),
+                );
+                ui.add_space(5.0);
+                ui.label(
+                    egui::RichText::new("用户名")
+                        .size(11.0)
+                        .color(theme.text_muted),
+                );
+                ui.add_sized(
+                    [field_width, 28.0],
+                    egui::TextEdit::singleline(&mut self.form.user).hint_text("用户名，例如 root"),
+                );
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new("网络地址")
+                        .strong()
+                        .color(theme.accent2),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("主机 / 端口")
+                        .size(11.0)
+                        .color(theme.text_muted),
+                );
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [field_width - 76.0, 28.0],
+                        egui::TextEdit::singleline(&mut self.form.host).hint_text("主机名或 IP"),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("端口")
+                            .size(11.0)
+                            .color(theme.text_muted),
+                    );
+                    ui.add_sized(
+                        [68.0, 28.0],
+                        egui::TextEdit::singleline(&mut self.form.port).hint_text("22"),
+                    );
+                });
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new("认证方式")
+                        .strong()
+                        .color(theme.accent2),
+                );
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.form.auth_kind, 0, "密码");
+                    ui.selectable_value(&mut self.form.auth_kind, 1, "私钥");
+                });
+                ui.add_space(5.0);
+                if self.form.auth_kind == 0 {
+                    ui.add_sized(
+                        [field_width, 28.0],
+                        egui::TextEdit::singleline(&mut self.form.password)
+                            .password(true)
+                            .hint_text("密码"),
+                    );
+                } else {
+                    ui.add_sized(
+                        [field_width, 28.0],
+                        egui::TextEdit::singleline(&mut self.form.key_path)
+                            .hint_text("私钥文件路径"),
+                    );
+                    ui.add_space(5.0);
+                    ui.add_sized(
+                        [field_width, 28.0],
+                        egui::TextEdit::singleline(&mut self.form.passphrase)
+                            .password(true)
+                            .hint_text("私钥口令（可选）"),
+                    );
+                }
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);
@@ -862,7 +937,17 @@ impl KunApp {
                     .stroke(egui::Stroke::NONE)
                     .corner_radius(crate::theme::tokens::RADIUS_SM);
                     if ui.add(connect).clicked() {
-                        let port: u16 = self.form.port.trim().parse().unwrap_or(22);
+                        let port: u16 = match self.form.port.trim().parse() {
+                            Ok(port @ 1..=65535) => port,
+                            _ => {
+                                port_error = true;
+                                22
+                            }
+                        };
+                        if port_error {
+                            self.show_toast("端口必须是 1-65535 的数字", true);
+                            return;
+                        }
                         let auth = if self.form.auth_kind == 0 {
                             Auth::Password(self.form.password.clone())
                         } else {
@@ -973,9 +1058,15 @@ impl KunApp {
                 );
                 if sel_alpha > 0.01 {
                     ui.painter().rect_filled(
-                        row.rect.expand2(egui::vec2(1.0, 2.0)),
+                        row.rect.expand2(egui::vec2(2.0, 3.0)),
                         crate::theme::tokens::RADIUS_ITEM,
                         theme.accent_soft.gamma_multiply(sel_alpha),
+                    );
+                    ui.painter().rect_stroke(
+                        row.rect.expand2(egui::vec2(1.0, 2.0)),
+                        crate::theme::tokens::RADIUS_ITEM,
+                        egui::Stroke::new(1.0, theme.accent.gamma_multiply(sel_alpha * 0.7)),
+                        egui::StrokeKind::Inside,
                     );
                 } else if hover_alpha > 0.01 {
                     ui.painter().rect_filled(
@@ -1416,22 +1507,35 @@ impl KunApp {
 
 // ==================== 绘制辅助 ====================
 
-/// 品牌 logo：圆角紫青渐变 + 白色 K。
+/// ikun 品牌标记：篮球轨迹、K 字与紫金霓虹光环。
 fn draw_logo_mark(ui: &mut egui::Ui, size: f32) -> egui::Rect {
     let theme = crate::theme::current_theme();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
-        anim::paint_rounded_gradient(ui.painter(), rect, size * 0.28, theme.accent, theme.accent2);
-        if response.hovered() {
-            anim::paint_glow(ui.painter(), rect.center(), size * 0.85, theme.accent);
-        }
-        ui.painter().text(
-            rect.center(),
+        let painter = ui.painter();
+        let center = rect.center();
+        let radius = size * 0.38;
+        painter.circle_filled(center, radius, theme.accent);
+        painter.circle_stroke(
+            center,
+            radius,
+            egui::Stroke::new(size * 0.055, theme.accent2),
+        );
+        painter.circle_stroke(
+            center,
+            radius * 0.72,
+            egui::Stroke::new(size * 0.045, egui::Color32::from_rgb(0xff, 0xd1, 0x66)),
+        );
+        painter.text(
+            center,
             egui::Align2::CENTER_CENTER,
             "K",
-            egui::FontId::proportional(size * 0.56),
+            egui::FontId::proportional(size * 0.52),
             egui::Color32::WHITE,
         );
+        if response.hovered() {
+            anim::paint_glow(painter, center, size * 0.9, theme.accent2);
+        }
     }
     rect
 }
@@ -1555,7 +1659,6 @@ impl eframe::App for KunApp {
             (egui::Key::Num1, 0),
             (egui::Key::Num2, 1),
             (egui::Key::Num3, 2),
-            (egui::Key::Num4, 3),
         ] {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, key)) {
                 crate::theme::set_theme(&ctx, theme_idx);
@@ -1620,41 +1723,11 @@ impl eframe::App for KunApp {
                 top: 7,
                 bottom: 3,
             });
-        let toolbar_response = egui::Panel::top("toolbar")
+        egui::Panel::top("toolbar")
             .frame(toolbar_frame)
             .show(ui, |ui| {
                 self.toolbar(ui);
             });
-        // 工具栏底部扫光（hover 或更新状态活跃时持续动画）。
-        {
-            let rect = toolbar_response.response.rect;
-            let pointer_over =
-                ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| rect.contains(p)));
-            let active = pointer_over
-                || matches!(
-                    self.update_state,
-                    UpdateState::Available(_)
-                        | UpdateState::Downloading(_)
-                        | UpdateState::Downloaded { .. }
-                        | UpdateState::Installing(_)
-                );
-            if active {
-                ctx.request_repaint_after(Duration::from_millis(16));
-            }
-            let phase = anim::sweep(&ctx, 2.8);
-            anim::paint_shimmer_line(
-                ui.painter(),
-                egui::Rect::from_min_max(
-                    egui::pos2(rect.left(), rect.bottom() - 2.0),
-                    egui::pos2(rect.right(), rect.bottom()),
-                ),
-                theme.accent,
-                theme.accent2,
-                phase,
-                0.22,
-            );
-        }
-
         // ==================== 标签页栏 ====================
         let tab_frame = egui::Frame::new()
             .fill(theme.bg_header)
@@ -1878,7 +1951,7 @@ mod app_tests {
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
         harness.run();
-        harness.get_by_label("◧").click();
+        harness.get_by_label("kun").click();
         for _ in 0..3 {
             harness.step();
         }
@@ -1981,7 +2054,7 @@ mod connect_tests {
             .with_step_dt(1.0 / 60.0)
             .build_eframe(|cc| KunApp::new(cc));
         harness.run();
-        harness.get_by_label("◧").click();
+        harness.get_by_label("kun").click();
         for _ in 0..3 {
             harness.step();
         }
@@ -2083,7 +2156,7 @@ mod snapshot_tests {
             .with_step_dt(1.0 / 60.0)
             .build_eframe(|cc| KunApp::new(cc));
         harness.run();
-        harness.get_by_label("◧").click();
+        harness.get_by_label("kun").click();
         for _ in 0..3 {
             harness.step();
         }
@@ -2123,7 +2196,7 @@ mod snapshot_tests {
                 .with_step_dt(1.0 / 60.0)
                 .build_eframe(|cc| KunApp::new(cc));
             harness.run();
-            harness.get_by_label("◧").click();
+            harness.get_by_label("kun").click();
             for _ in 0..3 {
                 harness.step();
             }
@@ -2150,15 +2223,15 @@ mod snapshot_tests {
 mod theme_tests {
     use super::*;
 
-    /// 四套主题切换并渲染截图（视觉验证用）。
+    /// 三套主题切换并渲染截图（视觉验证用）。
     #[test]
-    fn 四套主题渲染截图() {
+    fn 三套主题渲染截图() {
         use kittest::Queryable;
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
         harness.run();
 
-        for theme_name in ["Warp 深色", "Dawn 浅色", "Midnight 深蓝", "Cyberpunk 霓虹"] {
+        for theme_name in ["深色", "深蓝", "霓虹"] {
             let combo = harness
                 .root()
                 .query_by_role(accesskit::Role::ComboBox)
@@ -2362,7 +2435,7 @@ mod dblclick_probe {
 mod sidebar_tests {
     use super::*;
 
-    /// 侧栏默认折叠（"新建连接"按钮不可见），点 ◧ 展开，再点收起。
+    /// 侧栏默认折叠（"新建连接"按钮不可见），点击 logo 展开，再点收起。
     #[test]
     fn 侧栏默认折叠可展开收起() {
         use kittest::Queryable;
@@ -2379,7 +2452,7 @@ mod sidebar_tests {
             "侧栏默认应折叠（新建连接按钮不可见）"
         );
 
-        harness.get_by_label("◧").click();
+        harness.get_by_label("kun").click();
         for _ in 0..3 {
             harness.step();
         }
@@ -2393,7 +2466,7 @@ mod sidebar_tests {
         );
         harness.get_by_label("新建连接");
 
-        harness.get_by_label("◧").click();
+        harness.get_by_label("kun").click();
         for _ in 0..3 {
             harness.step();
         }

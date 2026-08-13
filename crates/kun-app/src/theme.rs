@@ -1,12 +1,12 @@
 //! 主题与配色。
 //!
 //! 视觉体系参照 Warp 终端：深灰近黑的分层背景、极淡半透明边线、
-//! 紫青品牌渐变、圆角卡片与克制的高亮。四套皮肤共用同一套结构。
+//! 紫青品牌渐变、圆角卡片与克制的高亮。三套深色皮肤共用同一套结构。
 
 use alacritty_terminal::vte::ansi::Rgb;
 use egui::{Color32, Context, CornerRadius, Stroke, Visuals};
 
-/// 设计 token（默认 Warp 深色基准）。
+/// 设计 token（默认深色主题基准）。
 pub mod tokens {
     use egui::Color32;
 
@@ -262,7 +262,7 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
     ctx.set_style_of(egui::Theme::Dark, style);
 }
 
-// ---- 终端调色板：四套 ----
+// ---- 终端调色板：三套 ----
 
 const PALETTE_WARP: [Rgb; 16] = TERM_PALETTE_16;
 
@@ -432,92 +432,9 @@ const PALETTE_CYBER: [Rgb; 16] = [
     },
 ];
 
-const PALETTE_DAWN: [Rgb; 16] = [
-    Rgb {
-        r: 0x8a,
-        g: 0x8a,
-        b: 0x8a,
-    },
-    Rgb {
-        r: 0xd2,
-        g: 0x4d,
-        b: 0x3d,
-    },
-    Rgb {
-        r: 0x2e,
-        g: 0x8b,
-        b: 0x57,
-    },
-    Rgb {
-        r: 0xb5,
-        g: 0x8f,
-        b: 0x00,
-    },
-    Rgb {
-        r: 0x25,
-        g: 0x63,
-        b: 0xeb,
-    },
-    Rgb {
-        r: 0xa5,
-        g: 0x5e,
-        b: 0xe0,
-    },
-    Rgb {
-        r: 0x0e,
-        g: 0x9f,
-        b: 0x9a,
-    },
-    Rgb {
-        r: 0x4a,
-        g: 0x4a,
-        b: 0x4a,
-    },
-    Rgb {
-        r: 0x9a,
-        g: 0x9a,
-        b: 0x9a,
-    },
-    Rgb {
-        r: 0xd2,
-        g: 0x4d,
-        b: 0x3d,
-    },
-    Rgb {
-        r: 0x2e,
-        g: 0x8b,
-        b: 0x57,
-    },
-    Rgb {
-        r: 0xb5,
-        g: 0x8f,
-        b: 0x00,
-    },
-    Rgb {
-        r: 0x25,
-        g: 0x63,
-        b: 0xeb,
-    },
-    Rgb {
-        r: 0xa5,
-        g: 0x5e,
-        b: 0xe0,
-    },
-    Rgb {
-        r: 0x0e,
-        g: 0x9f,
-        b: 0x9a,
-    },
-    Rgb {
-        r: 0x4a,
-        g: 0x4a,
-        b: 0x4a,
-    },
-];
-
-pub static THEMES: [Theme; 4] = [
+pub static THEMES: [Theme; 3] = [
     Theme {
-        name: "Warp 深色",
+        name: "深色",
         light: false,
         bg_app: tokens::BG_APP,
         bg_header: tokens::BG_HEADER,
@@ -539,41 +456,7 @@ pub static THEMES: [Theme; 4] = [
         term_palette: PALETTE_WARP,
     },
     Theme {
-        name: "Dawn 浅色",
-        light: true,
-        bg_app: Color32::from_rgb(0xf7, 0xf7, 0xf9),
-        bg_header: Color32::from_rgb(0xef, 0xef, 0xf3),
-        bg_panel: Color32::from_rgb(0xe9, 0xe9, 0xee),
-        bg_elevated: Color32::from_rgb(0xff, 0xff, 0xff),
-        border: Color32::from_rgba_unmultiplied_const(0x00, 0x00, 0x00, 0x12),
-        text_primary: Color32::from_rgb(0x19, 0x19, 0x1d),
-        text_secondary: Color32::from_rgb(0x4a, 0x4a, 0x52),
-        text_muted: Color32::from_rgb(0x7c, 0x7c, 0x86),
-        accent: Color32::from_rgb(0x5a, 0x45, 0xe8),
-        accent2: Color32::from_rgb(0x08, 0x91, 0xb2),
-        accent_soft: Color32::from_rgba_unmultiplied_const(0x5a, 0x45, 0xe8, 0x18),
-        success: Color32::from_rgb(0x16, 0xa3, 0x4a),
-        warning: Color32::from_rgb(0xb4, 0x53, 0x09),
-        danger: Color32::from_rgb(0xdc, 0x26, 0x26),
-        term_bg: Rgb {
-            r: 0xff,
-            g: 0xff,
-            b: 0xff,
-        },
-        term_fg: Rgb {
-            r: 0x20,
-            g: 0x20,
-            b: 0x2a,
-        },
-        term_cursor: Rgb {
-            r: 0x5a,
-            g: 0x45,
-            b: 0xe8,
-        },
-        term_palette: PALETTE_DAWN,
-    },
-    Theme {
-        name: "Midnight 深蓝",
+        name: "深蓝",
         light: false,
         bg_app: Color32::from_rgb(0x06, 0x0a, 0x14),
         bg_header: Color32::from_rgb(0x0c, 0x12, 0x20),
@@ -607,7 +490,7 @@ pub static THEMES: [Theme; 4] = [
         term_palette: PALETTE_MIDNIGHT,
     },
     Theme {
-        name: "Cyberpunk 霓虹",
+        name: "霓虹",
         light: false,
         bg_app: Color32::from_rgb(0x0a, 0x04, 0x0f),
         bg_header: Color32::from_rgb(0x14, 0x0a, 0x1d),

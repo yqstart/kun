@@ -66,19 +66,19 @@ crates/
 - 主机条目支持单击选中、双击连接；条目样式：**accent 圆形头像（主机名首字符）+ 名称 + 🗑 删除图标**（行右侧，hover 红底）
 - **egui 0.36 交互坑：`Response::interact()`（scope_builder(...).response.interact(...)）的点击无法命中**（响应链问题，kittest 实测 clicked/hovered 恒 false）——必须用 `ui.interact(rect, id, sense)` 显式注册交互区，删除按钮等行内控件最后注册以覆盖行点击区
 - 终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）在渲染层解析（`theme.rs::TERM_PALETTE_16`/`xterm256`），优先级：Spec > OSC 覆盖（term.colors）> 内置调色板；`Term.colors` 默认全 None，不设调色板则全部渲染为白色
-- 工具栏底部有紫→青循环扫光；选中主机条目左侧 2px accent 竖条；标签页底部有选中指示条（宽度动画）
-- **四套主题**（`theme.rs::THEMES`）：Warp 深色（紫）/ Dawn 浅色 / Midnight 深蓝 / Cyberpunk 霓虹；每套含 UI token + 终端调色板（16 色 + fg/bg/cursor）；`current_theme()` 静态读取，工具栏 ComboBox 切换（`set_theme`）
+- 选中主机条目左侧 2px accent 竖条；标签页底部有选中指示条（宽度动画）
+- **三套深色主题**（`theme.rs::THEMES`）：深色（紫金）/ 深蓝 / 霓虹；每套含 UI token + 终端调色板（16 色 + fg/bg/cursor）；`current_theme()` 静态读取，工具栏 ComboBox 切换（`set_theme`）
 - 主题切换后需重新渲染终端（terminal_view 每帧读 `current_theme()`）
 - 终端输入/回车功能验证正常；若用户"回车不执行"多为中文输入法（IME）激活时回车被输入法消费（确认拼音候选），切英文输入法即可（所有终端应用共性）
 - **"删除键插入空格"（微信输入法 wetype 等）**：退格/删除键按下时输入法会伴随发送"空格类" Text 事件（ASCII 空格/零宽），写入终端表现为插入空格——已修复：`suppress_next_text` 跨帧标记 + 退格后一帧内的空白类 Text 丢弃（只影响空白字符，不误伤正常输入）；回归测试 `退格伴随空格文本不插入`
-- 顶部工具栏：左侧品牌区（渐变 logo + kun + 版本号）与「◧」主机列表折叠开关（默认**收起**，启动直接进终端，⌘B 切换）、右侧主题 ComboBox + 更新状态圆点/检查更新按钮；新建连接走左侧栏按钮/⌘N，新建本地终端走标签栏 ＋/⌘T
+- 顶部工具栏：左侧品牌区（ikun logo + kun + 版本号，点击 logo 折叠主机列表）（默认**收起**，启动直接进终端，⌘B 切换）、右侧主题 ComboBox + 更新状态圆点/检查更新按钮；新建连接走左侧栏按钮/⌘N，新建本地终端走标签栏 ＋/⌘T
 - **应用内更新**（`kun-core::updater` + `app.rs` 状态机）：版本检查走 `releases.atom`（不受 API 限流），资产直链按 `kun-{版本}-macos-{arm64|x64}.dmg` 构造并流式下载（进度回调）；安装由后台 shell 脚本完成——`hdiutil attach` 挂载 → `pgrep -x kun-app` 等待主进程退出 → `ditto` 替换 `/Applications/kun.app`（失败回退 `~/Applications`）→ `open` 重启；`installed` 状态延时 0.9s 后 `ViewportCommand::Close`
-- 主机行双击连接为**自实现检测**（`last_row_click`：0.3s 内同行的第二次点击）：egui 多击计数会把无关点击（如 ◧ 折叠按钮）计入序列导致 count=3 而 `double_clicked`（count==2）失效
-- **多标签页**（warp 风格）：`KunApp` 持 `tabs: Vec<TerminalTab>`（`label + TerminalView + sftp`），SFTP 按标签页挂载（远程 tab 独享）；标签栏在工具栏下方（`Panel::top("tabs")`），当前标签 accent-soft 高亮，支持点击切换/×关闭/＋新建；快捷键 ⌘T 新建本地、⌘W 关闭当前、⌘1-9 切换、⌘N 新建连接、⌥1-4 主题
+- 主机行双击连接为**自实现检测**（`last_row_click`：0.3s 内同行的第二次点击）：egui 多击计数会把无关点击（如工具栏其他按钮）计入序列导致 count=3 而 `double_clicked`（count==2）失效
+- **多标签页**（warp 风格）：`KunApp` 持 `tabs: Vec<TerminalTab>`（`label + TerminalView + sftp`），SFTP 按标签页挂载（远程 tab 独享）；标签栏在工具栏下方（`Panel::top("tabs")`），当前标签 accent-soft 高亮，支持点击切换/×关闭/＋新建；快捷键 ⌘T 新建本地、⌘W 关闭当前、⌘1-9 切换、⌘N 新建连接、⌥1-3 主题
 - 本地终端默认工作目录为 **home**（`local_session_options`：`working_directory = $HOME`）——Finder/Dock 启动时进程 cwd 为 `/`，不指定会导致终端落在根目录；远程会话不受影响（由 sshd 决定）
 - 终端内容颜色：prompt 彩色来自 shell 主题（如 oh-my-zsh robbyrussell 的绿/青/蓝/黄）；`ls` 无色是 macOS 默认行为（需 `alias ls='ls -G'`），kun 不篡改 shell 输出
-- 浅色主题兼容：终端背景强制跟随主题（忽略 OSC 11 背景覆盖——zsh 主题常设深色背景会破坏浅色主题）；`apply_theme` 同步系统主题（`ctx.set_theme`）使 macOS 标题栏跟随浅/深色
-- 主题快捷键：⌥1-⌥4 快速切换四套主题
+- 主题背景跟随当前深色主题；`apply_theme` 同步系统深色主题（`ctx.set_theme`）
+- 主题快捷键：⌥1-⌥3 快速切换三套主题
 
 ## 关键约定
 
