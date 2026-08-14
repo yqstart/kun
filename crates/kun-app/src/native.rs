@@ -11,6 +11,8 @@
 use objc2_app_kit::NSView;
 
 /// 窗口四角圆角半径（逻辑像素，与 `theme.rs` 的大圆角面板观感一致）。
+/// 仅 macOS 使用（Linux/Windows 的 native.rs 为空实现），加 cfg 防 `-D warnings` dead_code。
+#[cfg(target_os = "macos")]
 const WINDOW_CORNER_RADIUS: f64 = 12.0;
 
 /// 给无边框窗口应用整体圆角。失败（非 macOS / 无 AppKit 句柄）时静默忽略。
