@@ -173,6 +173,7 @@ impl TerminalView {
             let guard = term_arc.lock();
             let content = guard.renderable_content();
             let colors = content.colors;
+            let display_offset = content.display_offset;
             let default_fg =
                 colors[NamedColor::Foreground].unwrap_or(crate::theme::current_theme().term_fg);
             // 背景色强制跟随主题（忽略 OSC 背景覆盖——zsh 主题常设置深色背景，
@@ -197,6 +198,10 @@ impl TerminalView {
             let mut backgrounds: Vec<BgRect> = Vec::new();
             let mut hash: u64 = 0;
             let mut current_line = usize::MAX;
+            // display_iter 的行号是网格坐标（向上滚动后 scrollback 行为负），
+            // 仅用于换行检测；渲染定位与行缓存索引用相对视口顶行的显示行号（0 起）。
+            let mut prev_grid_line: i32 = i32::MIN;
+            let mut display_line: usize = 0;
             let default_bg_egui = to_egui(default_bg);
 
             for item in content.display_iter {
@@ -235,7 +240,7 @@ impl TerminalView {
                     continue;
                 }
 
-                if point.line != current_line {
+                if point.line.0 != prev_grid_line {
                     if current_line != usize::MAX {
                         lines_data.push(LineData {
                             line: current_line,
@@ -245,7 +250,9 @@ impl TerminalView {
                         });
                     }
                     hash = 0;
-                    current_line = point.line.0 as usize;
+                    current_line = display_line;
+                    display_line += 1;
+                    prev_grid_line = point.line.0;
                 }
 
                 // 解析颜色（含粗体 → 亮色映射）。
@@ -273,7 +280,7 @@ impl TerminalView {
                 // 光标 cell：Block 光标下文本反色，由光标矩形覆盖。
                 let is_cursor = cursor_visible
                     && cursor.shape == CursorShape::Block
-                    && point.line.0 as usize == cursor.point.line.0 as usize
+                    && point.line.0 == cursor.point.line.0
                     && point.column == cursor.point.column;
                 if is_cursor {
                     std::mem::swap(&mut fg, &mut bg);
@@ -326,19 +333,23 @@ impl TerminalView {
             // 光标矩形（Block 之外的光标形状）。
             if cursor_visible && cursor.shape != CursorShape::Hidden {
                 let (line, col) = (cursor.point.line.0 as usize, cursor.point.column.0);
-                if line < self.rows as usize && col < self.cols as usize {
+                // 滚动（查看 scrollback）时视口向上偏移 display_offset 行，
+                // 光标网格行号需换算为显示行号；滚出视口则不绘制。
+                let disp_line = line.saturating_add(display_offset);
+                if disp_line < self.rows as usize && col < self.cols as usize {
                     let color = colors[NamedColor::Cursor]
                         .unwrap_or(crate::theme::current_theme().term_cursor);
                     cursor_color = Some(to_egui(color));
                     cursor_rect = Some(Rect::from_min_size(
-                        inner.min + Vec2::new(col as f32 * cell_width, line as f32 * cell_height),
+                        inner.min
+                            + Vec2::new(col as f32 * cell_width, disp_line as f32 * cell_height),
                         Vec2::new(cell_width, cell_height),
                     ));
                 }
                 // 光标屏幕位置（补全浮层定位：光标行底部）。
                 self.cursor_pos = Some(egui::pos2(
                     inner.min.x + cursor.point.column.0 as f32 * cell_width,
-                    inner.min.y + (cursor.point.line.0 as usize as f32 + 1.0) * cell_height,
+                    inner.min.y + (disp_line as f32 + 1.0) * cell_height,
                 ));
             }
         }
@@ -746,14 +757,14 @@ impl TerminalView {
         let rows = self.candidates.len().min(8) as f32;
         let popup_h = rows * row_h + 12.0;
         // 显示在光标行上方；空间不足时移到光标行下方。
-        let mut pos = egui::pos2(
-            (cursor_pos.x - popup_w * 0.35)
-                .clamp(inner.left(), ui.max_rect().right() - popup_w - 4.0),
-            cursor_pos.y - popup_h - 4.0,
+        // cursor_pos 是光标行底部：上方模式浮层底边 = 光标行顶上方 4px（完全不遮输入行），
+        // 下方模式浮层顶边 = 光标行底下方 4px（紧贴输入行）。
+        let pos = completion_popup_pos(
+            cursor_pos,
+            self.cell_height,
+            egui::vec2(popup_w, popup_h),
+            inner,
         );
-        if pos.y < inner.top() {
-            pos.y = cursor_pos.y + self.cell_height + 4.0;
-        }
         egui::Area::new(egui::Id::new("completion_popup"))
             .order(egui::Order::Foreground)
             // 不拦截鼠标交互（interactable 的 Area 会导致终端焦点被释放）。
@@ -818,6 +829,28 @@ impl TerminalView {
                     });
             });
     }
+}
+
+/// 计算补全浮层左上角位置（独立函数便于单测）。
+///
+/// `cursor` 为光标行**底部**坐标；上方空间充足时浮层显示在输入行上方
+/// （底边 = 光标行顶上方 4px，完全不遮输入行），不足时显示在输入行下方
+/// （顶边 = 光标行底下方 4px，紧贴输入行）。x 方向以光标为轴向左偏移并
+/// 限制在终端内容区内。
+fn completion_popup_pos(
+    cursor: egui::Pos2,
+    cell_height: f32,
+    popup_size: egui::Vec2,
+    inner: egui::Rect,
+) -> egui::Pos2 {
+    let mut pos = egui::pos2(
+        (cursor.x - popup_size.x * 0.35).clamp(inner.left(), inner.right() - popup_size.x - 4.0),
+        cursor.y - cell_height - popup_size.y - 4.0,
+    );
+    if pos.y < inner.top() {
+        pos.y = cursor.y + 4.0;
+    }
+    pos
 }
 
 /// 一帧内的终端输入动作（闭包内收集，闭包外统一应用到补全模型）。
@@ -1075,22 +1108,24 @@ mod tests {
         let content = guard.renderable_content();
         let mut lines: Vec<String> = Vec::new();
         let mut current = String::new();
-        let mut current_line = usize::MAX;
+        let mut started = false;
+        let mut prev_grid_line: i32 = i32::MIN;
         for item in content.display_iter {
             let cell = item.cell;
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
                 continue;
             }
-            if item.point.line.0 as usize != current_line {
-                if current_line != usize::MAX {
+            if item.point.line.0 != prev_grid_line {
+                if started {
                     lines.push(current.trim_end().to_string());
                 }
                 current = String::new();
-                current_line = item.point.line.0 as usize;
+                started = true;
+                prev_grid_line = item.point.line.0;
             }
             current.push(cell.c);
         }
-        if current_line != usize::MAX {
+        if started {
             lines.push(current.trim_end().to_string());
         }
         lines.join("\n")
@@ -1216,6 +1251,77 @@ mod tests {
             "字符重复写入，最后一行：{last_line:?}，终端内容：\n{text}"
         );
     }
+
+    /// 向上滚动查看 scrollback 后渲染不得崩溃（回归测试：display_iter 的
+    /// scrollback 行是负网格行号，曾 cast 成 usize 触发 capacity overflow 闪退）。
+    #[test]
+    fn 滚动scrollback后渲染不崩溃() {
+        use alacritty_terminal::grid::Scroll;
+
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        assert!(wait_text(&view, &mut harness, "kun"), "zsh 未就绪");
+
+        // 执行 `seq 40` 输出 40 行，超过 24 行视口，产生 scrollback。
+        view.borrow().session().write(b"seq 40\r");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut done = false;
+        while Instant::now() < deadline {
+            harness.step();
+            let text = grid_text(view.borrow().session());
+            if text.lines().any(|l| l.trim_end() == "40") {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            done,
+            "seq 40 输出未就绪，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+
+        // 滚动前视口顶行（seq 输出靠近末尾的数字）。
+        let top_before: u32 = grid_text(view.borrow().session())
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(0);
+
+        // 向上滚动 5 行（进入 scrollback，出现负网格行号）。
+        {
+            let term = view.borrow().session().term();
+            let mut guard = term.lock();
+            guard.grid_mut().scroll_display(Scroll::Delta(5));
+        }
+
+        // 渲染若干帧：修复前负行号 cast 成 usize 后 resize 行缓存会
+        // capacity overflow panic（本测试直接失败）。
+        for _ in 0..6 {
+            harness.step();
+        }
+
+        // 滚动后视口顶行应显示更早的输出（数字更小），验证显示行号换算正确。
+        let top_after: u32 = grid_text(view.borrow().session())
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(0);
+        assert!(
+            top_after < top_before,
+            "滚动后视口应显示更早的输出行（{top_before} → {top_after}）"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1282,22 +1388,24 @@ mod enter_tests {
         let content = guard.renderable_content();
         let mut lines: Vec<String> = Vec::new();
         let mut current = String::new();
-        let mut current_line = usize::MAX;
+        let mut started = false;
+        let mut prev_grid_line: i32 = i32::MIN;
         for item in content.display_iter {
             let cell = item.cell;
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
                 continue;
             }
-            if item.point.line.0 as usize != current_line {
-                if current_line != usize::MAX {
+            if item.point.line.0 != prev_grid_line {
+                if started {
                     lines.push(current.trim_end().to_string());
                 }
                 current = String::new();
-                current_line = item.point.line.0 as usize;
+                started = true;
+                prev_grid_line = item.point.line.0;
             }
             current.push(cell.c);
         }
-        if current_line != usize::MAX {
+        if started {
             lines.push(current.trim_end().to_string());
         }
         lines.join("\n")
@@ -1460,22 +1568,24 @@ mod ime_backspace_tests {
         let content = guard.renderable_content();
         let mut lines: Vec<String> = Vec::new();
         let mut current = String::new();
-        let mut current_line = usize::MAX;
+        let mut started = false;
+        let mut prev_grid_line: i32 = i32::MIN;
         for item in content.display_iter {
             let cell = item.cell;
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
                 continue;
             }
-            if item.point.line.0 as usize != current_line {
-                if current_line != usize::MAX {
+            if item.point.line.0 != prev_grid_line {
+                if started {
                     lines.push(current.trim_end().to_string());
                 }
                 current = String::new();
-                current_line = item.point.line.0 as usize;
+                started = true;
+                prev_grid_line = item.point.line.0;
             }
             current.push(cell.c);
         }
-        if current_line != usize::MAX {
+        if started {
             lines.push(current.trim_end().to_string());
         }
         lines.join("\n")
@@ -1567,5 +1677,74 @@ mod ime_backspace_tests {
             !last_line.contains("ab "),
             "退格不应插入空格，最后一行：{last_line:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_popup_tests {
+    use super::completion_popup_pos;
+
+    /// 内边距后的终端内容区（800x600 面板去 PADDING）。
+    fn inner() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0))
+    }
+
+    /// 3 条候选的浮层尺寸（3 * 22 + 12）。
+    fn popup() -> egui::Vec2 {
+        egui::vec2(260.0, 78.0)
+    }
+
+    /// 输入行在视口中部：浮层显示在输入行上方，且完全不遮输入行
+    /// （底边 ≤ 光标行顶上方 4px；回归测试：曾向下偏移一整行盖住输入行底部）。
+    #[test]
+    fn 输入行在中部浮层在上方() {
+        let cursor = egui::pos2(120.0, 160.0); // 光标行底部（第 10 行）
+        let pos = completion_popup_pos(cursor, 16.0, popup(), inner());
+        assert_eq!(
+            pos.y,
+            160.0 - 16.0 - 78.0 - 4.0,
+            "浮层底边应在光标行顶上方 4px"
+        );
+        assert!(
+            pos.y + 78.0 <= cursor.y - 16.0 - 4.0,
+            "浮层不得遮挡输入行（底边 {} > 输入行顶上方 4px {}）",
+            pos.y + 78.0,
+            cursor.y - 16.0 - 4.0
+        );
+    }
+
+    /// 输入行在视口顶部（上方放不下）：浮层移到输入行下方紧贴，不遮输入行。
+    #[test]
+    fn 输入行在顶部浮层在下方() {
+        let cursor = egui::pos2(120.0, 32.0); // 第 2 行底，上方仅 1 行
+        let pos = completion_popup_pos(cursor, 16.0, popup(), inner());
+        assert_eq!(
+            pos.y,
+            cursor.y + 4.0,
+            "下方模式浮层顶边应紧贴输入行底下方 4px"
+        );
+        assert!(
+            pos.y >= cursor.y + 4.0,
+            "浮层不得遮挡输入行（顶边 {} < 光标行底 {}）",
+            pos.y,
+            cursor.y
+        );
+    }
+
+    /// 上方空间恰好放得下（浮层顶边 == 终端顶）时仍用上方模式。
+    #[test]
+    fn 上方空间恰好放得下() {
+        let cursor = egui::pos2(120.0, 98.0); // 98 - 16 - 78 - 4 = 0 == inner.top()
+        let pos = completion_popup_pos(cursor, 16.0, popup(), inner());
+        assert_eq!(pos.y, 0.0, "恰好放得下时应保持上方模式");
+    }
+
+    /// x 方向限制在终端内容区内（光标靠边时浮层不越界）。
+    #[test]
+    fn 浮层x方向不越界() {
+        let left = completion_popup_pos(egui::pos2(0.0, 160.0), 16.0, popup(), inner());
+        assert_eq!(left.x, 0.0, "浮层不得超出内容区左缘");
+        let right = completion_popup_pos(egui::pos2(800.0, 160.0), 16.0, popup(), inner());
+        assert_eq!(right.x, 800.0 - 260.0 - 4.0, "浮层不得超出内容区右缘");
     }
 }

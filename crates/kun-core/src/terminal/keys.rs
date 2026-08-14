@@ -98,12 +98,12 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
     match key {
         Key::Char(c) => encode_char(c, mods),
         Key::Enter => {
-            // 应用键盘模式（APP_KEYPAD）下 Enter 发送 ESC O M。
-            if mode.contains(TermMode::APP_KEYPAD) && !mods.alt {
-                Some(b"\x1bOM".to_vec())
-            } else {
-                Some(vec![b'\r'])
-            }
+            // 主键盘 Enter 永远发 CR（`\r`）。应用键盘模式（APP_KEYPAD / DECPAM）
+            // 只影响数字小键盘（小键盘 Enter 才是 SS3 `ESC O M`），主键盘 Enter
+            // 不受影响——曾把主键盘 Enter 按 APP_KEYPAD 编码成 `\x1bOM`，导致
+            // zsh 启用应用键盘模式（TERM=xterm-256color 下 zle 自动开启）后
+            // 回车不执行（命令停在命令行）。
+            Some(vec![b'\r'])
         }
         Key::Tab => {
             if mods.shift {
@@ -287,8 +287,11 @@ mod tests {
 
     #[test]
     fn enter应用键盘模式() {
+        // 主键盘 Enter 不受应用键盘模式影响，永远发 CR（\r）。
+        // 曾误编码为 \x1bOM（数字小键盘 Enter 序列），导致 zsh 启用
+        // 应用键盘模式后回车不执行（回归测试）。
         let bytes = encode_key(Key::Enter, no_mods(), TermMode::APP_KEYPAD).unwrap();
-        assert_eq!(bytes, b"\x1bOM");
+        assert_eq!(bytes, b"\r");
     }
 
     #[test]

@@ -241,28 +241,62 @@ impl SftpView {
         }
 
         // ==================== 文件列表 ====================
+        // 用 '0' 字符宽（数字等宽字体的真实字宽）计算列宽：
+        // 此前用 ' '（空格 ≈ 0.25em）低估了数字宽度（'0' ≈ 0.6em），
+        // 导致时间列 "2026-08-14" 被截到 "2026-01"。
         let cell_width = ui.fonts_mut(|f| {
             let font = egui::FontId::monospace(13.0);
-            f.glyph_width(&font, ' ')
+            f.glyph_width(&font, '0')
         });
-        let table_width = ui.available_width();
+        let row_h = 20.0;
+        // 固定列宽：名称列占剩余宽度、大小/修改时间右对齐定宽。
+        // 曾用"总宽 - 固定字符数"的 add_space 定位：长文件名会把
+        // 大小/时间列挤出面板右缘，且各行列位随名称长度漂移错位。
+        let size_col = cell_width * 12.0;
+        let time_col = cell_width * 12.0;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let table_width = ui.available_width();
+                // 名称列让出两个 6px 间隔（名称|大小|时间），大小/时间定宽。
+                let name_col = (table_width - size_col - time_col - 12.0).max(40.0);
+                let theme = crate::theme::current_theme();
+
                 if self.loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("加载中…");
                     });
                 }
-                // 表头。
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("名称").strong());
-                    ui.add_space(table_width - cell_width * 38.0);
-                    ui.label(RichText::new("大小").strong());
-                    ui.add_space(cell_width * 10.0);
-                    ui.label(RichText::new("修改时间").strong());
+                // 表头（与行同列基准：名称左对齐、大小/时间定宽右排）。
+                let (header_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(table_width, row_h), egui::Sense::hover());
+                let mut header = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(header_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                // 归零自动间距：列间距完全由 add_space 精确控制
+                // （否则子项间默认 8px item_spacing 会叠加，列位错乱）。
+                header.spacing_mut().item_spacing.x = 0.0;
+                header.add_sized(
+                    [name_col, row_h],
+                    egui::Label::new(RichText::new("名称").strong()).halign(egui::Align::LEFT),
+                );
+                header.add_space(6.0);
+                header.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.set_min_size(egui::vec2(size_col + time_col + 6.0, row_h));
+                    ui.add_sized(
+                        [time_col, row_h],
+                        egui::Label::new(RichText::new("修改时间").strong())
+                            .halign(egui::Align::RIGHT),
+                    );
+                    ui.add_space(6.0);
+                    ui.add_sized(
+                        [size_col, row_h],
+                        egui::Label::new(RichText::new("大小").strong()).halign(egui::Align::RIGHT),
+                    );
                 });
                 ui.separator();
 
@@ -275,27 +309,72 @@ impl SftpView {
                     } else {
                         entry.name.clone()
                     };
+                    // 整行注册点击区（单击选中、双击进入目录）。
+                    let (row_rect, response) = ui
+                        .allocate_exact_size(egui::vec2(table_width, row_h), egui::Sense::click());
+                    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    // 选中/hover 整行高亮（先画背景，列内容绘制在其上）。
+                    if selected || response.hovered() {
+                        ui.painter().rect_filled(
+                            row_rect,
+                            crate::theme::tokens::RADIUS_ITEM,
+                            theme.accent_soft,
+                        );
+                    }
+                    // 三列内容：名称（超长截断省略号）+ 大小/时间定宽右排。
                     let mut name_text = RichText::new(label).monospace();
                     if selected {
-                        name_text = name_text.background_color(Color32::from_rgb(0x44, 0x47, 0x5a));
+                        name_text = name_text.color(theme.text_primary);
                     }
-                    let response = ui.horizontal(|ui| {
-                        ui.label(name_text);
-                        ui.add_space(table_width - cell_width * 38.0 - 2.0 * cell_width);
-                        if entry.is_dir {
-                            ui.weak("—");
+                    let weak_color = if selected {
+                        theme.text_secondary
+                    } else {
+                        theme.text_muted
+                    };
+                    let mut inner = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(row_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    // 归零自动间距（见表头注释）。
+                    inner.spacing_mut().item_spacing.x = 0.0;
+                    inner.add_sized(
+                        [name_col, row_h],
+                        egui::Label::new(name_text)
+                            .halign(egui::Align::LEFT)
+                            .truncate(),
+                    );
+                    inner.add_space(6.0);
+                    inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.set_min_size(egui::vec2(size_col + time_col + 6.0, row_h));
+                        // 时间缺失时以 "—" 占位，保持列位稳定。
+                        let time_text = entry
+                            .modified
+                            .map(Self::format_time)
+                            .unwrap_or_else(|| "—".to_string());
+                        ui.add_sized(
+                            [time_col, row_h],
+                            egui::Label::new(RichText::new(time_text).color(weak_color))
+                                .halign(egui::Align::RIGHT)
+                                .truncate(),
+                        );
+                        ui.add_space(6.0);
+                        let size_text = if entry.is_dir {
+                            "—".to_string()
                         } else {
-                            ui.weak(Self::format_size(entry.size));
-                        }
-                        ui.add_space(cell_width * 10.0);
-                        if let Some(modified) = entry.modified {
-                            ui.weak(Self::format_time(modified));
-                        }
+                            Self::format_size(entry.size)
+                        };
+                        ui.add_sized(
+                            [size_col, row_h],
+                            egui::Label::new(RichText::new(size_text).color(weak_color))
+                                .halign(egui::Align::RIGHT)
+                                .truncate(),
+                        );
                     });
-                    if response.response.clicked() {
+                    if response.clicked() {
                         select = Some(entry.name.clone());
                     }
-                    if response.response.double_clicked() && entry.is_dir {
+                    if response.double_clicked() && entry.is_dir {
                         open_dir = Some(entry.name.clone());
                     }
                 }
@@ -657,6 +736,84 @@ mod tests {
         assert_eq!(parent_of("/home/user"), "/home");
         assert_eq!(parent_of("/home"), "/");
         assert_eq!(parent_of("/"), "/");
+    }
+
+    /// 文件列表列对齐：大小/时间列位置固定，不随名称长度漂移；
+    /// 长文件名不越入大小列（回归测试：曾用"总宽-固定字符数"
+    /// add_space 定位，长文件名把时间列挤出面板右缘且各行列位错乱）。
+    #[test]
+    fn 文件列表列对齐() {
+        use kittest::Queryable;
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_raw(handle_tx);
+        let mut view = SftpView {
+            host_name: "测试主机".into(),
+            handle,
+            rx,
+            current_path: "/".into(),
+            entries: vec![
+                RemoteEntry {
+                    name: "defaultUploadFolder".into(),
+                    is_dir: true,
+                    size: 0,
+                    modified: Some(1_800_000_000),
+                    permissions: 0,
+                },
+                RemoteEntry {
+                    name: "a".into(),
+                    is_dir: false,
+                    size: 5_000_000_000,
+                    modified: Some(1_800_000_000),
+                    permissions: 0,
+                },
+            ],
+            selected: None,
+            loading: false,
+            transfers: Vec::new(),
+            dialog: None,
+            error: None,
+            closed: false,
+        };
+
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            view.show(ui);
+        });
+        harness.run();
+
+        // 时间列：两行（长名/短名）框位置一致，不随名称长度漂移。
+        let times = harness
+            .root()
+            .query_all_by_label("2027-01-29")
+            .collect::<Vec<_>>();
+        assert_eq!(times.len(), 2, "两行都应显示修改时间");
+        assert_eq!(
+            times[0].rect().left(),
+            times[1].rect().left(),
+            "时间列左缘应一致"
+        );
+        assert_eq!(
+            times[0].rect().right(),
+            times[1].rect().right(),
+            "时间列右缘应一致"
+        );
+
+        // 大小列：目录 "—" 与文件 "4.7 GB" 框位置一致。
+        let dir_size = harness.get_by_label("—").rect();
+        let file_size = harness.get_by_label("4.7 GB").rect();
+        assert_eq!(dir_size.left(), file_size.left(), "大小列左缘应一致");
+
+        // 长文件名不越入大小列（名称列与大小列之间留 6px 间隔）。
+        let name = harness.get_by_label("defaultUploadFolder/").rect();
+        assert!(
+            name.right() + 6.0 <= file_size.left(),
+            "长文件名不应越入大小列"
+        );
+        assert!(
+            name.right() + 6.0 <= file_size.left(),
+            "长文件名不应越入大小列"
+        );
     }
 
     #[test]

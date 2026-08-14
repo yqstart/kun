@@ -97,10 +97,12 @@ struct Toast {
 }
 
 /// 单个终端标签页（本地或远程会话）。
-struct TerminalTab {
+pub struct TerminalTab {
     label: String,
     terminal: TerminalView,
     sftp: Option<SftpView>,
+    /// SFTP 面板是否展开（tabby 形式：默认收起，终端右上角悬浮按钮切换）。
+    sftp_open: bool,
 }
 
 impl TerminalTab {
@@ -109,6 +111,7 @@ impl TerminalTab {
             label,
             terminal,
             sftp: None,
+            sftp_open: false,
         }
     }
 
@@ -123,15 +126,26 @@ impl TerminalTab {
     }
 }
 
+/// 标签页：普通终端（含本地/远程）。设置改为独立弹窗（`show_settings`），
+/// 不再作为 tab。
+///
+/// `Vec<Box<TerminalTab>>` 用 Box 包裹：TerminalTab 体积大，
+/// Box 避免 Vec 各槽位按最大元素对齐造成内存浪费
+/// （clippy `large_enum_variant` 等价警告——`Tab` enum 之前也是用 Box）。
+pub type Tab = Box<TerminalTab>;
+
 /// 应用状态。
 pub struct KunApp {
-    tabs: Vec<TerminalTab>,
+    tabs: Vec<Tab>,
     active_tab: usize,
     /// 连接成功后创建的标签页索引（用于挂载 SFTP）。
     pending_tab: Option<usize>,
-    sidebar_open: bool,
     /// 主机行最近一次点击（时间, 行索引），自实现双击检测。
     last_row_click: Option<(f64, usize)>,
+    /// 设置弹窗是否打开（`⌘,` 或齿轮按钮切换；Esc/× 关闭）。
+    show_settings: bool,
+    /// 最近一帧的 egui::Context（`new_local_tab` 等非 UI 闭包内构造时使用）。
+    last_ctx: egui::Context,
     config: HostConfig,
     config_path: PathBuf,
     show_new_conn: bool,
@@ -152,26 +166,150 @@ pub struct KunApp {
     manual_update: bool,
     /// 安装脚本已启动，到该时间点关闭应用重启。
     restart_at: Option<f64>,
-    /// 应用内动态 logo 的 ikun 形象纹理（assets/ikun_face.png 抠图，
-    /// 透明背景；在紫金渐变圆底 + 弹跳篮球之上叠加显示）。
-    logo_texture: Option<egui::TextureHandle>,
 }
 
-/// 本地终端会话选项：默认工作目录为 home，注入 CLICOLOR 使 `ls` 输出彩色。
+/// 本地终端会话选项：默认工作目录为 home，注入 TERM 与颜色环境变量。
 fn local_session_options() -> SessionOptions {
     SessionOptions {
         working_directory: std::env::var("HOME").ok().map(PathBuf::from),
+        // TERM 必须显式注入：从 GUI/Finder/Dock 启动的进程继承 `TERM=dumb`，
+        // alacritty 的 `setup_env()` 只在其主应用入口调用，kun 未调用 →
+        // zsh 的 zle 判定非交互终端，删除回显走「原地空格覆盖」（删不掉+冒空格）、
+        // 行编辑/补全/回车行为异常。注入 xterm-256color 恢复完整交互（同 Miro Code 修复）。
+        // 注意：勿注入 locale（LANG/LC_ALL），会引发回车不执行（实测回归）。
         // macOS `ls` 默认不输出颜色（无 CLICOLOR 环境变量），文件/目录全白；
         // 注入后按 LSCOLORS 着色区分（与 Terminal.app/iTerm2 行为一致，不篡改 shell）。
         // LSCOLORS 为深色终端优化：目录=亮青、符号链接=紫红、可执行=红、
         // socket=绿、管道=黄、块/字符设备=蓝（默认底色）。
         env: [
+            ("TERM".to_string(), "xterm-256color".to_string()),
             ("CLICOLOR".to_string(), "1".to_string()),
             ("LSCOLORS".to_string(), "Gxfxcxdxbxegedabagacad".to_string()),
         ]
         .into(),
         ..Default::default()
     }
+}
+
+/// 终端右上角悬浮 SFTP 开关按钮（tabby 风格；纯函数避免借用冲突，
+/// 返回是否被点击）。打开时 accent 填充，关闭时浮层底 + 边框。
+fn sftp_floating_button(ui: &mut egui::Ui, open: bool) -> bool {
+    let theme = crate::theme::current_theme();
+    let area = ui.max_rect();
+    let btn_size = egui::vec2(60.0, 24.0);
+    // 与终端内容内边距一致（PADDING=10），悬浮于终端区域右上角。
+    let btn_rect = egui::Rect::from_min_size(
+        egui::pos2(area.right() - 10.0 - btn_size.x, area.top() + 10.0),
+        btn_size,
+    );
+    let (fill, stroke, fg) = if open {
+        (theme.accent, egui::Stroke::NONE, egui::Color32::WHITE)
+    } else {
+        (
+            theme.bg_elevated,
+            egui::Stroke::new(1.0, theme.border),
+            theme.text_secondary,
+        )
+    };
+    let button = egui::Button::new(egui::RichText::new("SFTP").size(12.0).color(fg))
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(crate::theme::tokens::RADIUS_SM)
+        .min_size(btn_size);
+    ui.put(btn_rect, button)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(if open {
+            "关闭 SFTP 面板"
+        } else {
+            "打开 SFTP 面板"
+        })
+        .clicked()
+}
+
+/// 自绘 macOS traffic lights：关闭 eframe 标题栏后顶部左缘显示三个圆点
+/// （红 / 黄 / 绿），与 Terminal.app/iTerm2 视觉一致。
+/// 返回 `(clicked_idx, hover_idx)` —— clicked_idx = Some(0/1/2) 表示被点击，
+/// 闭包外发 ViewportCommand 避免借用冲突。
+fn draw_traffic_lights(ui: &mut egui::Ui) -> (Option<usize>, Option<usize>) {
+    let r = 6.0;
+    ui.add_space(10.0);
+    let y = ui.cursor().center().y;
+    let colors = [
+        (egui::Color32::from_rgb(0xff, 0x5f, 0x57), "关闭"),
+        (egui::Color32::from_rgb(0xfe, 0xbc, 0x2e), "最小化"),
+        (egui::Color32::from_rgb(0x28, 0xc8, 0x40), "全屏"),
+    ];
+    let mut clicked = None;
+    let mut hovered = None;
+    for (i, (color, hover_text)) in colors.iter().enumerate() {
+        let center = egui::pos2(ui.cursor().min.x + r, y);
+        let rect = egui::Rect::from_center_size(center, egui::vec2(r * 2.0, r * 2.0));
+        let resp = ui.allocate_rect(rect, egui::Sense::click());
+        let hov = resp.hovered();
+        let clk = resp.clicked();
+        ui.painter().circle_filled(center, r, *color);
+        if hov {
+            hovered = Some(i);
+            ui.painter().text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                match i {
+                    0 => "×",
+                    1 => "−",
+                    _ => "⤢",
+                },
+                egui::FontId::proportional(8.5),
+                egui::Color32::from_rgb(0x4d, 0x00, 0x00),
+            );
+            resp.on_hover_text(*hover_text);
+        }
+        if clk {
+            clicked = Some(i);
+        }
+        ui.add_space(6.0);
+    }
+    ui.add_space(6.0);
+    (clicked, hovered)
+}
+
+/// 标签栏最右侧齿轮图标（设置入口）。22×22 纯图标按钮，无文字。
+/// 渐变圆底 + ⚙ 符号，hover accent2 辉光。
+/// 包装为 `egui::Button` 以便被 kittest 通过 `Role::Button` 找到。
+/// 点击调用方负责打开设置弹窗。
+fn settings_gear_button(ui: &mut egui::Ui) -> bool {
+    let theme = crate::theme::current_theme();
+    let btn_size = 22.0;
+    // 无文字 Button（透明 fill 覆盖默认背景）——kittest 通过 Role::Button 找到此控件。
+    let btn = egui::Button::new("")
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::NONE)
+        .min_size(egui::vec2(btn_size, btn_size));
+    let response = ui
+        .add(btn)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("设置（⌘,）");
+    // 自绘渐变圆底 + ⚙ 符号（在 Button rect 上覆盖）。
+    let rect = response.rect;
+    if ui.is_rect_visible(rect) {
+        anim::paint_rounded_gradient(
+            ui.painter(),
+            rect,
+            btn_size * 0.5,
+            theme.accent,
+            theme.accent2,
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "⚙",
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+        if response.hovered() {
+            anim::paint_glow(ui.painter(), rect.center(), btn_size * 0.9, theme.accent2);
+        }
+    }
+    response.clicked()
 }
 
 /// 当前 macOS 架构 → 发布产物命名（release.yml 约定）。
@@ -237,16 +375,13 @@ impl KunApp {
         let config_path = default_config_path();
         let config = HostConfig::load(&config_path).unwrap_or_default();
 
-        // 加载 ikun 形象抠图（assets/ikun_face.png 透明背景，see scripts/extract-ikun.swift）。
-        // 失败时降级为 None，draw_logo_mark 会回退到程序绘制的简化形象。
-        let logo_texture = load_logo_texture(&cc.egui_ctx);
-
         let mut app = Self {
             tabs: Vec::new(),
             active_tab: 0,
             pending_tab: None,
-            sidebar_open: false,
             last_row_click: None,
+            show_settings: false,
+            last_ctx: cc.egui_ctx.clone(),
             config,
             config_path,
             show_new_conn: false,
@@ -263,10 +398,10 @@ impl KunApp {
             download_rx: None,
             manual_update: false,
             restart_at: None,
-            logo_texture,
         };
         // 启动时自动检查更新（后台线程，延迟 3 秒，静默）。
         app.start_update_check(true);
+        // 初始一个本地终端 tab；设置改弹窗（`show_settings`）。
         app.new_local_tab(&ctx);
         app
     }
@@ -288,10 +423,11 @@ impl KunApp {
         });
         match Session::spawn_local(local_session_options(), 80, 24, on_event) {
             Ok(session) => {
-                self.tabs.push(TerminalTab::new(
+                let tab = Box::new(TerminalTab::new(
                     "本地终端".into(),
                     TerminalView::new(session),
                 ));
+                self.tabs.push(tab);
                 self.active_tab = self.tabs.len() - 1;
             }
             Err(e) => {
@@ -476,7 +612,7 @@ impl KunApp {
                 ConnectResult::Connected(session) => {
                     let view = TerminalView::new(session);
                     self.tabs
-                        .push(TerminalTab::new(self.pending_label.clone(), view));
+                        .push(Box::new(TerminalTab::new(self.pending_label.clone(), view)));
                     self.active_tab = self.tabs.len() - 1;
                     self.pending_tab = Some(self.active_tab);
                     self.mount_ready_sftp();
@@ -553,129 +689,173 @@ impl KunApp {
         }
     }
 
-    /// 渲染顶部工具栏。
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
+    /// 设置弹窗：macOS 系统偏好设置风格，分三组（主机 / 外观 / 关于）。
+    /// 内部调用 `host_sidebar` 渲染主机列表；外观组合并主题 ComboBox；
+    /// 关于组展示版本号与手动检查更新按钮。
+    /// 卡片化分组（`bg_elevated` 底 + 边框 + 圆角 + 紧凑内边距）。
+    fn settings_panel(&mut self, ctx: &egui::Context) {
         let theme = crate::theme::current_theme();
-        ui.horizontal(|ui| {
-            ui.add_space(2.0);
-            // 品牌：渐变 logo + 应用名 + 版本。
-            let brand_start = ui.cursor().min;
-            draw_logo_mark(ui, 28.0, self.logo_texture.as_ref());
-            ui.add_space(8.0);
-            ui.vertical(|ui| {
-                ui.add_space(1.0);
-                ui.label(
-                    egui::RichText::new("kun")
-                        .strong()
-                        .size(15.0)
-                        .color(theme.text_primary),
-                );
-                ui.label(
-                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .size(10.0)
-                        .color(theme.text_muted),
-                );
-            });
-            ui.add_space(10.0);
-            let brand_end = ui.cursor().min;
-            let brand_rect = egui::Rect::from_min_max(
-                brand_start,
-                egui::pos2(brand_end.x, brand_start.y + 34.0),
-            );
-            if ui
-                .interact(
-                    brand_rect,
-                    egui::Id::new("sidebar_logo_toggle"),
-                    egui::Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(if self.sidebar_open {
-                    "收起主机列表（⌘B）"
-                } else {
-                    "展开主机列表（⌘B）"
-                })
-                .clicked()
-            {
-                self.sidebar_open = !self.sidebar_open;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 主题切换：渐变圆点图标 + 主题名。
-                // （此前用 ◐ 字符，SF 字体缺字形渲染为方块，改为自绘渐变圆。）
-                let current = crate::theme::current_theme().name;
-                let (dot_rect, dot_resp) =
-                    ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                anim::paint_rounded_gradient(
-                    ui.painter(),
-                    dot_rect,
-                    6.0,
-                    theme.accent,
-                    theme.accent2,
-                );
-                if dot_resp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                dot_resp.on_hover_text("切换主题");
+        let mut open = self.show_settings;
+        egui::Window::new("设置")
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
+            .default_size([520.0, 540.0])
+            .min_size([460.0, 420.0])
+            // 限制最大尺寸：避免主机行多时被内容撑大（保持固定外观）。
+            .max_size([520.0, 540.0])
+            .resizable(true)
+            .collapsible(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.bg_app)
+                    .corner_radius(crate::theme::tokens::RADIUS_SM)
+                    .stroke(egui::Stroke::new(1.0, theme.border))
+                    .inner_margin(egui::Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                // 唯一标题由 `egui::Window::new("设置")` 自带，
+                // 这里不再重复加标题与副标题（之前导致双层标题问题）。
                 ui.add_space(4.0);
-                egui::ComboBox::from_id_salt("theme_switcher")
-                    .selected_text(egui::RichText::new(current))
-                    .show_ui(ui, |ui| {
-                        for (i, t) in crate::theme::THEMES.iter().enumerate() {
-                            let selected = current == t.name;
-                            if ui
-                                .selectable_label(
-                                    selected,
-                                    egui::RichText::new(t.name).color(if selected {
-                                        theme.accent
-                                    } else {
-                                        theme.text_primary
-                                    }),
-                                )
-                                .clicked()
-                            {
-                                crate::theme::set_theme(ui.ctx(), i);
-                                self.show_toast(format!("主题：{}", t.name), false);
-                            }
-                        }
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    // 弹窗总高 540 - 标题 28 - 内边距 36 - 边距 ≈ 476，
+                    // 留 6px 给三组间距，紧凑但不被主机列表撑大。
+                    .max_height(470.0)
+                    .show(ui, |ui| {
+                        // ============ 主机管理 ============
+                        Self::settings_card(ui, "主机管理", |ui| {
+                            self.host_sidebar(ui);
+                        });
+                        ui.add_space(10.0);
+
+                        // ============ 外观 ============
+                        Self::settings_card(ui, "外观", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("主题")
+                                        .size(12.0)
+                                        .color(theme.text_muted),
+                                );
+                                ui.add_space(8.0);
+                                let current = crate::theme::current_theme().name;
+                                egui::ComboBox::from_id_salt("settings_theme_switcher")
+                                    .selected_text(
+                                        egui::RichText::new(current).color(theme.text_primary),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (i, t) in crate::theme::THEMES.iter().enumerate() {
+                                            let selected = current == t.name;
+                                            if ui
+                                                .selectable_label(
+                                                    selected,
+                                                    egui::RichText::new(t.name).color(
+                                                        if selected {
+                                                            theme.accent
+                                                        } else {
+                                                            theme.text_primary
+                                                        },
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                crate::theme::set_theme(ui.ctx(), i);
+                                                self.show_toast(format!("主题：{}", t.name), false);
+                                            }
+                                        }
+                                    });
+                            });
+                        });
+                        ui.add_space(10.0);
+
+                        // ============ 关于 ============
+                        Self::settings_card(ui, "关于", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "kun v{}",
+                                        env!("CARGO_PKG_VERSION")
+                                    ))
+                                    .size(12.0)
+                                    .color(theme.text_secondary),
+                                );
+                            });
+                            ui.add_space(8.0);
+                            let (label, dot, pulse) = match &self.update_state {
+                                UpdateState::Idle => ("检查更新", None, false),
+                                UpdateState::Checking => ("检查中…", Some(theme.text_muted), false),
+                                UpdateState::Available(_) => {
+                                    ("新版本可用", Some(theme.accent2), true)
+                                }
+                                UpdateState::UpToDate => ("已是最新", Some(theme.success), false),
+                                UpdateState::Failed => ("检查失败", Some(theme.danger), false),
+                                UpdateState::Downloading(_) => {
+                                    ("正在下载", Some(theme.accent), false)
+                                }
+                                UpdateState::Downloaded { .. } => {
+                                    ("准备安装", Some(theme.accent), true)
+                                }
+                                UpdateState::Installing(_) => {
+                                    ("安装中…", Some(theme.accent), false)
+                                }
+                                UpdateState::Installed => ("已更新", Some(theme.success), false),
+                                UpdateState::Error(_) => ("更新出错", Some(theme.danger), true),
+                            };
+                            ui.horizontal(|ui| {
+                                if let Some(color) = dot {
+                                    status_dot(ui, color, pulse);
+                                    ui.add_space(6.0);
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(label)
+                                                .size(12.0)
+                                                .color(theme.text_primary),
+                                        )
+                                        .fill(theme.bg_elevated)
+                                        .stroke(egui::Stroke::new(1.0, theme.border))
+                                        .corner_radius(crate::theme::tokens::RADIUS_ITEM),
+                                    )
+                                    .on_hover_text("检查更新")
+                                    .clicked()
+                                    && matches!(
+                                        self.update_state,
+                                        UpdateState::Idle
+                                            | UpdateState::UpToDate
+                                            | UpdateState::Failed
+                                            | UpdateState::Error(_)
+                                    )
+                                {
+                                    self.start_update_check(false);
+                                }
+                            });
+                        });
                     });
-                ui.add_space(8.0);
-                // 更新状态 + 按钮。
-                let (label, dot, pulse) = match &self.update_state {
-                    UpdateState::Idle => ("检查更新", None, false),
-                    UpdateState::Checking => ("检查中…", Some(theme.text_muted), false),
-                    UpdateState::Available(_) => ("新版本可用", Some(theme.accent2), true),
-                    UpdateState::UpToDate => ("已是最新", Some(theme.success), false),
-                    UpdateState::Failed => ("检查失败", Some(theme.danger), false),
-                    UpdateState::Downloading(_) => ("正在下载", Some(theme.accent), false),
-                    UpdateState::Downloaded { .. } => ("准备安装", Some(theme.accent), true),
-                    UpdateState::Installing(_) => ("安装中…", Some(theme.accent), false),
-                    UpdateState::Installed => ("已更新", Some(theme.success), false),
-                    UpdateState::Error(_) => ("更新出错", Some(theme.danger), true),
-                };
-                if let Some(color) = dot {
-                    status_dot(ui, color, pulse);
-                    ui.add_space(2.0);
-                }
-                let update_clicked = ui
-                    .add(
-                        egui::Button::new(egui::RichText::new(label).size(12.0))
-                            .fill(egui::Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::NONE)
-                            .corner_radius(crate::theme::tokens::RADIUS_ITEM),
-                    )
-                    .on_hover_text("检查更新")
-                    .clicked();
-                if update_clicked
-                    && matches!(
-                        self.update_state,
-                        UpdateState::Idle
-                            | UpdateState::UpToDate
-                            | UpdateState::Failed
-                            | UpdateState::Error(_)
-                    )
-                {
-                    self.start_update_check(false);
-                }
             });
+        // Esc 关闭 / × 关闭：open 同步回 self.show_settings。
+        self.show_settings = open;
+    }
+
+    /// 设置弹窗的卡片化分组容器：`bg_elevated` 底 + 边框 + 圆角 + 紧凑内边距。
+    /// 头部 accent2 颜色小标题 + 内容区。自由函数避免借用 self 与 ctx 冲突。
+    fn settings_card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+        let theme = crate::theme::current_theme();
+        let frame = egui::Frame::new()
+            .fill(theme.bg_elevated)
+            .stroke(egui::Stroke::new(1.0, theme.border))
+            .corner_radius(crate::theme::tokens::RADIUS_SM)
+            .inner_margin(egui::Margin::symmetric(12, 10));
+        frame.show(ui, |ui| {
+            ui.set_min_width(ui.available_width() - 4.0);
+            ui.label(
+                egui::RichText::new(title)
+                    .strong()
+                    .size(11.5)
+                    .color(theme.accent2),
+            );
+            ui.add_space(6.0);
+            body(ui);
         });
     }
 
@@ -893,7 +1073,7 @@ impl KunApp {
             .collapsible(false)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    draw_logo_mark(ui, 42.0, self.logo_texture.as_ref());
+                    draw_logo_mark(ui, 42.0);
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new("建立安全连接")
@@ -1096,17 +1276,45 @@ impl KunApp {
     /// 渲染标签页栏（Warp 风格圆角标签 + 底部指示条）。
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let theme = crate::theme::current_theme();
+        // 无边框窗口拖拽：整行注册底层 drag 背景（先注册，被后注册的控件覆盖）。
+        // egui 命中规则：后注册 widget 在顶层，控件上点击/拖拽优先命中控件，
+        // 标签栏空白处按下拖动则命中此背景 → 发 StartDrag 让系统接管窗口移动。
+        let drag_rect = ui.max_rect();
+        let drag_resp = ui.interact(
+            drag_rect,
+            egui::Id::new("tab_bar_drag"),
+            egui::Sense::drag(),
+        );
+        if drag_resp.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        let mut tl_clicked: Option<usize> = None;
         ui.horizontal(|ui| {
-            ui.add_space(2.0);
+            // macOS traffic lights（自绘，因为关闭了 eframe 标题栏）。
+            let (tl, _) = draw_traffic_lights(ui);
+            tl_clicked = tl;
             let mut switch_to: Option<usize> = None;
             let mut close_idx: Option<usize> = None;
             for (i, tab) in self.tabs.iter().enumerate() {
                 let title = tab.title();
                 let selected = i == self.active_tab;
+                // 数字索引前缀：与终端主流 Tab 习惯一致（1, 2, ...）。
+                let prefix = format!("{} ", i + 1);
                 let row = ui
                     .scope_builder(egui::UiBuilder::new().id_salt(("tab", i)), |ui| {
                         ui.horizontal(|ui| {
-                            ui.add_space(2.0);
+                            ui.add_space(6.0);
+                            // 数字索引（muted 色，提示序号）。
+                            ui.label(
+                                egui::RichText::new(&prefix)
+                                    .size(11.5)
+                                    .color(if selected {
+                                        theme.text_muted
+                                    } else {
+                                        theme.text_muted.gamma_multiply(0.7)
+                                    })
+                                    .monospace(),
+                            );
                             // 无边框透明按钮（selectable_label 选中自带边框，
                             // 与下方手绘高亮叠加会形成"双重框"）。
                             if ui
@@ -1140,7 +1348,7 @@ impl KunApp {
                             {
                                 close_idx = Some(i);
                             }
-                            ui.add_space(2.0);
+                            ui.add_space(4.0);
                         });
                     })
                     .response;
@@ -1195,7 +1403,7 @@ impl KunApp {
                     );
                 }
             }
-            // 新建本地终端标签。
+            // 新建本地终端标签（＋）。
             if ui
                 .add(
                     egui::Button::new(egui::RichText::new("＋").color(theme.text_muted))
@@ -1208,6 +1416,14 @@ impl KunApp {
             {
                 self.new_local_tab(ui.ctx());
             }
+
+            // 顶到右侧：设置齿轮（设置弹窗入口）。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if settings_gear_button(ui) {
+                    self.show_settings = true;
+                }
+            });
+
             if let Some(i) = switch_to {
                 self.active_tab = i;
             }
@@ -1215,6 +1431,23 @@ impl KunApp {
                 self.close_tab(i);
             }
         });
+        // traffic lights 点击 → ViewportCommand（闭包外避免借用冲突）。
+        if let Some(idx) = tl_clicked {
+            match idx {
+                0 => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                1 => ui
+                    .ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                _ => ui
+                    .ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true)),
+            }
+        }
+    }
+
+    /// 切换设置弹窗开关状态。
+    fn toggle_settings(&mut self) {
+        self.show_settings = !self.show_settings;
     }
 
     /// 渲染状态栏。
@@ -1367,7 +1600,7 @@ impl KunApp {
             .show(ctx, |ui| {
                 // 头部。
                 ui.horizontal(|ui| {
-                    draw_logo_mark(ui, 28.0, self.logo_texture.as_ref());
+                    draw_logo_mark(ui, 28.0);
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
                         ui.label(
@@ -1614,7 +1847,7 @@ impl KunApp {
         let theme = crate::theme::current_theme();
         ui.centered_and_justified(|ui| {
             ui.vertical_centered(|ui| {
-                draw_logo_mark(ui, 48.0, self.logo_texture.as_ref());
+                draw_logo_mark(ui, 48.0);
                 ui.add_space(12.0);
                 ui.label(
                     egui::RichText::new("kun")
@@ -1685,42 +1918,10 @@ fn form_input(
     ui.add_sized([width, 30.0], edit)
 }
 
-/// 解码 ikun 抠图 PNG 为 egui 纹理（透明背景 + ikun 形象），用于动态 logo。
-/// 失败时返回 None，draw_logo_mark 会回退到程序绘制的简化形象（黄色圆 + ikun 字）。
-fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let bytes = include_bytes!("../assets/ikun_face.png");
-    match image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
-        Ok(img) => {
-            let rgba = img.to_rgba8();
-            let (w, h) = rgba.dimensions();
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [w as usize, h as usize],
-                &rgba.into_raw(),
-            );
-            Some(ctx.load_texture("kun_ikun_logo", color_image, Default::default()))
-        }
-        Err(e) => {
-            log::warn!("加载 ikun 抠图失败：{e}");
-            None
-        }
-    }
-}
-
-/// ikun 品牌标记：紫金渐变圆底 + 抠图纹理（assets/ikun_face.png）+ 篮球弹跳。
+/// 品牌标记：紫金渐变圆底 + 白色粗体 "K" 字（居中）。
 ///
-/// 形象直接取自用户提供的 ikun 参考图（白底→透明，see scripts/extract-ikun.swift），
-/// 通过 `Image::texture` 显示；叠加程序绘制的橙色篮球（按抛物线在脸下方
-/// 拍击，落地瞬间压扁、顶点拉长），周期 1.3s。
-/// 30fps 请求重绘，兼顾动效与省电。
-/// ikun 品牌标记：紫金渐变圆底 + 白色 "K" 字 + 橙色篮球循环弹跳（持续动画）。
-///
-/// K 字固定在圆底中央偏上，篮球按抛物线在 K 字下方拍击
-/// （落地瞬间压扁、顶点拉长，周期 1.3s）；30fps 请求重绘，兼顾动效与省电。
-///
-/// 预留 `logo` 参数：未来切换为自定义 logo 纹理时直接用 `painter.image`
-/// 替换 K 字部分即可，圆底+篮球层不动。
-#[allow(unused_variables)]
-fn draw_logo_mark(ui: &mut egui::Ui, size: f32, logo: Option<&egui::TextureHandle>) -> egui::Rect {
+/// 与应用图标（scripts/make-icon.swift）同构图；hover 时带 accent 辉光。
+fn draw_logo_mark(ui: &mut egui::Ui, size: f32) -> egui::Rect {
     let theme = crate::theme::current_theme();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
@@ -1736,62 +1937,18 @@ fn draw_logo_mark(ui: &mut egui::Ui, size: f32, logo: Option<&egui::TextureHandl
             theme.accent2,
         );
 
-        // K 字：白色粗体，固定在圆底中央偏上。
+        // K 字：白色粗体，居中。
         painter.text(
-            egui::pos2(center.x, center.y - size * 0.04),
+            center,
             egui::Align2::CENTER_CENTER,
             "K",
             egui::FontId::proportional(size * 0.46),
             egui::Color32::WHITE,
         );
 
-        // 篮球弹跳：p 为一个周期内的相位，h=0 顶点 / 1 落地。
-        let t = anim::now(ui.ctx()) as f32;
-        let p = (t / 1.3).fract();
-        let h = 1.0 - (2.0 * p - 1.0).abs();
-        let lift = (1.0 - h) * size * 0.16; // 弹起高度（球顶能触到 K 底边）
-        let squash = (1.0 - (p - 0.5).abs() * 3.6).clamp(0.0, 1.0); // 落地瞬间 1
-        let sy = 1.0 - 0.26 * squash;
-        let sx = 1.0 + 0.32 * squash;
-        let ball_r = size * 0.14;
-        let ball_center = egui::pos2(center.x, center.y + size * (0.28 - lift / size));
-        // 篮球：橙色椭圆（压扁/拉伸）+ 深色纹理弧线。
-        let ball_color = egui::Color32::from_rgb(0xff, 0x9e, 0x2c);
-        let line_color = egui::Color32::from_rgb(0x2b, 0x20, 0x33);
-        let bw = ball_r * sx;
-        let bh = ball_r * sy;
-        painter.add(egui::Shape::ellipse_filled(
-            ball_center,
-            egui::vec2(bw, bh),
-            ball_color,
-        ));
-        let line_w = (ball_r * 0.17).max(0.8);
-        let stroke = egui::Stroke::new(line_w, line_color);
-        // 竖弧 + 左右侧弧（经典篮球纹理）。
-        painter.line_segment(
-            [
-                egui::pos2(ball_center.x, ball_center.y - bh),
-                egui::pos2(ball_center.x, ball_center.y + bh),
-            ],
-            stroke,
-        );
-        let side_x = bw * 0.62;
-        let side_h = bh * 0.82;
-        for sign in [-1.0f32, 1.0] {
-            painter.line_segment(
-                [
-                    egui::pos2(ball_center.x + side_x * sign, ball_center.y - side_h),
-                    egui::pos2(ball_center.x + side_x * sign, ball_center.y + side_h),
-                ],
-                stroke,
-            );
-        }
         if response.hovered() {
             anim::paint_glow(painter, center, size * 0.9, theme.accent2);
         }
-        // 持续动画：30fps 重绘（仅 logo 可见时，且非测试环境由 kittest 控制帧）。
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(33));
     }
     rect
 }
@@ -1895,6 +2052,8 @@ fn launch_installer(dmg: &Path, mount: &Path) -> Result<(), String> {
 impl eframe::App for KunApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // 缓存 ctx 供非 UI 回调使用（如复制 tab 时构造 Session）。
+        self.last_ctx = ctx.clone();
 
         // ==================== 快捷键 ====================
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
@@ -1903,8 +2062,9 @@ impl eframe::App for KunApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T)) {
             self.new_local_tab(&ctx);
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)) {
-            self.sidebar_open = !self.sidebar_open;
+        // ⌘, 切换设置弹窗（macOS 标准"应用偏好设置"快捷键）。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.toggle_settings();
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
             && !self.tabs.is_empty()
@@ -1948,43 +2108,8 @@ impl eframe::App for KunApp {
         self.poll_update();
         self.poll_download(&ctx);
 
-        // ==================== 左侧主机栏（可折叠，默认收起） ====================
-        if self.sidebar_open {
-            let theme = crate::theme::current_theme();
-            let sidebar_frame =
-                egui::Frame::new()
-                    .fill(theme.bg_panel)
-                    .inner_margin(egui::Margin {
-                        left: 12,
-                        right: 12,
-                        top: 10,
-                        bottom: 10,
-                    });
-            egui::Panel::left("hosts")
-                .default_size(240.0)
-                .min_size(240.0)
-                .resizable(true)
-                .frame(sidebar_frame)
-                .show(ui, |ui| {
-                    self.host_sidebar(ui);
-                });
-        }
-
-        // ==================== 顶部工具栏 ====================
+        // ==================== 顶部标签页栏（合并了原 toolbar：齿轮入口在最右） ====================
         let theme = crate::theme::current_theme();
-        let toolbar_frame = egui::Frame::new()
-            .fill(theme.bg_header)
-            .inner_margin(egui::Margin {
-                left: 12,
-                right: 10,
-                top: 7,
-                bottom: 3,
-            });
-        egui::Panel::top("toolbar")
-            .frame(toolbar_frame)
-            .show(ui, |ui| {
-                self.toolbar(ui);
-            });
         // ==================== 标签页栏 ====================
         let tab_frame = egui::Frame::new()
             .fill(theme.bg_header)
@@ -2017,27 +2142,26 @@ impl eframe::App for KunApp {
         // SFTP 面板必须是顶层面板（先于 CentralPanel 注册）：
         // egui 0.36 嵌套在 CentralPanel 内的 `Panel::right` 会把面板状态
         // 计入顶层布局，导致面板错位覆盖终端（表现为"SFTP 面板打不开"）。
-        let has_sftp = self
-            .tabs
-            .get(self.active_tab)
-            .is_some_and(|t| t.sftp.is_some());
-        if has_sftp {
-            let sftp_frame = egui::Frame::new()
-                .fill(theme.bg_panel)
-                .inner_margin(egui::Margin::symmetric(10, 8));
-            egui::Panel::right("sftp_panel")
-                .default_size(360.0)
-                // 最小宽度保证面板始终可见可操作（此前可被拖到极窄）。
-                .min_size(240.0)
-                .resizable(true)
-                .frame(sftp_frame)
-                .show(ui, |ui| {
-                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                        if let Some(sftp) = &mut tab.sftp {
-                            sftp.show(ui);
-                        }
-                    }
-                });
+        // tabby 形式：面板默认收起，只显示终端；终端右上角悬浮按钮切换
+        // 展开/收起（`show_collapsible` 官方滑动动画，收起后右缘保留
+        // 细拖拽把手，拖动也可重新打开）。
+        let max_sftp_w = ui.ctx().viewport_rect().width() * 0.45;
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            if let Some(sftp) = &mut tab.sftp {
+                let sftp_frame = egui::Frame::new()
+                    .fill(theme.bg_panel)
+                    .inner_margin(egui::Margin::symmetric(10, 8));
+                egui::Panel::right("sftp_panel")
+                    .default_size(340.0)
+                    // 最小宽度保证面板始终可见可操作（此前可被拖到极窄）。
+                    .min_size(260.0)
+                    // 最宽限制（约窗口 45%）：防止拖宽挤压终端
+                    // （曾拖到 ~70% 窗口宽把终端压成一条窄带）。
+                    .max_size(max_sftp_w)
+                    .resizable(true)
+                    .frame(sftp_frame)
+                    .show_collapsible(ui, &mut tab.sftp_open, |ui| sftp.show(ui));
+            }
         }
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(_pending) = &self.pending {
@@ -2055,6 +2179,10 @@ impl eframe::App for KunApp {
                 self.empty_state(ui, &ctx);
             } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 tab.terminal.show(ui);
+                // tabby 风格：远程标签页终端右上角悬浮 SFTP 开关按钮。
+                if tab.sftp.is_some() && sftp_floating_button(ui, tab.sftp_open) {
+                    tab.sftp_open = !tab.sftp_open;
+                }
             }
         });
 
@@ -2066,6 +2194,9 @@ impl eframe::App for KunApp {
         }
         self.connect_dialog(&ctx);
         self.update_dialog(&ctx);
+        if self.show_settings {
+            self.settings_panel(&ctx);
+        }
         self.render_toast(&ctx);
 
         // 安装完成 → 关闭应用（脚本会拉起新版本）。
@@ -2214,6 +2345,56 @@ mod dialog_tests {
 mod app_tests {
     use super::*;
 
+    /// tabby 形式：远程标签页 SFTP 面板默认收起，仅显示终端；
+    /// 终端右上角悬浮 SFTP 按钮点击切换面板开/关
+    /// （回归测试：曾无条件显示右侧面板，宽度失控挤压终端成窄条）。
+    #[test]
+    fn sftp面板默认收起悬浮按钮切换() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            let mut app = KunApp::new(cc);
+            // 构造带 SFTP 会话的标签页（mock 通道，无需测试 sshd）。
+            let session = Session::spawn_local(
+                SessionOptions::default(),
+                80,
+                24,
+                Arc::new(|_ev: &SessionEvent| {}),
+            )
+            .expect("创建本地终端失败");
+            let mut tab = TerminalTab::new("测试主机".into(), TerminalView::new(session));
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            tab.sftp = Some(SftpView::new(
+                "测试主机",
+                SftpHandle::from_raw(handle_tx),
+                rx,
+            ));
+            app.tabs.push(Box::new(tab));
+            app.active_tab = app.tabs.len() - 1;
+            app
+        });
+        harness.run_steps(6);
+
+        // 默认：面板收起（面板内控件不可见），悬浮按钮可见。
+        assert!(
+            harness.root().query_all_by_label("刷新").next().is_none(),
+            "SFTP 面板应默认收起"
+        );
+        harness.get_by_label("SFTP").click();
+        harness.run_steps(6);
+        // 点击悬浮按钮 → 面板展开。
+        harness.get_by_label("刷新");
+        harness.get_by_label("上传");
+        // 再点 → 收起。
+        harness.get_by_label("SFTP").click();
+        harness.run_steps(6);
+        assert!(
+            harness.root().query_all_by_label("刷新").next().is_none(),
+            "再次点击应收起面板"
+        );
+    }
+
     /// 本地终端输入命令前缀 → 补全浮层出现；Esc 关闭；Tab 确认补全。
     #[test]
     fn 输入触发补全浮层() {
@@ -2287,6 +2468,97 @@ mod app_tests {
         );
     }
 
+    /// 读当前标签页终端可见文本（kittest 断言用）。
+    fn app_grid_text(app: &KunApp) -> String {
+        use alacritty_terminal::term::cell::Flags;
+        let tab = app.tabs.get(app.active_tab).expect("无标签页");
+        let term_arc = tab.terminal.session().term();
+        let guard = term_arc.lock();
+        let content = guard.renderable_content();
+        let mut lines: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut started = false;
+        let mut prev_grid_line: i32 = i32::MIN;
+        for item in content.display_iter {
+            let cell = item.cell;
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
+                continue;
+            }
+            if item.point.line.0 != prev_grid_line {
+                if started {
+                    lines.push(current.trim_end().to_string());
+                }
+                current = String::new();
+                started = true;
+                prev_grid_line = item.point.line.0;
+            }
+            current.push(cell.c);
+        }
+        if started {
+            lines.push(current.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    /// 完整应用（工具栏/标签栏/悬浮按钮共存）下回车应执行命令
+    /// （回归测试：用户报告英文输入法下命令能输入但回车不执行）。
+    #[test]
+    fn 完整应用回车执行命令() {
+        use std::time::{Duration, Instant};
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run_steps(6);
+
+        // 等待 zsh 就绪（提示符出现）。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if app_grid_text(harness.state()).contains('➜') {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            ready,
+            "zsh 未就绪，终端内容：\n{}",
+            app_grid_text(harness.state())
+        );
+
+        // 输入 echo hello。
+        harness.event(egui::Event::Text("echo hello".into()));
+        for _ in 0..6 {
+            harness.step();
+        }
+
+        // 按回车。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            modifiers: egui::Modifiers::NONE,
+            repeat: false,
+            pressed: true,
+        });
+
+        // 等待 hello 输出出现（命令被执行）。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut executed = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if app_grid_text(harness.state()).contains("hello") {
+                executed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            executed,
+            "回车未执行命令，终端内容：\n{}",
+            app_grid_text(harness.state())
+        );
+    }
+
     /// 新建连接表单默认值：用户名 root、端口 22（可修改）。
     #[test]
     fn 表单默认root与22端口() {
@@ -2298,14 +2570,21 @@ mod app_tests {
         assert_eq!(form.port.trim().parse::<u16>().unwrap(), 22);
     }
 
-    /// 完整应用：点击"新建连接"按钮打开对话框，不应崩溃。
+    /// 完整应用：⌘, 打开设置弹窗后点"新建连接"按钮打开对话框，不应崩溃。
     #[test]
     fn 点击新建连接不崩溃() {
         use kittest::Queryable;
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
         harness.run_steps(6);
-        harness.get_by_label("kun").click();
+        // ⌘, 打开设置弹窗（含"主机管理"分组与"新建连接"按钮）。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
         for _ in 0..3 {
             harness.step();
         }
@@ -2408,11 +2687,19 @@ mod connect_tests {
             .with_step_dt(1.0 / 60.0)
             .build_eframe(|cc| KunApp::new(cc));
         harness.run_steps(6);
-        harness.get_by_label("kun").click();
+        // 主机行从设置弹窗里取：⌘, 打开设置弹窗。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
         for _ in 0..3 {
             harness.step();
         }
 
+        // 双击设置 tab 内的主机行（自实现 0.3s 双击检测）。
         {
             let host_row = harness.get_by_label("链路测试");
             host_row.click();
@@ -2443,6 +2730,22 @@ mod connect_tests {
         std::fs::remove_file(&config_path).ok();
 
         assert!(connected, "点击连接后未出现 SFTP 面板（连接失败或崩溃）");
+        // 连接成功后设置弹窗仍打开，关闭弹窗（⌘, toggle）让 SFTP 浮按钮可点。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..3 {
+            harness.step();
+        }
+        // SFTP 面板默认收起，需点击终端右上角悬浮按钮展开。
+        harness.get_by_label("SFTP").click();
+        for _ in 0..6 {
+            harness.step();
+        }
         harness.get_by_label("上传");
         harness.get_by_label("刷新");
     }
@@ -2510,7 +2813,14 @@ mod snapshot_tests {
             .with_step_dt(1.0 / 60.0)
             .build_eframe(|cc| KunApp::new(cc));
         harness.run_steps(6);
-        harness.get_by_label("kun").click();
+        // 主机行从设置弹窗里取：⌘, 打开设置弹窗。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
         for _ in 0..3 {
             harness.step();
         }
@@ -2550,7 +2860,14 @@ mod snapshot_tests {
                 .with_step_dt(1.0 / 60.0)
                 .build_eframe(|cc| KunApp::new(cc));
             harness.run_steps(6);
-            harness.get_by_label("kun").click();
+            // 主机行从设置弹窗里取：⌘, 打开设置弹窗。
+            harness.event(egui::Event::Key {
+                key: egui::Key::Comma,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            });
             for _ in 0..3 {
                 harness.step();
             }
@@ -2566,6 +2883,22 @@ mod snapshot_tests {
         }
         assert!(connected, "连接失败，无法生成截图");
 
+        // 连接成功后设置弹窗仍打开，关闭弹窗（⌘, toggle）让 SFTP 浮按钮可点。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..3 {
+            harness.step();
+        }
+        // SFTP 面板默认收起，需点击终端右上角悬浮按钮展开。
+        harness.get_by_label("SFTP").click();
+        for _ in 0..6 {
+            harness.step();
+        }
         // 布局断言：SFTP 面板应位于窗口右侧（终端 + 面板 + 侧栏三段式）。
         let up = harness.get_by_label("上传");
         let r = up.rect();
@@ -2574,11 +2907,17 @@ mod snapshot_tests {
             "SFTP 面板应位于窗口右半侧，实际上传按钮 x={}",
             r.left()
         );
-        let host_title = harness.get_by_label("主机");
+        // 设置入口齿轮按钮应在标签栏最右侧（> 700 视口），用 Button role 查找
+        // （齿轮纯图标无文字 label）。取所有 button 中 right 最大的。
+        let gear = harness
+            .root()
+            .query_all_by_role(accesskit::Role::Button)
+            .max_by(|a, b| a.rect().right().partial_cmp(&b.rect().right()).unwrap())
+            .expect("应找到按钮");
         assert!(
-            host_title.rect().left() < 200.0,
-            "侧栏应位于窗口左侧，实际主机标题 x={}",
-            host_title.rect().left()
+            gear.rect().right() > 700.0,
+            "齿轮按钮应在标签栏最右侧（视口宽 800），实际 right={}",
+            gear.rect().right()
         );
         // 多跑几帧让面板状态稳定后再截图（kittest 渲染器对首帧 shapes 输出有延迟）。
         for _ in 0..30 {
@@ -2603,6 +2942,17 @@ mod theme_tests {
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
         harness.run_steps(6);
+        // 主题下拉现在在设置弹窗里，先用 ⌘, 打开弹窗。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..3 {
+            harness.step();
+        }
 
         for theme_name in ["深色", "深蓝", "霓虹"] {
             let combo = harness
@@ -2666,6 +3016,14 @@ mod tab_tests {
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
         harness.run_steps(6);
 
+        // 启动时：[本地终端]（设置改弹窗，不再是 tab）→ 1 个 ×。
+        assert_eq!(
+            harness.query_all_by_label("×").count(),
+            1,
+            "启动时只有 1 个本地终端标签"
+        );
+
+        // ⌘T 新建本地终端 → [本地终端, 新的本地终端] → 2 个 ×。
         harness.event(egui::Event::Key {
             key: egui::Key::T,
             physical_key: None,
@@ -2679,9 +3037,10 @@ mod tab_tests {
         assert_eq!(
             harness.query_all_by_label("×").count(),
             2,
-            "⌘T 后应有 2 个标签页"
+            "⌘T 后应有 2 个 × 按钮"
         );
 
+        // ⌘W 关闭当前 → [本地终端] → 1 个 ×。
         harness.event(egui::Event::Key {
             key: egui::Key::W,
             physical_key: None,
@@ -2695,8 +3054,10 @@ mod tab_tests {
         assert_eq!(
             harness.query_all_by_label("×").count(),
             1,
-            "⌘W 后应回到 1 个标签页"
+            "⌘W 后应回到 1 个 × 按钮"
         );
+
+        // 再次 ⌘W → [] → 0 个 ×。
         harness.event(egui::Event::Key {
             key: egui::Key::W,
             physical_key: None,
@@ -2710,7 +3071,7 @@ mod tab_tests {
         assert_eq!(
             harness.query_all_by_label("×").count(),
             0,
-            "全部关闭后应无标签页"
+            "全部关闭后应无 × 按钮"
         );
     }
 
@@ -2722,6 +3083,12 @@ mod tab_tests {
             opts.working_directory,
             std::env::var("HOME").ok().map(PathBuf::from),
             "本地会话应默认在 home 目录"
+        );
+        // 必须注入 TERM：GUI 启动继承 TERM=dumb 会致删除回显异常/回车不执行（回归测试）。
+        assert_eq!(
+            opts.env.get("TERM").map(String::as_str),
+            Some("xterm-256color"),
+            "本地会话必须注入 TERM=xterm-256color（避免继承 TERM=dumb）"
         );
     }
 }
@@ -2805,72 +3172,42 @@ mod dblclick_probe {
 }
 
 #[cfg(test)]
-mod sidebar_tests {
+mod settings_tests {
     use super::*;
 
-    /// 侧栏默认折叠（"新建连接"按钮不可见），点击 logo 展开，再点收起。
+    /// 设置弹窗默认关闭，tabs 不含设置 tab（设置改弹窗后无 Tab::Settings 概念）。
     #[test]
-    fn 侧栏默认折叠可展开收起() {
-        use kittest::Queryable;
-
+    fn 设置弹窗默认关闭() {
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
         harness.run_steps(6);
-
+        let app = harness.state();
+        assert!(!app.show_settings, "启动时设置弹窗应默认关闭");
+        assert_eq!(
+            app.active_tab, 0,
+            "默认激活第一个 tab（本地终端），不打扰用户"
+        );
+        // 启动时"主机管理"分组不应渲染。
+        use kittest::Queryable;
         assert!(
             harness
                 .root()
-                .query_all_by_label("新建连接")
+                .query_all_by_label("主机管理")
                 .next()
                 .is_none(),
-            "侧栏默认应折叠（新建连接按钮不可见）"
-        );
-
-        harness.get_by_label("kun").click();
-        for _ in 0..3 {
-            harness.step();
-        }
-        assert!(
-            harness
-                .root()
-                .query_all_by_label("新建连接")
-                .next()
-                .is_some(),
-            "展开后新建连接按钮应可见"
-        );
-        harness.get_by_label("新建连接");
-
-        harness.get_by_label("kun").click();
-        for _ in 0..3 {
-            harness.step();
-        }
-        assert!(
-            harness
-                .root()
-                .query_all_by_label("新建连接")
-                .next()
-                .is_none(),
-            "收起后新建连接按钮应不可见"
+            "设置弹窗未打开时不应渲染主机管理"
         );
     }
 
-    /// ⌘B 切换侧栏折叠。
+    /// ⌘, 快捷键切换设置弹窗（macOS 标准"应用偏好设置"）。
     #[test]
-    fn 快捷键切换侧栏() {
+    fn 快捷键打开设置() {
         use kittest::Queryable;
-
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
         harness.run_steps(6);
-        assert!(
-            harness
-                .root()
-                .query_all_by_label("新建连接")
-                .next()
-                .is_none(),
-            "默认折叠"
-        );
+        assert!(!harness.state().show_settings, "默认关闭");
 
         harness.event(egui::Event::Key {
-            key: egui::Key::B,
+            key: egui::Key::Comma,
             physical_key: None,
             pressed: true,
             repeat: false,
@@ -2879,13 +3216,48 @@ mod sidebar_tests {
         for _ in 0..3 {
             harness.step();
         }
+        // 打开后渲染"主机管理"分组。
+        assert!(harness.state().show_settings, "⌘, 应打开设置弹窗");
+        harness.get_by_label("主机管理");
+
+        // 再按 ⌘, 关闭。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..3 {
+            harness.step();
+        }
+        assert!(!harness.state().show_settings, "⌘, 应再次关闭设置弹窗");
+    }
+
+    /// 标签栏齿轮按钮存在且在标签栏最右侧（> 200 px）。
+    /// 齿轮纯图标无文字 label（`on_hover_text` 不被 kittest 识别为 label），
+    /// 通过 `by_role(Button)` 查找；点击验证 ⌘, 等价路径。
+    #[test]
+    fn 齿轮存在并能打开设置() {
+        use kittest::Queryable;
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        harness.run_steps(6);
+        // 齿轮是标签栏最右侧的 Button（视口宽 800，齿轮 right > 700）。
+        let gear = harness
+            .root()
+            .query_all_by_role(accesskit::Role::Button)
+            .max_by(|a, b| a.rect().right().partial_cmp(&b.rect().right()).unwrap())
+            .expect("应找到按钮");
         assert!(
-            harness
-                .root()
-                .query_all_by_label("新建连接")
-                .next()
-                .is_some(),
-            "⌘B 应展开侧栏"
+            gear.rect().right() > 700.0,
+            "齿轮按钮应在标签栏最右侧（> 700），实际 right={}",
+            gear.rect().right()
         );
+        gear.click();
+        for _ in 0..3 {
+            harness.step();
+        }
+        assert!(harness.state().show_settings, "齿轮点击应打开设置弹窗");
+        harness.get_by_label("主机管理");
     }
 }

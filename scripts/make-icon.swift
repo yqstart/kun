@@ -1,10 +1,10 @@
 #!/usr/bin/env swift
-// ==================== 生成 kun 应用图标（K 字 + 篮球） ====================
-// 紫金渐变圆角底 + 白色粗体 "K" + 篮球贴 K 字下方（落地压扁姿态）；
+// ==================== 生成 kun 应用图标（纯 K 字） ====================
+// 紫金渐变圆角底 + 白色粗体 "K"（居中）；
 // 四周留 10% 透明边距——macOS Dock 对占满画布的无边距图标会自动放大显示
 // （视觉"大一圈"），透明边距让 Dock 按标准尺寸渲染。
 //
-// 与应用内动态 logo（app.rs::draw_logo_mark）同构图：圆底 + K + 篮球。
+// 与应用内动态 logo（app.rs::draw_logo_mark）同构图：圆底 + K。
 // 用法：swift scripts/make-icon.swift <输出目录>
 
 import AppKit
@@ -29,9 +29,6 @@ let sizes: [(Int, Int)] = [
 // 品牌渐变：顶部 #8b5cf6 → 底部 #22d3ee（呼应应用 accent 渐变）。
 let topColor = NSColor(calibratedRed: 0x8b / 255.0, green: 0x5c / 255.0, blue: 0xf6 / 255.0, alpha: 1.0)
 let bottomColor = NSColor(calibratedRed: 0x22 / 255.0, green: 0xd3 / 255.0, blue: 0xee / 255.0, alpha: 1.0)
-// 篮球橙（ikun 招牌色）。
-let ballColor = NSColor(calibratedRed: 0xff / 255.0, green: 0x9e / 255.0, blue: 0x2c / 255.0, alpha: 1.0)
-let lineColor = NSColor(calibratedRed: 0x2b / 255.0, green: 0x20 / 255.0, blue: 0x33 / 255.0, alpha: 1.0)
 
 for (point, scale) in sizes {
     let px = point * scale
@@ -64,7 +61,7 @@ for (point, scale) in sizes {
     let gradient = NSGradient(colors: [topColor, bottomColor])!
     gradient.draw(in: path, angle: -90)
 
-    // K 字：白色粗体，圆底中央偏上。
+    // K 字：白色粗体，居中。
     let fontSize = rect.width * 0.46
     let font = NSFont.boldSystemFont(ofSize: fontSize)
     let attrs: [NSAttributedString.Key: Any] = [
@@ -75,43 +72,9 @@ for (point, scale) in sizes {
     let kSize = kText.size()
     let kPoint = NSPoint(
         x: rect.midX - kSize.width / 2,
-        y: rect.midY - kSize.height / 2 + rect.height * 0.04
+        y: rect.midY - kSize.height / 2
     )
     kText.draw(at: kPoint)
-
-    // 篮球：贴 K 字下方，落地压扁姿态（与动态版 squash 状态一致）。
-    let ballRadius = rect.width * 0.14
-    let ballCenter = NSPoint(x: rect.midX, y: rect.minY + rect.height * 0.24)
-    let sx: CGFloat = 1.32 // 横向压扁
-    let sy: CGFloat = 0.74 // 纵向收缩
-    let bw = ballRadius * sx
-    let bh = ballRadius * sy
-    let ball = NSBezierPath(ovalIn: NSRect(
-        x: ballCenter.x - bw, y: ballCenter.y - bh,
-        width: bw * 2, height: bh * 2))
-    ballColor.setFill()
-    ball.fill()
-    lineColor.setStroke()
-    ball.lineWidth = max(1.0, ballRadius * 0.17)
-    ball.stroke()
-    // 竖弧。
-    let vert = NSBezierPath()
-    vert.move(to: NSPoint(x: ballCenter.x, y: ballCenter.y - bh))
-    vert.line(to: NSPoint(x: ballCenter.x, y: ballCenter.y + bh))
-    vert.lineWidth = max(0.9, ballRadius * 0.15)
-    vert.stroke()
-    // 左右侧弧（经典篮球纹理）。
-    for sign: CGFloat in [-1.0, 1.0] {
-        let arc = NSBezierPath()
-        let ax = ballCenter.x + bw * 0.62 * sign
-        arc.move(to: NSPoint(x: ax, y: ballCenter.y - bh * 0.82))
-        arc.curve(
-            to: NSPoint(x: ax, y: ballCenter.y + bh * 0.82),
-            controlPoint1: NSPoint(x: ax + ballRadius * 1.5 * sign, y: ballCenter.y),
-            controlPoint2: NSPoint(x: ax + ballRadius * 1.5 * sign, y: ballCenter.y))
-        arc.lineWidth = max(0.9, ballRadius * 0.15)
-        arc.stroke()
-    }
 
     NSGraphicsContext.restoreGraphicsState()
 
