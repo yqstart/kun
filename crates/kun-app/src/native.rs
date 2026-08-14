@@ -7,8 +7,6 @@
 //! 只应在真实 AppKit 窗口环境调用（eframe 主线程创建期）；
 //! kittest 测试环境没有真实 NSWindow（句柄匹配失败），静默跳过。
 
-use raw_window_handle::HasWindowHandle as _;
-
 #[cfg(target_os = "macos")]
 use objc2_app_kit::NSView;
 
@@ -26,7 +24,7 @@ pub fn apply_rounded_window(cc: &eframe::CreationContext<'_>) {
 /// macOS 实现：拿到 contentView → 打开 layer 支持 → 设圆角 + 裁切 → 窗口背景透明。
 #[cfg(target_os = "macos")]
 fn apply_rounded_window_macos(cc: &eframe::CreationContext<'_>) {
-    use raw_window_handle::RawWindowHandle;
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
     // 从 eframe 创建的窗口拿 AppKit 句柄；失败说明不是真实窗口（如测试环境）。
     let Ok(handle) = cc.window_handle() else {

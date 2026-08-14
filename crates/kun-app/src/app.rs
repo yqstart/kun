@@ -2509,12 +2509,15 @@ mod app_tests {
         let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
         harness.run_steps(6);
 
-        // 等待 zsh 就绪（提示符出现）。
+        // 等待 zsh 就绪（提示符出现）。用 `~`（home 缩写，zsh 在 home 目录的
+        // 交互提示符必含）而非 `➜`（仅 oh-my-zsh robbyrussell 主题有）——
+        // GitHub runner 默认 zsh 提示符是 `...:~ runner$`，不输出 `➜`，
+        // 依赖 `➜` 会让该测试在 CI 上永远超时（此前 CI 失败根因）。
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut ready = false;
         while Instant::now() < deadline {
             harness.step();
-            if app_grid_text(harness.state()).contains('➜') {
+            if app_grid_text(harness.state()).contains('~') {
                 ready = true;
                 break;
             }
