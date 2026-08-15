@@ -3,9 +3,10 @@
 //! 远程终端与本地终端共用 `Term` 状态机：后台 tokio 任务读 SSH channel，
 //! 数据经 vte 解析器喂入 `Term`，写操作走命令队列（UI 线程非阻塞）。
 
+pub(crate) mod known_hosts;
 pub mod sftp;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alacritty_terminal::sync::FairMutex;
@@ -18,6 +19,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use crate::config::Auth;
 use crate::terminal::{EventHandler, Listener, Session, SessionEvent, Shared, TermSize};
+
+use known_hosts::{default_known_hosts_path, HostKeyVerifier};
 
 /// 远程会话后台命令。
 enum SessionCmd {
@@ -37,17 +40,34 @@ pub enum ConnectResult {
     Failed(String),
 }
 
-/// russh 客户端 Handler（MVP：接受所有服务器密钥）。
-pub(crate) struct ClientHandler;
+/// 统一的 SSH 客户端配置：30 秒无数据发 keepalive，3 次无响应断开
+/// （空闲连接被中间设备静默断开后能及时发现，避免会话假死）。
+fn ssh_config() -> client::Config {
+    client::Config {
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        keepalive_max: 3,
+        ..Default::default()
+    }
+}
 
-impl client::Handler for ClientHandler {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &russh::keys::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+/// 连接并校验服务器密钥（TOFU），失败时返回带原因的错误。
+pub(crate) async fn connect_verified(
+    config: Arc<client::Config>,
+    profile: &crate::config::HostProfile,
+) -> Result<client::Handle<HostKeyVerifier>, String> {
+    let (verifier, verifier_error) = HostKeyVerifier::new(
+        profile.host.clone(),
+        profile.port,
+        default_known_hosts_path(),
+    );
+    match client::connect(config, (profile.host.as_str(), profile.port), verifier).await {
+        Ok(handle) => Ok(handle),
+        Err(e) => {
+            // 密钥校验失败时给出明确原因（指纹不匹配 + 修复指引）；
+            // 其他错误（TCP 拒绝等）沿用 russh 原文。
+            let detail = verifier_error.lock().unwrap().take();
+            Err(detail.unwrap_or_else(|| e.to_string()))
+        }
     }
 }
 
@@ -75,21 +95,18 @@ pub fn connect_remote(
         let session_done = Arc::new(tokio::sync::Notify::new());
         let session_done_loop = session_done.clone();
         runtime.block_on(async move {
-            // ============ 1. TCP 连接与认证 ============
-            let config = Arc::new(client::Config::default());
-            let mut handle =
-                match client::connect(config, (profile.host.as_str(), profile.port), ClientHandler)
-                    .await
-                {
-                    Ok(h) => h,
-                    Err(e) => {
-                        let _ = tx.send(ConnectResult::Failed(format!(
-                            "连接 {}:{} 失败：{e}",
-                            profile.host, profile.port
-                        )));
-                        return;
-                    }
-                };
+            // ============ 1. TCP 连接与认证（含主机密钥 TOFU 校验） ============
+            let config = Arc::new(ssh_config());
+            let mut handle = match connect_verified(config, &profile).await {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = tx.send(ConnectResult::Failed(format!(
+                        "连接 {}:{} 失败：{e}",
+                        profile.host, profile.port
+                    )));
+                    return;
+                }
+            };
 
             let authed = match authenticate(&mut handle, &profile).await {
                 Ok(ok) => ok,
@@ -174,7 +191,7 @@ pub fn connect_remote(
             });
 
             let _ = tx.send(ConnectResult::Connected(Session::new(
-                term, shared, writer, resizer, shuttor, true,
+                term, shared, writer, resizer, shuttor, true, None,
             )));
 
             // ============ 7. 等待会话关闭，保持 runtime 存活 ============
@@ -191,7 +208,7 @@ async fn remote_loop(
     term: Arc<FairMutex<Term<Listener>>>,
     shared: Arc<Shared>,
     on_event: EventHandler,
-    _handle: client::Handle<ClientHandler>,
+    _handle: client::Handle<HostKeyVerifier>,
 ) {
     log::info!("remote_loop 启动");
     let mut parser: alacritty_terminal::vte::ansi::Processor = Processor::new();
@@ -249,18 +266,39 @@ async fn remote_loop(
     (on_event)(&SessionEvent::ChildExit);
 }
 
-/// 加载私钥文件（支持口令）。
+/// 展开私钥路径中的 `~`（配置里用户常写 `~/.ssh/id_ed25519`，
+/// 而 `std::fs` 不展开波浪号，会导致加载失败）。
+fn expand_tilde(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    if s == "~" {
+        if let Some(h) = home {
+            return h;
+        }
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(h) = home {
+            return h.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// 加载私钥文件（支持口令，路径自动展开 `~`）。
 fn load_private_key(
-    path: &PathBuf,
+    path: &Path,
     passphrase: Option<&str>,
 ) -> Result<russh::keys::PrivateKey, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let expanded = expand_tilde(path);
+    let content = std::fs::read_to_string(&expanded)
+        .map_err(|e| format!("读取私钥 {} 失败：{e}", expanded.display()))?;
     decode_secret_key(&content, passphrase).map_err(|e| e.to_string())
 }
 
 /// 执行认证（密码或私钥），返回是否成功。
 pub(crate) async fn authenticate(
-    handle: &mut client::Handle<ClientHandler>,
+    handle: &mut client::Handle<HostKeyVerifier>,
     profile: &crate::config::HostProfile,
 ) -> Result<bool, String> {
     let authed = match &profile.auth {

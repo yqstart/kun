@@ -156,6 +156,9 @@ pub struct Session {
             alacritty_terminal::event_loop::State,
         )>,
     >,
+    /// 本地 shell 子进程 PID（仅 unix：关闭时兜底 SIGKILL，远程会话为 None）。
+    #[cfg(unix)]
+    child_pid: Option<i32>,
 }
 
 /// 会话创建参数（本地）。
@@ -178,6 +181,7 @@ impl Session {
         resizer: Resizer,
         shuttor: Shuttor,
         is_remote: bool,
+        #[allow(unused_variables)] child_pid: Option<i32>,
     ) -> Session {
         Session {
             term,
@@ -187,6 +191,8 @@ impl Session {
             shuttor,
             is_remote,
             pty_thread: None,
+            #[cfg(unix)]
+            child_pid,
         }
     }
 
@@ -224,6 +230,11 @@ impl Session {
             cell_height: 1,
         };
         let pty = tty::new(&pty_options, window_size, 0)?;
+        // 子进程 PID：alacritty 的 Pty 析构只发 SIGHUP 后 `wait()`，shell 偶发
+        // 不响应 SIGHUP 会让关闭流程永久阻塞；Session 关闭时用它兜底 SIGKILL
+        // （仅 unix 有此机制，Windows ConPTY 无对应问题）。
+        #[cfg(unix)]
+        let child_pid = pty.child().id() as i32;
 
         // 创建终端状态机。
         let term = Arc::new(FairMutex::new(Term::new(
@@ -239,7 +250,7 @@ impl Session {
         )));
 
         // 创建事件循环（PTY 读取线程）。
-        let event_loop = EventLoop::new(
+        let event_loop = match EventLoop::new(
             term.clone(),
             Listener {
                 shared: shared.clone(),
@@ -248,7 +259,17 @@ impl Session {
             pty,
             true,
             false,
-        )?;
+        ) {
+            Ok(event_loop) => event_loop,
+            Err(err) => {
+                // pty 随错误路径析构，先杀 shell 避免其 wait 阻塞。
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(child_pid, libc::SIGKILL);
+                }
+                return Err(err);
+            }
+        };
         let channel = event_loop.channel();
         let pty_thread: JoinHandle<(
             EventLoop<tty::Pty, Listener>,
@@ -274,7 +295,12 @@ impl Session {
             let _ = shuttor_channel.send(Msg::Shutdown);
         });
 
-        let mut session = Session::new(term, shared, writer, resizer, shuttor, false);
+        #[cfg(unix)]
+        let child_pid_arg = Some(child_pid);
+        #[cfg(not(unix))]
+        let child_pid_arg: Option<i32> = None;
+        let mut session =
+            Session::new(term, shared, writer, resizer, shuttor, false, child_pid_arg);
         session.pty_thread = Some(pty_thread);
         Ok(session)
     }
@@ -333,6 +359,18 @@ impl Session {
 impl Drop for Session {
     /// 会话被丢弃时优雅关闭后台线程。
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.child_pid {
+            // 先给 shell 优雅退出机会（SIGHUP 让它保存状态正常退出）。
+            unsafe { libc::kill(pid, libc::SIGHUP) };
+            // 兜底：shell 偶发不响应 SIGHUP，而 alacritty Pty 析构的
+            // `wait()` 会随之永久阻塞（关闭标签页时 UI 线程卡死），
+            // 延时 SIGKILL 保证其必然退出（shell 已退时 kill 无害）。
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            });
+        }
         self.shuttor.shutdown();
     }
 }

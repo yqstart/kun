@@ -3,13 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use russh::client;
 use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::config::HostProfile;
-use crate::ssh::ClientHandler;
+use crate::ssh::{connect_verified, ssh_config};
 
 /// 远程文件条目。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,20 +154,19 @@ async fn sftp_main(
     mut cmd_rx: UnboundedReceiver<SftpCmd>,
     ev_tx: UnboundedSender<SftpEvent>,
 ) {
-    // ==================== 1. 连接与认证 ====================
+    // ==================== 1. 连接与认证（含主机密钥 TOFU 校验） ====================
     log::info!("sftp_main 启动：{}:{}", profile.host, profile.port);
-    let config = Arc::new(client::Config::default());
-    let mut handle =
-        match client::connect(config, (profile.host.as_str(), profile.port), ClientHandler).await {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = ev_tx.send(SftpEvent::Failed(format!(
-                    "连接 {}:{} 失败：{e}",
-                    profile.host, profile.port
-                )));
-                return;
-            }
-        };
+    let config = Arc::new(ssh_config());
+    let mut handle = match connect_verified(config, &profile).await {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = ev_tx.send(SftpEvent::Failed(format!(
+                "连接 {}:{} 失败：{e}",
+                profile.host, profile.port
+            )));
+            return;
+        }
+    };
 
     log::info!("TCP 连接成功，开始认证");
     let authed = match crate::ssh::authenticate(&mut handle, &profile).await {
@@ -236,6 +234,8 @@ async fn sftp_main(
                         let _ = ev_tx.send(SftpEvent::Done { label });
                     }
                     Err(e) => {
+                        // 失败时清理半成品远程文件（不残留 0 字节/截断文件）。
+                        let _ = sftp.remove_file(&remote).await;
                         let _ = ev_tx.send(SftpEvent::Error { label, message: e });
                     }
                 }
@@ -253,6 +253,8 @@ async fn sftp_main(
                         let _ = ev_tx.send(SftpEvent::Done { label });
                     }
                     Err(e) => {
+                        // 失败时清理半成品本地文件（不残留截断文件误导用户）。
+                        let _ = tokio::fs::remove_file(&local).await;
                         let _ = ev_tx.send(SftpEvent::Error { label, message: e });
                     }
                 }

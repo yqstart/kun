@@ -153,12 +153,13 @@ pub struct KunApp {
     pending: Option<UnboundedReceiver<ConnectResult>>,
     pending_label: String,
     toast: Option<Toast>,
-    pending_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>)>,
+    /// 进行中的 SFTP 连接（句柄 + 事件流 + 主机名——主机名随连接绑定，
+    /// 多连接并发时不会串到别的标签页上）。
+    pending_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>, String)>,
     /// SFTP 已就绪但 SSH 标签尚未创建，等待挂载。
-    ready_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>)>,
+    ready_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>, String)>,
     /// SFTP 连接错误（状态栏持久显示，toast 易被忽略）。
     sftp_error: Option<String>,
-    sftp_host: String,
     update_state: UpdateState,
     update_rx: Option<std::sync::mpsc::Receiver<Result<Option<UpdateInfo>, String>>>,
     download_rx: Option<std::sync::mpsc::Receiver<DownloadEvent>>,
@@ -273,7 +274,7 @@ fn draw_traffic_lights(ui: &mut egui::Ui) -> (Option<usize>, Option<usize>) {
 }
 
 /// 标签栏最右侧齿轮图标（设置入口）。22×22 纯图标按钮，无文字。
-/// 渐变圆底 + ⚙ 符号，hover accent2 辉光。
+/// 朴素风格：⚙ 符号次要色，hover 变主色 + 白色低透明度圆角底（Tabby 风）。
 /// 包装为 `egui::Button` 以便被 kittest 通过 `Role::Button` 找到。
 /// 点击调用方负责打开设置弹窗。
 fn settings_gear_button(ui: &mut egui::Ui) -> bool {
@@ -288,28 +289,59 @@ fn settings_gear_button(ui: &mut egui::Ui) -> bool {
         .add(btn)
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text("设置（⌘,）");
-    // 自绘渐变圆底 + ⚙ 符号（在 Button rect 上覆盖）。
     let rect = response.rect;
     if ui.is_rect_visible(rect) {
-        anim::paint_rounded_gradient(
-            ui.painter(),
-            rect,
-            btn_size * 0.5,
-            theme.accent,
-            theme.accent2,
-        );
+        if response.hovered() {
+            // hover：白色 8% 圆角底（与全局控件 hover 一致）。
+            ui.painter().rect_filled(
+                rect,
+                crate::theme::tokens::RADIUS_ITEM,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+            );
+        }
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             "⚙",
-            egui::FontId::proportional(12.0),
-            egui::Color32::WHITE,
+            egui::FontId::proportional(13.0),
+            if response.hovered() {
+                theme.text_primary
+            } else {
+                theme.text_secondary
+            },
         );
-        if response.hovered() {
-            anim::paint_glow(ui.painter(), rect.center(), btn_size * 0.9, theme.accent2);
-        }
     }
     response.clicked()
+}
+
+/// 标签栏快速 SSH 连接按钮。22×22 纯图标按钮（">_" 终端符号，业界通用的
+/// "命令行/终端"标识），风格与齿轮一致：次要色、hover 白 8% 圆角底。
+/// 点击弹出已保存主机列表（`Popup::menu` 自行管理开关状态，Id 需稳定）。
+fn ssh_quick_button(ui: &mut egui::Ui) -> egui::Response {
+    let theme = crate::theme::current_theme();
+    let btn_size = 22.0;
+    let btn = egui::Button::new(
+        egui::RichText::new(">_")
+            .monospace()
+            .size(11.0)
+            .color(theme.text_secondary),
+    )
+    .fill(egui::Color32::TRANSPARENT)
+    .stroke(egui::Stroke::NONE)
+    .min_size(egui::vec2(btn_size, btn_size));
+    let response = ui
+        .add(btn)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("快速连接已保存主机");
+    if response.hovered() && ui.is_rect_visible(response.rect) {
+        // hover：白色 8% 圆角底（与全局控件 hover 一致）。
+        ui.painter().rect_filled(
+            response.rect,
+            crate::theme::tokens::RADIUS_ITEM,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+        );
+    }
+    response
 }
 
 /// 当前 macOS 架构 → 发布产物命名（release.yml 约定）。
@@ -369,11 +401,34 @@ open "$FINAL"
 impl KunApp {
     /// 创建应用（启动本地终端会话）。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::new_with_config(cc, default_config_path())
+    }
+
+    /// 指定配置文件路径创建应用。
+    ///
+    /// 测试必须走这里传入隔离路径——曾发生测试直接读写并删除用户真实的
+    /// `~/.config/kun/hosts.toml`（default_config_path），运行一次测试
+    /// 主机列表就丢一次（表现为"更新后主机全部消失"）。
+    pub fn new_with_config(cc: &eframe::CreationContext<'_>, config_path: PathBuf) -> Self {
         crate::theme::set_theme(&cc.egui_ctx, 0);
         let ctx = cc.egui_ctx.clone();
 
-        let config_path = default_config_path();
-        let config = HostConfig::load(&config_path).unwrap_or_default();
+        // 加载失败不能静默按空配置启动：文件存在但解析失败时先备份原文，
+        // 避免后续保存把用户主机列表覆盖掉。
+        let (config, load_error) = match HostConfig::load(&config_path) {
+            Ok(c) => (c, false),
+            Err(e) => {
+                let existed = config_path.exists();
+                if existed {
+                    let bak = config_path.with_extension("toml.bak");
+                    if let Err(be) = std::fs::copy(&config_path, &bak) {
+                        log::error!("备份主机配置到 {bak:?} 失败：{be}");
+                    }
+                    log::error!("主机配置加载失败（原文已备份为 {bak:?}）：{e}");
+                }
+                (HostConfig::default(), existed)
+            }
+        };
 
         let mut app = Self {
             tabs: Vec::new(),
@@ -392,7 +447,6 @@ impl KunApp {
             pending_sftp: None,
             ready_sftp: None,
             sftp_error: None,
-            sftp_host: String::new(),
             update_state: UpdateState::Idle,
             update_rx: None,
             download_rx: None,
@@ -400,6 +454,9 @@ impl KunApp {
             restart_at: None,
         };
         // 启动时自动检查更新（后台线程，延迟 3 秒，静默）。
+        if load_error {
+            app.show_toast("主机配置读取失败，原文已备份为 hosts.toml.bak", true);
+        }
         app.start_update_check(true);
         // 初始一个本地终端 tab；设置改弹窗（`show_settings`）。
         app.new_local_tab(&ctx);
@@ -640,9 +697,9 @@ impl KunApp {
         self.pending_label = label.clone();
 
         let (_sftp_thread, sftp_handle, sftp_rx) = connect_sftp(&profile);
-        self.sftp_host = label;
+        // 主机名随本连接绑定，避免与并发连接串台。
+        self.pending_sftp = Some((sftp_handle, sftp_rx, label));
         self.sftp_error = None;
-        self.pending_sftp = Some((sftp_handle, sftp_rx));
         self.ready_sftp = None;
         self.pending_tab = None;
     }
@@ -650,11 +707,11 @@ impl KunApp {
     /// 将已就绪的 SFTP 会话挂载到 SSH 标签页。
     fn mount_ready_sftp(&mut self) {
         let Some(idx) = self.pending_tab else { return };
-        let Some((handle, rx)) = self.ready_sftp.take() else {
+        let Some((handle, rx, host)) = self.ready_sftp.take() else {
             return;
         };
         if let Some(tab) = self.tabs.get_mut(idx) {
-            tab.sftp = Some(SftpView::new(&self.sftp_host, handle, rx));
+            tab.sftp = Some(SftpView::new(&host, handle, rx));
         }
     }
 
@@ -663,7 +720,7 @@ impl KunApp {
         let mut ready = false;
         let mut failed: Option<String> = None;
         let mut closed = false;
-        if let Some((_handle, rx)) = &mut self.pending_sftp {
+        if let Some((_handle, rx, _host)) = &mut self.pending_sftp {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     SftpEvent::Ready => ready = true,
@@ -833,8 +890,9 @@ impl KunApp {
                         });
                     });
             });
-        // Esc 关闭 / × 关闭：open 同步回 self.show_settings。
-        self.show_settings = open;
+        // Esc 关闭 / × 关闭 / 闭包内主动关闭（如双击主机行连接成功）都生效：
+        // open 由 egui 回写用户关闭动作，self.show_settings 记录闭包内的主动关闭。
+        self.show_settings = open && self.show_settings;
     }
 
     /// 设置弹窗的卡片化分组容器：`bg_elevated` 底 + 边框 + 圆角 + 紧凑内边距。
@@ -857,6 +915,114 @@ impl KunApp {
             ui.add_space(6.0);
             body(ui);
         });
+    }
+
+    /// 标签栏 ">_" 快捷按钮弹出的主机菜单：单击主机行直接发起连接
+    /// （与设置弹窗主机行的双击不同——快捷入口单击即连，无需二次确认）。
+    /// 无已保存主机时提示并可一键打开新建连接对话框。
+    fn host_quick_menu(&mut self, ui: &mut egui::Ui) {
+        let theme = crate::theme::current_theme();
+        ui.set_min_width(232.0);
+        if self.config.hosts.is_empty() {
+            ui.add_space(6.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("暂无已保存主机")
+                        .size(12.0)
+                        .color(theme.text_muted),
+                );
+                ui.add_space(4.0);
+                if ui
+                    .button(
+                        egui::RichText::new("新建连接")
+                            .size(12.0)
+                            .color(theme.text_primary),
+                    )
+                    .clicked()
+                {
+                    self.show_new_conn = true;
+                    ui.close();
+                }
+            });
+            ui.add_space(6.0);
+            return;
+        }
+
+        let mut connect: Option<HostProfile> = None;
+        for (i, host) in self.config.hosts.iter().enumerate() {
+            // 行内容（头像 + 名称 + user@host，超长截断）。
+            let inner = ui
+                .scope_builder(egui::UiBuilder::new().id_salt(("quick_host", i)), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let avatar_size = 18.0;
+                        let (avatar_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(avatar_size, avatar_size),
+                            egui::Sense::hover(),
+                        );
+                        anim::paint_rounded_gradient(
+                            ui.painter(),
+                            avatar_rect,
+                            avatar_size * 0.5,
+                            theme.accent,
+                            theme.accent2,
+                        );
+                        let initial = host.name.chars().next().unwrap_or('?');
+                        ui.painter().text(
+                            avatar_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            initial.to_string(),
+                            egui::FontId::proportional(9.0),
+                            egui::Color32::WHITE,
+                        );
+                        ui.vertical(|ui| {
+                            ui.add_sized(
+                                [170.0, 14.0],
+                                egui::Label::new(
+                                    egui::RichText::new(&host.name)
+                                        .size(12.5)
+                                        .color(theme.text_primary),
+                                )
+                                .truncate(),
+                            );
+                            ui.add_sized(
+                                [170.0, 13.0],
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{}@{}", host.user, host.host))
+                                        .size(10.5)
+                                        .color(theme.text_muted),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    });
+                })
+                .response;
+            // 整行点击区（显式 interact + 稳定 Id，注册在内容之后）。
+            let row_rect = inner.rect.expand2(egui::vec2(4.0, 2.0));
+            let resp = ui
+                .interact(
+                    row_rect,
+                    egui::Id::new(("quick_host_click", i)),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.hovered() {
+                ui.painter().rect_filled(
+                    row_rect,
+                    crate::theme::tokens::RADIUS_ITEM,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                );
+            }
+            if resp.clicked() {
+                connect = Some(host.clone());
+                // 单击即连：关闭弹出菜单。
+                ui.close();
+            }
+        }
+        if let Some(profile) = connect {
+            self.start_connect(ui.ctx(), profile);
+        }
     }
 
     /// 渲染左侧主机列表。
@@ -895,9 +1061,10 @@ impl KunApp {
         {
             self.show_new_conn = true;
         }
-        ui.add_space(12.0);
-        hairline(ui, theme);
-        ui.add_space(6.0);
+        // 按钮与主机列表直接留白分隔。曾在此画发丝线，但 hairline 取
+        // ui.max_rect().top()（卡片内容区顶部）而非当前光标位置，线实际
+        // 出现在"主机管理"标题下方、压在新建连接按钮上方——用户要求去掉。
+        ui.add_space(8.0);
 
         if self.config.hosts.is_empty() {
             ui.add_space(20.0);
@@ -1023,18 +1190,26 @@ impl KunApp {
             }
 
             // 选中/hover 高亮（动画过渡）。
+            // Tabby 风：hover 白色低透明度叠加，选中用 accent 软底。
             let hover = row_response.hovered();
             let selected = selected_host == Some(i);
             let hover_alpha =
                 anim::smooth_bool(ui.ctx(), row_id.with("hover"), hover, anim::SPEED_FAST);
             let sel_alpha =
                 anim::smooth_bool(ui.ctx(), row_id.with("sel"), selected, anim::SPEED_FAST);
-            let alpha = (hover_alpha * 0.72).max(sel_alpha);
-            if alpha > 0.01 {
+            if hover_alpha > 0.01 {
                 ui.painter().rect_filled(
                     row_rect.expand2(egui::vec2(0.0, 4.0)),
                     crate::theme::tokens::RADIUS_ITEM,
-                    theme.accent_soft.gamma_multiply(alpha),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12)
+                        .gamma_multiply(hover_alpha * 0.8),
+                );
+            }
+            if sel_alpha > 0.01 {
+                ui.painter().rect_filled(
+                    row_rect.expand2(egui::vec2(0.0, 4.0)),
+                    crate::theme::tokens::RADIUS_ITEM,
+                    theme.accent_soft.gamma_multiply(sel_alpha),
                 );
             }
             if sel_alpha > 0.01 {
@@ -1050,6 +1225,8 @@ impl KunApp {
         }
         if let Some(i) = connect_idx {
             let profile = self.config.hosts[i].clone();
+            // 从设置弹窗双击连接成功后关闭弹窗，直接进入终端。
+            self.show_settings = false;
             self.start_connect(ui.ctx(), profile);
         }
         if let Some(i) = remove_idx {
@@ -1263,6 +1440,7 @@ impl KunApp {
             self.config.hosts.push(profile.clone());
             self.save_config();
             self.show_new_conn = false;
+            self.show_settings = false;
             self.form.name_focused = false;
             self.start_connect(ctx, profile);
         } else if canceled || !open {
@@ -1300,60 +1478,82 @@ impl KunApp {
                 let selected = i == self.active_tab;
                 // 数字索引前缀：与终端主流 Tab 习惯一致（1, 2, ...）。
                 let prefix = format!("{} ", i + 1);
+                // 选中底必须画在内容之前（Frame 先铺底再放内容）：曾把不透明
+                // 面板色画在内容之后，激活 tab 的文字被整块盖住、完全不可见。
+                let sel_alpha = anim::smooth_bool(
+                    ui.ctx(),
+                    egui::Id::new(("tab_sel", i)),
+                    selected,
+                    anim::SPEED_FAST,
+                );
                 let row = ui
                     .scope_builder(egui::UiBuilder::new().id_salt(("tab", i)), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add_space(6.0);
-                            // 数字索引（muted 色，提示序号）。
-                            ui.label(
-                                egui::RichText::new(&prefix)
-                                    .size(11.5)
-                                    .color(if selected {
-                                        theme.text_muted
-                                    } else {
-                                        theme.text_muted.gamma_multiply(0.7)
-                                    })
-                                    .monospace(),
-                            );
-                            // 无边框透明按钮（selectable_label 选中自带边框，
-                            // 与下方手绘高亮叠加会形成"双重框"）。
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(&title).size(12.5).color(if selected {
-                                            theme.text_primary
-                                        } else {
-                                            theme.text_muted
-                                        }),
-                                    )
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(egui::Stroke::NONE)
-                                    .corner_radius(crate::theme::tokens::RADIUS_ITEM),
-                                )
-                                .clicked()
-                            {
-                                switch_to = Some(i);
-                            }
-                            ui.add_space(1.0);
-                            if ui
-                                .add(
-                                    egui::Button::new("×")
-                                        .fill(egui::Color32::TRANSPARENT)
-                                        .stroke(egui::Stroke::NONE)
-                                        .min_size(egui::vec2(18.0, 18.0))
-                                        .corner_radius(4.0),
-                                )
-                                .on_hover_text("关闭标签页")
-                                .clicked()
-                            {
-                                close_idx = Some(i);
-                            }
-                            ui.add_space(4.0);
-                        });
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                theme.bg_panel.r(),
+                                theme.bg_panel.g(),
+                                theme.bg_panel.b(),
+                                (sel_alpha * 255.0) as u8,
+                            ))
+                            .corner_radius(crate::theme::tokens::RADIUS_ITEM)
+                            .inner_margin(egui::Margin::symmetric(2, 3))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(4.0);
+                                    // 数字索引（muted 色，提示序号）。
+                                    ui.label(
+                                        egui::RichText::new(&prefix)
+                                            .size(11.5)
+                                            .color(if selected {
+                                                theme.text_muted
+                                            } else {
+                                                theme.text_muted.gamma_multiply(0.7)
+                                            })
+                                            .monospace(),
+                                    );
+                                    // 无边框透明按钮（selectable_label 选中自带边框，
+                                    // 与手绘高亮叠加会形成"双重框"）。
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new(&title).size(12.5).color(
+                                                    if selected {
+                                                        theme.text_primary
+                                                    } else {
+                                                        theme.text_muted
+                                                    },
+                                                ),
+                                            )
+                                            .fill(egui::Color32::TRANSPARENT)
+                                            .stroke(egui::Stroke::NONE)
+                                            .corner_radius(crate::theme::tokens::RADIUS_ITEM),
+                                        )
+                                        .clicked()
+                                    {
+                                        switch_to = Some(i);
+                                    }
+                                    ui.add_space(1.0);
+                                    if ui
+                                        .add(
+                                            egui::Button::new("×")
+                                                .fill(egui::Color32::TRANSPARENT)
+                                                .stroke(egui::Stroke::NONE)
+                                                .min_size(egui::vec2(18.0, 18.0))
+                                                .corner_radius(4.0),
+                                        )
+                                        .on_hover_text("关闭标签页")
+                                        .clicked()
+                                    {
+                                        close_idx = Some(i);
+                                    }
+                                    ui.add_space(2.0);
+                                });
+                            });
                     })
                     .response;
 
-                // 选中底 / hover 底（动画过渡，唯一的高亮层）。
+                // hover 底（动画过渡）：白色低透明度叠加画在内容之后，只是
+                // 极淡提亮不遮文字；激活 tab 的凸起底已由上方 Frame 先铺好。
                 let hover = row.hovered() && !selected;
                 let hover_alpha = anim::smooth_bool(
                     ui.ctx(),
@@ -1361,26 +1561,15 @@ impl KunApp {
                     hover,
                     anim::SPEED_FAST,
                 );
-                let sel_alpha = anim::smooth_bool(
-                    ui.ctx(),
-                    egui::Id::new(("tab_sel", i)),
-                    selected,
-                    anim::SPEED_FAST,
-                );
-                if sel_alpha > 0.01 {
-                    ui.painter().rect_filled(
-                        row.rect.expand2(egui::vec2(2.0, 3.0)),
-                        crate::theme::tokens::RADIUS_ITEM,
-                        theme.accent_soft.gamma_multiply(sel_alpha),
-                    );
-                } else if hover_alpha > 0.01 {
+                if hover_alpha > 0.01 {
                     ui.painter().rect_filled(
                         row.rect.expand2(egui::vec2(1.0, 2.0)),
                         crate::theme::tokens::RADIUS_ITEM,
-                        theme.accent_soft.gamma_multiply(hover_alpha * 0.65),
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12)
+                            .gamma_multiply(hover_alpha),
                     );
                 }
-                // 底部指示条（宽度随选中状态动画）。
+                // 底部指示条（宽度随选中状态动画；白色细线，Tabby current-tab-indicator）。
                 let bar_w = anim::smooth(
                     ui.ctx(),
                     egui::Id::new(("tab_bar_w", i)),
@@ -1399,7 +1588,8 @@ impl KunApp {
                     ui.painter().rect_filled(
                         bar,
                         1.0,
-                        theme.accent.gamma_multiply(sel_alpha.max(0.25)),
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)
+                            .gamma_multiply(sel_alpha.max(0.25)),
                     );
                 }
             }
@@ -1416,6 +1606,12 @@ impl KunApp {
             {
                 self.new_local_tab(ui.ctx());
             }
+
+            // 快速 SSH 连接（">_" 图标）：点击弹出已保存主机列表，单击主机行
+            // 直接发起连接（不需要进设置弹窗双击）。push_id 固定按钮 Id——
+            // Popup::menu 的开关状态按 Id 记忆，自动 Id 帧间漂移会让菜单闪断。
+            let ssh_btn_resp = ui.push_id("ssh_quick", ssh_quick_button).inner;
+            egui::Popup::menu(&ssh_btn_resp).show(|ui| self.host_quick_menu(ui));
 
             // 顶到右侧：设置齿轮（设置弹窗入口）。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1472,10 +1668,12 @@ impl KunApp {
                 if exited {
                     ui.colored_label(theme.danger, "会话已退出");
                 }
-                if tab.sftp.is_some() {
+                // SFTP 主机名从标签页的 SFTP 视图读取（每个标签绑定自己的连接，
+                // 多远程标签共存时不会显示成最后一次连接的主机名）。
+                if let Some(sftp) = &tab.sftp {
                     ui.separator();
                     status_dot(ui, theme.accent2, false);
-                    ui.colored_label(theme.accent2, format!("SFTP · {}", self.sftp_host));
+                    ui.colored_label(theme.accent2, format!("SFTP · {}", sftp.host_name()));
                 }
             }
             if self.pending_sftp.is_some() {
@@ -1493,41 +1691,6 @@ impl KunApp {
                 ui.label(egui::RichText::new(e).size(11.5).color(theme.danger))
                     .on_hover_text("重新连接主机可再次尝试");
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.available_width() > 460.0 {
-                    // 快捷键提示：圆角深色块，按键 accent 色 + 动作次要色。
-                    for (key, action) in [
-                        ("⌘B", "主机"),
-                        ("⌘T", "终端"),
-                        ("⌘W", "关闭"),
-                        ("⌘N", "连接"),
-                        ("⌥1-3", "主题"),
-                    ] {
-                        egui::Frame::new()
-                            .fill(theme.bg_elevated)
-                            .stroke(egui::Stroke::new(1.0, theme.border))
-                            .corner_radius(4.0)
-                            .inner_margin(egui::Margin::symmetric(7, 2))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(key)
-                                            .monospace()
-                                            .size(10.5)
-                                            .color(theme.accent),
-                                    );
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        egui::RichText::new(action)
-                                            .size(10.5)
-                                            .color(theme.text_secondary),
-                                    );
-                                });
-                            });
-                        ui.add_space(2.0);
-                    }
-                }
-            });
         });
     }
 
@@ -1880,6 +2043,15 @@ impl KunApp {
 
 // ==================== 绘制辅助 ====================
 
+/// 隔离的测试配置路径（每个测试独享一份临时文件）。
+///
+/// 绝不触碰用户真实的 `~/.config/kun/hosts.toml`——曾发生测试直接
+/// 覆盖并删除用户主机配置（运行一次测试丢一次主机列表）。
+#[cfg(test)]
+pub(crate) fn test_config_path(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("kun-test-config-{tag}-{}.toml", std::process::id()))
+}
+
 /// 新建连接对话框的输入框统一样式：圆角深色底、垂直居中、焦点 accent 边框。
 ///
 /// TextEdit 默认 `Align2::LEFT_TOP`（单行输入框文字偏上），这里改为垂直居中；
@@ -1966,16 +2138,6 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32, pulse: bool) {
             egui::Stroke::new(1.0, color.gamma_multiply(0.8 - p * 0.8)),
         );
     }
-}
-
-/// 面板内的细分隔线。
-fn hairline(ui: &mut egui::Ui, theme: &crate::theme::Theme) {
-    let rect = ui.max_rect();
-    ui.painter().hline(
-        rect.left() + 6.0..=rect.right() - 6.0,
-        rect.top(),
-        egui::Stroke::new(1.0, theme.border),
-    );
 }
 
 /// 自定义渐变进度条（未知总量时显示流动光带）。
@@ -2145,17 +2307,21 @@ impl eframe::App for KunApp {
         // tabby 形式：面板默认收起，只显示终端；终端右上角悬浮按钮切换
         // 展开/收起（`show_collapsible` 官方滑动动画，收起后右缘保留
         // 细拖拽把手，拖动也可重新打开）。
-        let max_sftp_w = ui.ctx().viewport_rect().width() * 0.45;
+        // SFTP 面板宽度：默认约 40% 窗口宽、最宽 50%（曾固定 340px，
+        // 大窗口下偏窄；用户要求默认 40%、上限 50%）。
+        let viewport_w = ui.ctx().viewport_rect().width();
+        let sftp_default_w = viewport_w * 0.40;
+        let max_sftp_w = viewport_w * 0.50;
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             if let Some(sftp) = &mut tab.sftp {
                 let sftp_frame = egui::Frame::new()
                     .fill(theme.bg_panel)
-                    .inner_margin(egui::Margin::symmetric(10, 8));
+                    .inner_margin(egui::Margin::symmetric(12, 10));
                 egui::Panel::right("sftp_panel")
-                    .default_size(340.0)
+                    .default_size(sftp_default_w)
                     // 最小宽度保证面板始终可见可操作（此前可被拖到极窄）。
                     .min_size(260.0)
-                    // 最宽限制（约窗口 45%）：防止拖宽挤压终端
+                    // 最宽限制（约窗口 50%）：防止拖宽挤压终端
                     // （曾拖到 ~70% 窗口宽把终端压成一条窄带）。
                     .max_size(max_sftp_w)
                     .resizable(true)
@@ -2629,6 +2795,16 @@ mod connect_tests {
     use super::*;
     use kun_core::config::Auth;
 
+    /// 将测试 sshd 的 known_hosts 记录与 hostkey 放在同一目录（/tmp/kun-test-sshd）：
+    /// hostkey 随 /tmp 清理重建时指纹记录一并消失，避免旧指纹不匹配导致测试失败。
+    /// `call_once` 保证进程内只设置一次（测试并行安全）。
+    static KNOWN_HOSTS_INIT: std::sync::Once = std::sync::Once::new();
+    fn init_test_env() {
+        KNOWN_HOSTS_INIT.call_once(|| {
+            std::env::set_var("KUN_KNOWN_HOSTS", "/tmp/kun-test-sshd/known_hosts.toml");
+        });
+    }
+
     fn sshd_available() -> bool {
         use std::net::TcpStream;
         use std::time::Duration;
@@ -2668,6 +2844,7 @@ mod connect_tests {
         use kittest::Queryable;
         use std::time::{Duration, Instant};
 
+        init_test_env();
         if !sshd_available() {
             eprintln!("跳过：测试 sshd 未运行（scripts/test-sshd.sh start）");
             return;
@@ -2680,7 +2857,9 @@ mod connect_tests {
                 return;
             }
         }
-        let config_path = default_config_path();
+        // 隔离路径：绝不覆盖用户真实的 ~/.config/kun/hosts.toml
+        //（曾直接覆盖并删除用户主机列表，运行一次测试丢一次配置）。
+        let config_path = test_config_path("connect-e2e");
         let config = HostConfig {
             hosts: vec![profile],
         };
@@ -2688,7 +2867,7 @@ mod connect_tests {
 
         let mut harness = egui_kittest::Harness::builder()
             .with_step_dt(1.0 / 60.0)
-            .build_eframe(|cc| KunApp::new(cc));
+            .build_eframe(|cc| KunApp::new_with_config(cc, config_path.clone()));
         harness.run_steps(6);
         // 主机行从设置弹窗里取：⌘, 打开设置弹窗。
         harness.event(egui::Event::Key {
@@ -2733,7 +2912,33 @@ mod connect_tests {
         std::fs::remove_file(&config_path).ok();
 
         assert!(connected, "点击连接后未出现 SFTP 面板（连接失败或崩溃）");
-        // 连接成功后设置弹窗仍打开，关闭弹窗（⌘, toggle）让 SFTP 浮按钮可点。
+        // 连接成功后设置弹窗应自动关闭（回归：曾保持打开遮住终端）。
+        assert!(
+            !harness.state().show_settings,
+            "双击主机行连接成功后设置弹窗应自动关闭"
+        );
+        // SFTP 面板默认收起，需点击终端右上角悬浮按钮展开。
+        harness.get_by_label("SFTP").click();
+        for _ in 0..6 {
+            harness.step();
+        }
+        harness.get_by_label("上传");
+        harness.get_by_label("刷新");
+    }
+
+    /// 回归：设置弹窗 → 新建连接 → 点"连接"后，新建连接对话框与设置弹窗
+    /// 都应关闭（连接结果不影响关闭行为）。
+    #[test]
+    fn 新建连接后关闭设置弹窗() {
+        use kittest::{NodeT, Queryable};
+
+        let config_path = test_config_path("new-conn-dialog");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            KunApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+
+        // ⌘, 打开设置弹窗 → 点"新建连接"。
         harness.event(egui::Event::Key {
             key: egui::Key::Comma,
             physical_key: None,
@@ -2744,19 +2949,61 @@ mod connect_tests {
         for _ in 0..3 {
             harness.step();
         }
-        // SFTP 面板默认收起，需点击终端右上角悬浮按钮展开。
-        harness.get_by_label("SFTP").click();
-        for _ in 0..6 {
+        assert!(harness.state().show_settings, "设置弹窗应打开");
+        harness.get_by_label("新建连接").click();
+        for _ in 0..3 {
             harness.step();
         }
-        harness.get_by_label("上传");
-        harness.get_by_label("刷新");
+        assert!(harness.state().show_new_conn, "新建连接对话框应打开");
+
+        // 填主机（用户名默认 root、端口默认 22，无需改动）。
+        // 输入框顺序：名称、用户名、主机、端口、密码。
+        let inputs: Vec<_> = harness
+            .root()
+            .query_all_by_role(accesskit::Role::TextInput)
+            .collect();
+        assert!(inputs.len() >= 3, "表单应有名称/用户名/主机输入框");
+        inputs[2].click();
+        for _ in 0..2 {
+            harness.step();
+        }
+        harness.event(egui::Event::Text("127.0.0.1".into()));
+        for _ in 0..2 {
+            harness.step();
+        }
+
+        // 点"连接" → 两个弹窗都应关闭（连接发起后失败与否不影响）。
+        // 按钮文字会同时生成 Label 节点，需按 role 过滤出真正的 Button。
+        let connect_btn = harness
+            .root()
+            .query_all_by_role(accesskit::Role::Button)
+            .find(|n| n.accesskit_node().label() == Some("连接".to_string()))
+            .expect("找不到连接按钮");
+        connect_btn.click();
+        for _ in 0..3 {
+            harness.step();
+        }
+        assert!(
+            !harness.state().show_new_conn,
+            "点连接后新建连接对话框应关闭"
+        );
+        assert!(!harness.state().show_settings, "点连接后设置弹窗应关闭");
+        // 清理测试写入的配置。
+        std::fs::remove_file(&config_path).ok();
     }
 }
 
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+
+    /// 与 connect_tests::init_test_env 相同（每模块独立 Once）。
+    static KNOWN_HOSTS_INIT: std::sync::Once = std::sync::Once::new();
+    fn init_test_env() {
+        KNOWN_HOSTS_INIT.call_once(|| {
+            std::env::set_var("KUN_KNOWN_HOSTS", "/tmp/kun-test-sshd/known_hosts.toml");
+        });
+    }
 
     fn sshd_available() -> bool {
         use std::net::TcpStream;
@@ -2775,6 +3022,7 @@ mod snapshot_tests {
         use kun_core::config::Auth;
         use std::time::{Duration, Instant};
 
+        init_test_env();
         if !sshd_available() {
             eprintln!("跳过：测试 sshd 未运行");
             return;
@@ -2806,7 +3054,7 @@ mod snapshot_tests {
                 return;
             }
         }
-        let config_path = default_config_path();
+        let config_path = test_config_path("snapshot");
         let config = HostConfig {
             hosts: vec![profile],
         };
@@ -2814,7 +3062,7 @@ mod snapshot_tests {
 
         let mut harness = egui_kittest::Harness::builder()
             .with_step_dt(1.0 / 60.0)
-            .build_eframe(|cc| KunApp::new(cc));
+            .build_eframe(|cc| KunApp::new_with_config(cc, config_path.clone()));
         harness.run_steps(6);
         // 主机行从设置弹窗里取：⌘, 打开设置弹窗。
         harness.event(egui::Event::Key {
@@ -2861,7 +3109,7 @@ mod snapshot_tests {
             config.save(&config_path).ok();
             harness = egui_kittest::Harness::builder()
                 .with_step_dt(1.0 / 60.0)
-                .build_eframe(|cc| KunApp::new(cc));
+                .build_eframe(|cc| KunApp::new_with_config(cc, config_path.clone()));
             harness.run_steps(6);
             // 主机行从设置弹窗里取：⌘, 打开设置弹窗。
             harness.event(egui::Event::Key {
@@ -2886,18 +3134,7 @@ mod snapshot_tests {
         }
         assert!(connected, "连接失败，无法生成截图");
 
-        // 连接成功后设置弹窗仍打开，关闭弹窗（⌘, toggle）让 SFTP 浮按钮可点。
-        harness.event(egui::Event::Key {
-            key: egui::Key::Comma,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::COMMAND,
-        });
-        for _ in 0..3 {
-            harness.step();
-        }
-        // SFTP 面板默认收起，需点击终端右上角悬浮按钮展开。
+        // 连接成功后设置弹窗自动关闭，SFTP 浮按钮可直接点击。
         harness.get_by_label("SFTP").click();
         for _ in 0..6 {
             harness.step();
@@ -3262,5 +3499,75 @@ mod settings_tests {
         }
         assert!(harness.state().show_settings, "齿轮点击应打开设置弹窗");
         harness.get_by_label("主机管理");
+    }
+
+    /// 标签栏 ">_" 快捷按钮：点击弹出已保存主机列表，单击主机行直接发起
+    /// 连接（隔离配置路径，不碰用户真实 hosts.toml）。
+    #[test]
+    fn ssh快捷按钮连接主机() {
+        use kittest::Queryable;
+
+        let config_path = test_config_path("ssh-quick");
+        let config = HostConfig {
+            hosts: vec![HostProfile {
+                name: "快捷主机".into(),
+                host: "127.0.0.1".into(),
+                // 端口 9（discard）必然拒绝连接：只验证"发起连接"，
+                // 不依赖测试 sshd。
+                port: 9,
+                user: "root".into(),
+                auth: Auth::Password("x".into()),
+            }],
+        };
+        config.save(&config_path).expect("写入测试配置失败");
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            KunApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+
+        // 点击 ">_" → 弹出主机菜单（主机名可见）。
+        harness.get_by_label(">_").click();
+        harness.run_steps(6);
+        harness.get_by_label("快捷主机");
+
+        // 单击主机行 → 直接发起连接（pending_label 记录目标主机）。
+        harness.get_by_label("快捷主机").click();
+        harness.run_steps(6);
+        assert_eq!(
+            harness.state().pending_label,
+            "快捷主机",
+            "单击主机行应直接发起连接"
+        );
+        // 弹出菜单应已关闭（user@host 行不再可见）。
+        assert!(
+            harness
+                .root()
+                .query_all_by_label("root@127.0.0.1")
+                .next()
+                .is_none(),
+            "点击主机行后快捷菜单应关闭"
+        );
+
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// 无已保存主机时，" >_" 快捷菜单应提示并引导新建连接。
+    #[test]
+    fn ssh快捷按钮无主机提示() {
+        use kittest::Queryable;
+
+        let config_path = test_config_path("ssh-quick-empty");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            KunApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+
+        harness.get_by_label(">_").click();
+        harness.run_steps(6);
+        harness.get_by_label("暂无已保存主机");
+        harness.get_by_label("新建连接");
+
+        std::fs::remove_file(&config_path).ok();
     }
 }

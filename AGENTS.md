@@ -20,7 +20,8 @@ crates/
 │   ├── src/lib.rs
 │   ├── src/terminal/mod.rs   # Session 统一封装（本地/远程）、TermSize、Listener
 │   ├── src/terminal/keys.rs  # 键盘 → 字节序列编码（XTerm 修饰键）
-│   ├── src/ssh/mod.rs        # connect_remote（后台线程 + tokio）、authenticate
+│   ├── src/ssh/mod.rs        # connect_remote（后台线程 + tokio）、authenticate、connect_verified（TOFU + keepalive 配置）
+│   ├── src/ssh/known_hosts.rs # HostKeyVerifier（TOFU 主机密钥校验）+ known_hosts.toml 持久化（0600）
 │   ├── src/ssh/sftp.rs       # connect_sftp、SftpHandle（命令队列）、SftpEvent（事件流）
 │   ├── src/config/mod.rs     # HostProfile/HostConfig + hosts.toml
 │   └── tests/                # 集成测试（需本地测试 sshd: 127.0.0.1:2222）
@@ -46,9 +47,10 @@ crates/
 
 ### 基础补全（`kun-app/src/completion.rs`，Warp 风格）
 
-- 仅本地会话启用（远程无本机文件系统对应）；`InputModel` 跟踪输入行（与写入 PTY 的字节同步：可见文本追加、退格删尾、`\r` 执行并解析 `cd` 更新 cwd、Ctrl+C 重置、箭头/编辑键使模型失效）
+- 仅本地会话启用（远程无本机文件系统对应）；`InputModel` 跟踪输入行（与写入 PTY 的字节同步：可见文本追加、退格删尾、`\r` 执行并解析 `cd` 更新 cwd、Ctrl+C 重置、箭头/编辑键使模型失效、**Tab（shell 自身补全会原地改写输入行）也使模型失效**）
+- **`cd` 解析的前缀判定**：`strip_prefix("cd")` 后必须为空或以空白开头——`cdfoo` 是另一个命令，不能误判为 `cd foo`（回归测试 `cd前缀词不误判`）
 - 候选：命令位置匹配 PATH 可执行文件（`command_index()` OnceLock 懒扫描，只收有执行位的文件）；其余匹配 cwd 文件/目录（含 `~/` 展开与子路径），目录补 `/` 后缀
-- 浮层（`terminal_view.rs::render_completion_popup`）：光标行上方 Area 列表（命令 accent2/目录 accent/文件次要色），Tab 确认（按字符退格替换 word 后写 PTY）、↑/↓ 选择、Esc 关闭；输入变化即时重算（最多 8 条）。**定位用 `completion_popup_pos` 纯函数：`cursor_pos` 为光标行底部，上方空间充足时浮层底边 = 光标行顶上方 4px（完全不遮输入行），不足时顶边 = 光标行底下方 4px 紧贴输入行下方（回归测试：曾向下偏移一整行盖住输入行底部）**
+- 浮层（`terminal_view.rs::render_completion_popup`）：光标行上方 Area 列表（命令 accent2/目录 accent/文件次要色），Tab 确认（按字符退格替换 word 后写 PTY）、↑/↓ 选择、Esc 关闭；输入变化即时重算（最多 8 条）。**定位用 `Area::anchor` 锚定（`completion_popup_anchor` 纯函数算锚点/offset）：`cursor_pos` 为光标行底部，上方空间充足时 `LEFT_BOTTOM` 锚定浮层底边 = 光标行顶上方 4px、不足时 `LEFT_TOP` 锚定顶边 = 光标行底下方 4px——锚角固定、内容向另一侧生长，浮层真实渲染高度（行间 item_spacing 等）不再影响定位，绝不遮输入行（回归测试：曾用 fixed_pos + 高度估算，漏算行间距致底边侵入输入行 15px）**
 - 键盘拦截在 `handle_input` 的 Key 分支（菜单打开时 Tab/↑/↓/Esc 不转发 shell）；输入动作用 `InputAction` 枚举在 ui.input 闭包内收集、闭包外统一应用（闭包内 `session` 不可变借用，无法直接改 self）
 - **egui 0.36 焦点坑：Text/Key 事件帧后终端焦点可能被清除（`Memory::end_pass` dead-man-switch，kittest 必现）**——`TerminalView` 维护 `had_focus`，曾聚焦且当前 `focused().is_none()` 时每帧 `request_focus` 恢复（对话框输入框后渲染覆盖，不冲突）
 
@@ -57,54 +59,64 @@ crates/
 - `connect_sftp` 建立独立 SSH 连接（后台线程 runtime 存活到 `Shutdown` 命令）
 - UI 持 `SftpHandle`（克隆发送端）发命令；后台执行后经 `SftpEvent` 通道回报
 - 事件流：`Listed / Progress / Done / Error / Closed`
+- **传输失败清理半成品**：下载失败删本地半成品文件、上传失败删远程半成品（不残留截断文件误导用户）
+- **文件时间列**：`format_time` 用 civil_from_days 公版算法精确换算 UTC 日期（曾用 `天/365 + 天%365/30` 近似，月长不均/闰年导致日期错位）；测试断言已知时间戳（0=1970-01-01、951782400=2000-02-29 闰日、1800000000=2027-01-15）
+- **SFTP 主机名绑定在连接上**（`pending_sftp/ready_sftp` 元组携带 host label）：状态栏从 `tab.sftp.host_name()` 读取——曾用全局 `sftp_host` 字段，多远程标签共存时状态栏串台成"最后一次连接的主机名"
 
 ### 连接生命周期
 
+- **主机密钥校验（TOFU，`ssh/known_hosts.rs`）**：终端与 SFTP 连接都经 `connect_verified` 校验服务器公钥——首次连接记录 `SHA256:base64` 指纹到 `~/.config/kun/known_hosts.toml`，后续必须一致，不一致（服务器换密钥/中间人攻击）则拒绝并在错误里给出修复指引（曾无条件接受所有服务器密钥）。进程级 `Mutex` 串行化读-改-写（终端+SFTP 双连接并发首连会丢更新）；known_hosts 与 hosts.toml 都强制 **0600 权限**（含明文密码/口令，默认 umask 022 会产生 0644）。**指纹拒绝后重连需删文件对应条目**；密钥文件/known_hosts 测试用 rand 0.10（与 russh 的 rand_core 版本一致）
+- **SSH 配置**：`ssh_config()` 统一 30s keepalive（`keepalive_interval`）+ 3 次无响应断开（`keepalive_max`），空闲连接被 NAT/防火墙静默断开后能及时发现；私钥路径自动展开 `~`（配置里写 `~/.ssh/id_ed25519` 可直接加载）
 - 远程连接后台线程必须持有 runtime 直到会话关闭（`Notify` 等待 remote_loop 结束），否则 tokio::spawn 的任务被取消
 - `Session` 实现 `Drop` → 发 Shutdown 优雅关闭
+- **本地会话关闭兜底**：alacritty 的 `Pty` 析构只发 SIGHUP 后 `wait()`，shell（zsh）偶发不响应 SIGHUP 会让 wait 永久阻塞（关闭标签页时 UI 线程卡死，kittest 回归测试约 50% 概率必现）——`spawn_local` 在创建 EventLoop 前保存 `pty.child().id()`（macOS 上 login exec 成 shell 后 PID 不变），`Session::drop` 先 SIGHUP 给 shell 优雅退出机会，再在守护线程延时 300ms 补 **SIGKILL** 保证 Pty 的 wait 必然返回（shell 已退时 kill 无害）；EventLoop::new 失败的错误路径同样先 SIGKILL 再析构 pty；**libc 依赖仅 `cfg(unix)`**（Windows 无 kill/SIGHUP，ConPTY 无此问题）
 
-## 样式体系（Warp 风格）
+## 样式体系（Tabby 风格）
 
-- 设计 token 在 `theme.rs::tokens`：分层背景 `#0e0e11`（应用）/`#151519`（标题栏）/`#1a1a20`（面板）/`#24242c`（浮层）/`#0b0b0f`（终端，最深）
-- 文字三阶 `#f4f4f6/#bcbcc4/#80808a`；accent `#8b5cf6` + `ACCENT_SOFT`（15% 透明）做 hover/选中底；品牌渐变紫→青（`accent2 #22d3ee`）
-- 边框统一半透明白（`BORDER_SUBTLE`）；圆角 8px（按钮/输入）/7px（列表项/标签页）
+- 视觉参照 Tabby 终端（tabby-core theme.vars.scss）：深蓝灰分层背景、扁平控件、低对比 hover、小圆角紧凑排版、蓝色强调
+- 设计 token 在 `theme.rs::tokens`：分层背景 `#0e151d`（应用）/`#0a1017`（标签栏，最深）/`#16202b`（面板，激活 tab 凸起层）/`#1d272d`（浮层）/`#0b1016`（终端，最深）
+- 文字三阶 `#e2e9f0/#b3c0cc/#6e7d8c`；accent `#4f9df5`（Tabby 激活蓝）+ `accent2 #5bc0de`（青蓝辅助）；语义色 `#5cb85c/#f0ad4e/#d9534f`
+- **hover 高亮 = 白色低透明度叠加（`rgba(255,255,255,12~20)`），不再用 accent 底**；选中/激活态才用 `ACCENT_SOFT`（全局 widgets.hovered/active 在 `apply_theme` 统一设置，主机行/标签页自绘处同步遵循）
+- 边框统一半透明白（`BORDER_SUBTLE`，白 9%）；圆角 6px（按钮/输入）/5px（列表项/标签页）；按钮 padding 紧凑 `(9,4)`
 - 面板用 `Panel::frame(Frame)` 指定背景与边框；主按钮用 accent 填充
-- 终端背景在 TerminalView 里绘制 `BG_TERMINAL`；SFTP 面板与设置弹窗内主机列表行 hover/选中用 `ACCENT_SOFT` 圆角底
-- **动效**（`anim.rs`，无第三方依赖）：`smooth/smooth_bool` 指数平滑（状态存 ctx 临时数据，收敛中自动 request_repaint）、`paint_shimmer_line` 扫光 Mesh、`paint_rounded_gradient` 圆角渐变三角扇、`paint_glow` 辉光；工具栏底部扫光仅在 hover/更新活跃时持续重绘（省电）
-- **品牌 logo**（`draw_logo_mark`）：紫金渐变圆底 + **白色粗体 "K" 字**（居中，与应用图标同构图）；hover 时 accent2 辉光；无动画、无持续重绘（省电）。**kittest 注意：持续重绘会让 `Harness::run()` 超 max_steps panic——测试统一用 `harness.run_steps(6)` 显式步进**
+- 终端背景在 TerminalView 里绘制 `BG_TERMINAL`；终端光标白色（Tabby 风）
+- **动效**（`anim.rs`，无第三方依赖）：`smooth/smooth_bool` 指数平滑（状态存 ctx 临时数据，收敛中自动 request_repaint）、`paint_shimmer_line` 扫光 Mesh、`paint_rounded_gradient` 圆角渐变三角扇、`paint_glow` 辉光（仅品牌 logo hover 使用）
+- **品牌 logo**（`draw_logo_mark`）：紫金渐变圆底 + **白色粗体 "K" 字**（居中，与应用图标同构图，品牌识别保留渐变）；hover 时 accent2 辉光；无动画、无持续重绘（省电）。**kittest 注意：持续重绘会让 `Harness::run()` 超 max_steps panic——测试统一用 `harness.run_steps(6)` 显式步进**
 - **hover 光标**：`apply_theme` 设 `visuals.interact_cursor = Some(CursorIcon::PointingHand)`，所有标准控件（Button/SelectableLabel/ComboBox）hover 自动变小手（TextEdit 内部显式设 I-beam 覆盖）；自定义 `ui.interact` 区（主机行/删除/logo/toast）需手动 `.on_hover_cursor`
 - 终端内容内边距 `PADDING=10`（`terminal_view.rs`）：背景铺满 `ui.max_rect()`，文本/光标在内边距内绘制。**注意 egui 陷阱：`ui.min_rect()` 是"已用内容"包围盒，无子项时为 0x0**——背景/点击区域必须用 `ui.max_rect()`（布局分配区域），否则背景画不出来、点击无法重新聚焦
 - **display_iter 行号是网格坐标**（alacritty `grid/mod.rs::display_iter`）：viewport 顶行为 0，向上滚动后可见的 scrollback 行是**负行号**（`Line(-(display_offset)-1)`）。渲染循环必须用相对视口顶行的显示行号（换行时计数），**严禁 `point.line.0 as usize`**——负行号 cast 成 usize::MAX 级巨值，`rows_cache.resize` 直接 `capacity overflow` 闪退（offset=1 时则是 index 越界）；光标定位同样需换算：显示行 = 光标网格行 + `display_offset`。回归测试：`滚动scrollback后渲染不崩溃`
 - 主机条目（设置弹窗 → 主机管理卡片内）：单击选中、双击连接；样式：**accent 圆形头像（主机名首字符）+ 名称（超长截断不换行）+ 🗑 删除图标**（行右缘，hover 红底）；**行点击区横向扩展到面板可用宽度**（`row_rect`），短名称主机也能整行点击
 - **egui 0.36 交互坑：`Response::interact()`（scope_builder(...).response.interact(...)）的点击无法命中**（响应链问题，kittest 实测 clicked/hovered 恒 false）——必须用 `ui.interact(rect, id, sense)` 显式注册交互区，删除按钮等行内控件最后注册以覆盖行点击区
 - 终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）在渲染层解析（`theme.rs::TERM_PALETTE_16`/`xterm256`），优先级：Spec > OSC 覆盖（term.colors）> 内置调色板；`Term.colors` 默认全 None，不设调色板则全部渲染为白色
-- 选中主机条目左侧 2px accent 竖条；标签页底部有选中指示条（宽度动画）
-- **标签页（tab）无双边框**：tab 内容用无边框透明 `Button`（`selectable_label` 选中自带边框，与手绘高亮叠加会成"双重框"），高亮只有一层手绘 `accent_soft` 圆角底 + 底部指示条
-- **三套深色主题**（`theme.rs::THEMES`）：深色（紫金）/ 深蓝 / 霓虹；每套含 UI token + 终端调色板（16 色 + fg/bg/cursor）；`current_theme()` 静态读取，**设置弹窗 → 外观卡片**切换（`set_theme`）——ComboBox 选当前主题名（**勿用 ◐ 等 unicode 符号作为图标，SF 字体缺字形渲染为方块**）
+- 选中主机条目左侧 2px accent 竖条；标签页底部有选中指示条（白色细线，宽度动画，Tabby current-tab-indicator）
+- **标签页（tab）无双边框**：tab 内容用无边框透明 `Button`（`selectable_label` 选中自带边框，与手绘高亮叠加会成"双重框"），高亮只有一层手绘——**激活 tab 用面板色（`bg_panel`）凸起底 + 底部白色指示条，hover 用白 8% 叠加**（Tabby 风：标签栏比激活 tab 深一级）。**选中底必须画在内容之前**：用 `egui::Frame`（fill=bg_panel 随 sel_alpha 动画、inner_margin(2,3)）+ `.show()` 包住 tab 内容（Frame 先铺底再放内容）——曾把不透明面板色 `painter.rect_filled` 画在内容之后（同一 layer 后画在上），激活 tab 文字被整块盖住完全不可见（像素扫描验证：除底部指示条外无任何文字像素）；hover 白 8% 叠加是极淡提亮，画在内容之后无害
+- **三套深色主题**（`theme.rs::THEMES`）：深色（Tabby 蓝灰）/ 深蓝 / 霓虹；每套含 UI token + 终端调色板（16 色 + fg/bg/cursor）；`current_theme()` 静态读取，**设置弹窗 → 外观卡片**切换（`set_theme`）——ComboBox 选当前主题名（**勿用 ◐ 等 unicode 符号作为图标，SF 字体缺字形渲染为方块**）
 - 主题切换后需重新渲染终端（terminal_view 每帧读 `current_theme()`）
 - 终端输入/回车功能验证正常；**"回车不执行"两大真根因**：①TERM=dumb（GUI 启动继承，见下条 env 注入）②zsh 启用应用键盘模式（APP_KEYPAD）后主键盘 Enter 曾被误编码成 `ESC O M`——已修复为永远发 `\r`（见 keys.rs）；此外中文输入法（IME）激活时回车被输入法消费（确认拼音候选）是所有终端应用共性，切英文输入法即可
 - **"删除键插入空格"**：有两类独立根因——①**微信输入法 wetype**：退格/删除键按下时输入法伴随发送"空格类" Text 事件（ASCII 空格/零宽）→ 已修复：`suppress_next_text` 跨帧标记 + 退格后一帧内的空白类 Text 丢弃（只影响空白字符，不误伤正常输入）；回归测试 `退格伴随空格文本不插入` ②**TERM=dumb**：zle 判定非交互终端，删除回显走「原地空格覆盖」（只发空格缺 `\b`）→ 已修复：env 注入 TERM（见下条）
-- **布局重构（v0.5/v0.6）**：移除了左侧固定主机栏（`Panel::left("hosts")`）与顶部工具栏（`Panel::top("toolbar")`），所有原工具栏入口（主题/更新/品牌 logo）搬入**设置弹窗**（不再用 tab）；标签栏最右侧 `settings_gear_button` **22×22 纯图标齿轮**（无文字 label，自绘渐变圆底 + ⚙ 符号，hover accent2 辉光，包装为 `egui::Button` 以便被 kittest `Role::Button` 找到），click → `show_settings = true`；`⌘,` toggle 设置弹窗（macOS 标准"应用偏好设置"快捷键，取代原 `⌘B` 折叠侧栏）。**`KunApp::new` 启动仅创建本地终端 tab**（`Vec<Box<TerminalTab>>`），`active_tab = 0`（不打扰用户进入终端）；设置弹窗默认关闭。标签栏最右侧**只有齿轮一个图标按钮**（复制 tab「⎘」按钮已移除，相关 `duplicate_active_tab`/`new_local_tab_with_label` 一并删除）
+- **布局重构（v0.5/v0.6）**：移除了左侧固定主机栏（`Panel::left("hosts")`）与顶部工具栏（`Panel::top("toolbar")`），所有原工具栏入口（主题/更新/品牌 logo）搬入**设置弹窗**（不再用 tab）；标签栏最右侧 `settings_gear_button` **22×22 纯图标齿轮**（无文字 label，**朴素风：⚙ 符号次要色、hover 变主色 + 白 8% 圆角底**（曾为渐变圆底 + accent2 辉光，用户要求朴素化），包装为 `egui::Button` 以便被 kittest `Role::Button` 找到），click → `show_settings = true`；`⌘,` toggle 设置弹窗（macOS 标准"应用偏好设置"快捷键，取代原 `⌘B` 折叠侧栏）。**`KunApp::new` 启动仅创建本地终端 tab**（`Vec<Box<TerminalTab>>`），`active_tab = 0`（不打扰用户进入终端）；设置弹窗默认关闭。标签栏图标按钮：**＋（新建本地终端）→ `>_`（快速 SSH 连接）→ ⚙ 齿轮**（复制 tab「⎘」按钮已移除，相关 `duplicate_active_tab`/`new_local_tab_with_label` 一并删除）
+- **快速 SSH 连接按钮**（`ssh_quick_button` + `host_quick_menu`）：标签栏 `>_` 图标（monospace ">_" 终端符号，风格同齿轮），点击弹出 `egui::Popup::menu` 主机菜单——**单击主机行直接发起连接**（与设置弹窗主机行双击不同，快捷入口单击即连，点击后 `ui.close()` 关闭菜单）；行样式复用主机行（渐变圆头像 + 名称 + user@host 截断、hover 白 8%）；无已保存主机时提示"暂无已保存主机"+ 新建连接按钮（打开 `show_new_conn`）。**`Popup::menu` 的开关状态按按钮 Id 记忆，按钮必须 `ui.push_id("ssh_quick")` 固定 Id**（自动 Id 帧间漂移会让菜单闪断）；Popup::show 只接受 content 闭包（ctx 在构造时绑定，无 ctx 参数）；回归测试 `ssh快捷按钮连接主机`（隔离配置 + 端口 9 立即拒绝，断言 pending_label）/ `ssh快捷按钮无主机提示`
 - **窗口整体圆角**（`native.rs`，仅 macOS）：`with_decorations(false)` 无边框窗口是方角，通过 AppKit 给 contentView 的 backing layer 设 `cornerRadius=12` + `masksToBounds`，并 `setOpaque(false)` + `backgroundColor=clearColor` 让圆角外侧透明露出桌面（像素验证：四角 RGBA=(0,0,0,0) 全透明）。入口在 `main.rs` 的 app_creator 闭包 `native::apply_rounded_window(cc)`——用 `cc.window_handle()` 拿 `RawWindowHandle::AppKit` → `ns_view` 指针转 `&NSView`（同 eframe 内部写法，指针窗口生命周期内有效）；kittest 测试环境无真实 AppKit 句柄（`window_handle()` 失败/非 AppKit 变体）时静默返回，不 panic。**依赖**：kun-app 直接声明 `objc2-app-kit`（补 `NSColor`/`NSWindow`/`NSView` + `objc2-quartz-core` feature 使 CALayer 可用，features 全局合并不影响 eframe/winit）+ `objc2` + `raw-window-handle`（版本与 eframe 一致 0.6.2）；NSWindow 为 `MainThreadOnly`，必须在 eframe 主线程创建期调用
 - **无边框窗口拖拽**（`tab_bar`）：无系统标题栏，`tab_bar` 开头对**整行**（`ui.max_rect()`，Panel 分配区域非 0x0）注册底层 `Sense::drag()` 背景（id `tab_bar_drag`），`drag_started()` 时发 `ViewportCommand::StartDrag`（egui-winit 转 winit `drag_window()`，需窗口有焦点）。**关键交互顺序**：egui 命中规则是**后注册 widget 在顶层**（`WidgetRects::get_layer` back-to-front，`hit_test` 中 `drag_idx < click_idx` 判定 click 在 drag 之上）——拖拽背景**先注册**（底层），tabs/红绿灯/齿轮**后注册**（顶层），故控件点击/拖拽优先，仅标签栏空白处按下拖动才移窗；`Sense::drag` 的大背景 + 附近小控件会被 hit_test 的 `contains_rect` 帮助逻辑优先给小控件。**实测验证**：CGEvent 模拟标签栏空白处拖拽 → 窗口位置精确移动对应距离；点击齿轮 → 设置弹窗正常打开（kittest 齿轮测试亦通过）；`ui.interact` 不占布局空间不移动 cursor，horizontal 布局不受影响
-- **设置弹窗**（`fn settings_panel(ctx)`，`egui::Window` 居中，标题"设置"）：卡片化三组（`Self::settings_card` helper 渲染 `bg_elevated` 底 + 边框 + 圆角 + 紧凑内边距）：**主机管理**（复用 `host_sidebar`）/ **外观**（主题 ComboBox）/ **关于**（版本号 + 检查更新按钮）。`ScrollArea` 垂直滚动，max_height 420 防止超出视口。
-- **应用内更新**（`kun-core::updater` + `app.rs` 状态机）：版本检查走 `releases.atom`（不受 API 限流），资产直链按 `kun-{版本}-macos-{arm64|x64}.dmg` 构造并流式下载（进度回调）；安装由后台 shell 脚本完成——`hdiutil attach` 挂载 → `pgrep -x kun-app` 等待主进程退出 → `ditto` 替换 `/Applications/kun.app`（失败回退 `~/Applications`）→ `open` 重启；`installed` 状态延时 0.9s 后 `ViewportCommand::Close`；入口在设置弹窗 → 关于卡片
-- 主机行双击连接为**自实现检测**（`last_row_click`：0.3s 内同行的第二次点击）：egui 多击计数会把无关点击（如工具栏其他按钮）计入序列导致 count=3 而 `double_clicked`（count==2）失效
+- **设置弹窗**（`fn settings_panel(ctx)`，`egui::Window` 居中，标题"设置"）：卡片化三组（`Self::settings_card` helper 渲染 `bg_elevated` 底 + 边框 + 圆角 + 紧凑内边距）：**主机管理**（复用 `host_sidebar`）/ **外观**（主题 ComboBox）/ **关于**（版本号 + 检查更新按钮）。`ScrollArea` 垂直滚动，max_height 420 防止超出视口。**主机管理卡片内不要画细分隔线**——曾用 `hairline()` 画「新建连接」与主机列表的分隔线，但 hairline 取 `ui.max_rect().top()`（卡片内容区**顶部**）而非当前光标位置，线实际出现在"主机管理"标题下方、压在新建连接按钮上方（像素验证 y=266），用户要求去掉；`hairline` 函数已连同删除（`ui.max_rect().top()` 不等于 cursor.y，任何分隔线都应用 `ui.cursor().top()`）
+- **应用内更新**（`kun-core::updater` + `app.rs` 状态机）：版本检查走 `releases.atom`（不受 API 限流），资产直链按 `kun-{版本}-macos-{arm64|x64}.dmg` 构造并流式下载（进度回调）；**下载失败自动删除半成品 dmg**（不残留损坏镜像误导安装）；安装由后台 shell 脚本完成——`hdiutil attach` 挂载 → `pgrep -x kun-app` 等待主进程退出 → `ditto` 替换 `/Applications/kun.app`（失败回退 `~/Applications`）→ `open` 重启；`installed` 状态延时 0.9s 后 `ViewportCommand::Close`；入口在设置弹窗 → 关于卡片
+- 主机行双击连接为**自实现检测**（`last_row_click`：0.3s 内同行的第二次点击）：egui 多击计数会把无关点击（如工具栏其他按钮）计入序列导致 count=3 而 `double_clicked`（count==2）失效；**双击/新建连接成功后自动关闭设置弹窗**——settings_panel 结尾同步必须用 `self.show_settings = open && self.show_settings`（egui 只把用户关闭动作回写局部 `open`，闭包内主动关闭会被 `= open` 覆盖失效）
 - **多标签页**（warp 风格）：`KunApp` 持 `tabs: Vec<Box<TerminalTab>>`（`pub type Tab = Box<TerminalTab>`），SFTP 按 TerminalTab 挂载（远程 tab 独享）；**`Box` 包裹 TerminalTab**——避免 `Vec` 各槽位按最大元素对齐造成内存浪费（原 enum 形式触发的 `large_enum_variant` 警告在去 enum 化后自动消失）；标签栏在顶栏（`Panel::top("tabs")`，合并了原工具栏区域），当前标签 accent-soft 高亮，支持点击切换/×关闭/＋新建；最右侧为设置齿轮；快捷键 ⌘T 新建本地、⌘W 关闭当前、⌘1-9 切换、⌘N 新建连接、⌘, 切换设置弹窗、⌥1-3 主题
 - 本地终端默认工作目录为 **home**（`local_session_options`：`working_directory = $HOME`）——Finder/Dock 启动时进程 cwd 为 `/`，不指定会导致终端落在根目录；远程会话不受影响（由 sshd 决定）
 - **终端 `ls` 颜色与 TERM**：渲染层已支持 ANSI 色，但 macOS `ls` 默认无颜色输出（无 `CLICOLOR`）→ `local_session_options` 注入 `CLICOLOR=1` + 深色优化 `LSCOLORS=Gxfxcxdxbxegedabagacad`（目录亮青/链接紫红/可执行红/socket 绿/管道黄）+ **`TERM=xterm-256color`**（必须注入：GUI/Finder/Dock 启动继承 `TERM=dumb`，alacritty 的 `setup_env()` 只在 alacritty 主应用入口调用、kun 未调用，`TERM=dumb` 会致 zsh zle 删除回显异常/回车异常——同 Miro Code 根因；**勿注入 locale**，会引发回车不执行）；经 `SessionOptions.env`（alacritty 为覆盖语义，`builder.env` 追加继承）传给 PTY；与 Terminal.app/iTerm2 行为一致，不篡改 shell
-- **键盘编码**（`kun-core/src/terminal/keys.rs`）：主键盘 **Enter 永远发 `\r`**（应用键盘模式 APP_KEYPAD 只影响数字小键盘 Enter = `ESC O M`，主键盘 Enter 不受影响）——曾误按 APP_KEYPAD 把主键盘 Enter 编码成 `\x1bOM`，而 zsh 在 TERM=xterm-256color 下 zle 自动开启应用键盘模式 → 回车不执行（命令停在命令行）；回归测试 `enter应用键盘模式` 断言 Enter 在 APP_KEYPAD 下仍发 `\r`。方向键按 APP_CURSOR 用 SS3（`ESC O A` 等），Backspace=`\x7f`，Delete=`\x1b[3~`，Shift+Tab=`\x1b[Z`
+- **键盘编码**（`kun-core/src/terminal/keys.rs`）：主键盘 **Enter 永远发 `\r`**（应用键盘模式 APP_KEYPAD 只影响数字小键盘 Enter = `ESC O M`，主键盘 Enter 不受影响）——曾误按 APP_KEYPAD 把主键盘 Enter 编码成 `\x1bOM`，而 zsh 在 TERM=xterm-256color 下 zle 自动开启应用键盘模式 → 回车不执行（命令停在命令行）；回归测试 `enter应用键盘模式` 断言 Enter 在 APP_KEYPAD 下仍发 `\r`。方向键按 APP_CURSOR 用 SS3（`ESC O A` 等），Backspace=`\x7f`，Delete=`\x1b[3~`，Shift+Tab=`\x1b[Z`。**F1-F4 带修饰键的 CSI 修饰形式末尾字母随键递增**（P/Q/R/S = F1-F4，xterm 规范）——曾固定发 `P`，F2-F4 带修饰键时被终端识别为 F1（回归测试 `功能键带修饰键按xterm规范编码`）
 - 终端内容颜色：prompt 彩色来自 shell 主题（如 oh-my-zsh robbyrussell 的绿/青/蓝/黄）
 - 主题背景跟随当前深色主题；`apply_theme` 同步系统深色主题（`ctx.set_theme`）
 - 主题快捷键：⌥1-⌥3 快速切换三套主题
 - **新建连接表单**（`connect_dialog`）：默认用户名 `root`、端口 `22`（`ConnectForm` 手写 `Default`，可修改）；输入框统一走 `form_input` helper——圆角深色底（`bg_elevated`）+ 焦点 accent 边框 + `vertical_align(Center)`（**TextEdit 默认 `Align2::LEFT_TOP` 文字偏上，单行输入框必须居中**）
-- **状态栏快捷键提示**（右下角）：每个提示为圆角深色块（`bg_elevated` 底 + 边框），按键 accent 色 + 动作次要色；快捷键 ⌥1-3（勿写 ⌥1-4）
-- **SFTP 面板**（tabby 形式）：`Panel::right("sftp_panel")` **必须是顶层面板（先于 CentralPanel 注册）**——嵌套在 CentralPanel 内时面板状态会被顶层布局污染，面板错位覆盖终端（表现为"面板打不开"）；**默认收起只显示终端，终端右上角悬浮 `sftp_floating_button`（app.rs 顶层函数，"SFTP" 圆角按钮，点击切换 `TerminalTab.sftp_open`）**；展开用官方 `show_collapsible`（滑动动画，收起后右缘保留细拖拽把手可拖开）；尺寸 `default_size(340)/min_size(260)/max_size(窗口 45%)`——曾 resizable 无上限拖到 ~70% 窗口宽把终端压成窄条，max_size 每帧按 `viewport_rect().width()*0.45` 钳制；`poll_sftp` 处理 `Closed` 事件（连接中断时不能停在"连接中…"），失败写入 `sftp_error` 字段由状态栏**持久显示**（toast 一闪而过易忽略），下次 `start_connect` 清空；**文件列表列布局**（`sftp_view.rs`）：名称列左对齐、大小/时间列右对齐（均 `.halign(egui::Align::LEFT/RIGHT)` 显式声明，避免依赖默认对齐），`new_child` 子 Ui 需 `spacing_mut().item_spacing.x = 0.0` 归零自动间距（否则子项间默认 8px 叠加导致列位错乱），列间距用 add_space 精确控制，名称 `Label::truncate()` 截断；**`cell_width` 必须用 `'0'` 字符宽（数字等宽字体的真实字宽）而非空格宽**——空格 ≈ 0.25em、数字 ≈ 0.6em，用空格宽估算列宽会导致时间列 "2026-08-14" 被截到 "2026-01"（曾用空格宽 + 11 字符列宽只能容 7 字符数字）；大小/时间列宽 12 字符等宽（足够显示 10 字符日期 + 缓冲），名称列 = 总宽 - 12×2 - 12；回归测试 `文件列表列对齐`、`sftp面板默认收起悬浮按钮切换`；kittest 截图布局断言：上传按钮 left > 400（面板在右半侧）、齿轮按钮 right > 400（标签栏最右侧）
+- **状态栏**（底部）：左侧会话状态（状态点 + 会话标题 + SFTP 状态/错误），**右下角快捷键提示块已移除**（曾显示 ⌘B/⌘T/⌘W/⌘N/⌥1-3 五个圆角块，用户要求删除）；主题快捷键 ⌥1-3 仍在（勿写 ⌥1-4）
+- **SFTP 面板**（tabby 形式）：`Panel::right("sftp_panel")` **必须是顶层面板（先于 CentralPanel 注册）**——嵌套在 CentralPanel 内时面板状态会被顶层布局污染，面板错位覆盖终端（表现为"面板打不开"）；**默认收起只显示终端，终端右上角悬浮 `sftp_floating_button`（app.rs 顶层函数，"SFTP" 圆角按钮，点击切换 `TerminalTab.sftp_open`）**；展开用官方 `show_collapsible`（滑动动画，收起后右缘保留细拖拽把手可拖开）；尺寸 `default_size(窗口 40%)/min_size(260)/max_size(窗口 50%)`——曾固定 340px（大窗口下偏窄）与 45% 上限（用户要求 40% 默认、50% 上限）；曾 resizable 无上限拖到 ~70% 窗口宽把终端压成窄条，max_size 每帧按 `viewport_rect().width()*0.50` 钳制；面板 frame 内边距 `Margin::symmetric(12, 10)`；**工具栏三行布局**（`sftp_view.rs`）：①标题行=左 `SFTP · 主机名`（truncate 截断占剩余宽）+ 右缘「刷新」按钮（right_to_left 分居两端，曾与「删除」重叠）②操作行=`horizontal_wrapped` 五按钮（上传/下载/新建目录/重命名/删除，空间不足自动换行——曾单行 horizontal 塞全部按钮，340 宽面板溢出右缘被裁剪）③路径行=「上级」按钮 + 路径 truncate 截断（曾长路径溢出被裁）；按钮统一 `sftp_tool_button` 紧凑样式（11.5px 文字 + bg_elevated 底 + 细边框 + RADIUS_ITEM 圆角）；回归测试 `工具栏按钮不截断不重叠`（340 宽内各按钮 rect 不越界且两两不相交）；`poll_sftp` 处理 `Closed` 事件（连接中断时不能停在"连接中…"），失败写入 `sftp_error` 字段由状态栏**持久显示**（toast 一闪而过易忽略），下次 `start_connect` 清空；**文件列表列布局**（`sftp_view.rs`）：名称列左对齐、大小/时间列右对齐（均 `.halign(egui::Align::LEFT/RIGHT)` 显式声明，避免依赖默认对齐），`new_child` 子 Ui 需 `spacing_mut().item_spacing.x = 0.0` 归零自动间距（否则子项间默认 8px 叠加导致列位错乱），列间距用 add_space 精确控制，名称 `Label::truncate()` 截断；**`cell_width` 必须用 `'0'` 字符宽（数字等宽字体的真实字宽）而非空格宽**——空格 ≈ 0.25em、数字 ≈ 0.6em，用空格宽估算列宽会导致时间列 "2026-08-14" 被截到 "2026-01"（曾用空格宽 + 11 字符列宽只能容 7 字符数字）；大小/时间列宽 12 字符等宽（足够显示 10 字符日期 + 缓冲），名称列 = 总宽 - 12×2 - 12；回归测试 `文件列表列对齐`、`sftp面板默认收起悬浮按钮切换`；kittest 截图布局断言：上传按钮 left > 400（面板在右半侧）、齿轮按钮 right > 400（标签栏最右侧）；**2026-08 面板升级与目录导航**：①标题行加 accent2 状态点（与状态栏同款）②路径改为**圆角"地址条"**（bg_elevated 底 + 细边框 + 内部 truncate）③文件列表**表头行首留 22px 图标位**（`icon_pad`，表头与行共用基准）、行高 22、表头 11px muted ④**".." 行**置顶（点击返回上级目录，文件管理器通用习惯）⑤**行首矢量图标**（`paint_entry_icon`：文件夹 accent2 填充提手+圆角主体、文件细描边轮廓——矢量绘制避免 emoji 字形随字体变化）⑥目录名 text_primary/文件名 text_secondary，选中 accent_soft 底 + 左侧 2px accent 竖条（与主机行一致）、hover 白 8% 叠加 ⑦传输记录用主题语义色（success/danger/accent2）⑧**目录导航 = 单击选中、再次单击已选中的目录进入**（不用 `double_clicked`——egui 多击计数被无关点击污染，双击时灵时不灵）；**行点击必须显式 `ui.interact(row_rect, 稳定 Id, Sense::click())` 且注册在列内容之后**——`allocate_exact_size` 的自动 Id 帧间漂移 + `new_child` 子 Ui 叠加，行点击从未生效（"点击文件夹进不去"的根因，kittest 探针逐步定位：snap_clicked 指向行内容区而非行交互区）；hover 用 `pointer.hover_pos()` 判定（子 Ui 会抢走 `response.hovered()`）；目录进入后 `loading=true` 出现 spinner 持续重绘，相关测试用 `run_steps(6)` 显式步进（`Harness::run()` 会超 max_steps）；回归测试 `单击选中再次单击进入目录`（断言第一次单击只选中无 List 命令、再次单击发 `List("/workspace")`、文件两次单击不导航）、`文件列表列对齐` 已适配 ".." 行（"—" 共 3 个：.. 时间/.. 大小/目录大小）
 
 ## 关键约定
 
-- 集成测试依赖本地测试 sshd：`/usr/sbin/sshd -f /tmp/kun-test-sshd/sshd_config`（端口 2222、公钥认证、含 sftp subsystem）
-- 配置文件：`~/.config/kun/hosts.toml`（toml 中 enum 用内部标记：`[hosts.auth.Key]`）
+- 集成测试依赖本地测试 sshd：`/usr/sbin/sshd -f /tmp/kun-test-sshd/sshd_config`（端口 2222、公钥认证、含 sftp subsystem）；启动方式 `bash scripts/test-sshd.sh start`
+- 配置文件：`~/.config/kun/hosts.toml`（toml 中 enum 用内部标记：`[hosts.auth.Key]`）；**保存走原子写**（先写 `hosts.toml.tmp` 再 rename 覆盖，进程被杀/磁盘满不会截断或清空配置）；**加载失败绝不静默清空**——文件存在但解析失败时先备份为 `hosts.toml.bak` 再按空配置启动并 toast 提示（`KunApp::new_with_config`）
+- **测试绝不能读写用户真实配置**：`KunApp::new` 使用 `default_config_path()`（用户真实 `~/.config/kun/hosts.toml`），涉及配置读写的测试必须走 `KunApp::new_with_config(cc, test_config_path("标签"))`（`/tmp/kun-test-config-{tag}-{pid}.toml` 隔离路径）——**曾发生测试直接 save + remove_file 用户真实 hosts.toml：跑一次 `cargo test` 就覆盖并删除用户主机列表一次（表现为"每次更新新版本后主机全部消失"）**
 - 应用图标：`assets/icon.png`（**渐变紫圆角底 + 白色粗体 "K" 字（居中），四周留 10% 透明边距**，make-icon.swift 绘制，与应用内动态 logo 同构图）→ `load_icon()` 解码为 IconData → `ViewportBuilder::with_icon`——**eframe 在 macOS 上通过 NSApp 运行时设置 Dock 图标**，无 .app bundle 的 debug 构建也能生效；`.app` 安装版的 Dock 图标由 package-macos.sh 的 kun.icns 提供（同一设计）。**图标必须留透明边距：占满画布的无边距图标会被 macOS Dock 放大显示（比邻图标大一圈）**。**make-icon.swift 必须用 `NSBitmapImageRep` 位图上下文渲染（`NSImage.lockFocus` 在 Retina 屏按 2x 渲染导致输出尺寸翻倍）**
 - 字体：Monospace 族 = SF Mono（主）+ **Menlo（符号 fallback）** + STHeiti（CJK）+ egui 默认；Proportional 族 = SF 主 + STHeiti。**SF Mono 缺 `➜`(U+279C)/`❯`(U+276F)/`⚡` 等常用 zsh 提示符符号**，缺字形会被 egui 渲染为 `?` 替换符；Menlo 同为等宽且完整覆盖（宽度一致不漂移），必须排在 CJK fallback 之前。**禁止加载 Apple Color Emoji.ttc**（192MB 彩色位图字体，ab_glyph 无法解析 → egui panic）
 - 提示符 `?➜` 中的 `?` 是 oh-my-zsh robbyrussell 主题 `%1{➜%}` 语法在 zsh 5.9 的真实输出（script 捕获字节流验证：`0x3F E2 9E 9C`），Terminal.app 同样显示，**非 kun 渲染问题，勿尝试"修复"**
@@ -114,7 +126,7 @@ crates/
 ## 验证
 
 ```bash
-cargo test --workspace         # 63 个测试（单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页 + 双击交互 + 表单默认值 + 补全模型/候选 + 补全浮层交互 + 设置弹窗 + scrollback + 完整应用回车）
+cargo test --workspace         # 75 个测试（单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页 + 双击交互 + 表单默认值 + 补全模型/候选 + 补全浮层交互 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单）
 cargo clippy --workspace --all-targets   # 零警告
 cargo fmt --all
 ```

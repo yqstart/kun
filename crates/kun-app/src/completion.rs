@@ -100,10 +100,13 @@ impl InputModel {
     /// 回车：执行当前命令（解析 `cd` 更新 cwd），清空输入。
     pub fn execute(&mut self) {
         // 先提取参数（避免 text 借用与可变借用冲突）。
+        // 前缀判定要求 `cd` 后为空或空白开头——`cdfoo` 是另一个命令，
+        // 不能误判为 `cd foo`。
         let cd_arg = self
             .text
             .trim()
             .strip_prefix("cd")
+            .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
             .map(|r| r.trim().to_string());
         if let Some(arg) = cd_arg {
             self.apply_cd(&arg);
@@ -298,6 +301,26 @@ mod tests {
         m.execute();
         assert_eq!(m.cwd, PathBuf::from(&home));
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn cd前缀词不误判() {
+        // 回归测试：`cdfoo` 等以 cd 开头的命令曾被误判为 `cd foo`。
+        let tmp = std::env::temp_dir();
+        let mut m = InputModel::new(tmp.clone());
+        m.push_text("cdfoo /tmp");
+        m.execute();
+        assert_eq!(m.cwd, tmp, "cdfoo 不是 cd 命令，不应改变工作目录");
+        // `cd` 后带空白才是 cd 命令（cwd 经 canonicalize，macOS 上
+        // /tmp 是 /private/tmp 的符号链接，断言需同样 canonicalize）。
+        let mut m2 = InputModel::new(tmp.clone());
+        m2.push_text("cd   /tmp");
+        m2.execute();
+        assert_eq!(
+            m2.cwd,
+            std::fs::canonicalize("/tmp").unwrap(),
+            "cd 带空白参数应生效"
+        );
     }
 
     #[test]

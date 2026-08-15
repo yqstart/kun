@@ -14,6 +14,10 @@ log = { workspace = true }
 tokio = { workspace = true }
 ureq = "3"
 
+# libc 仅 unix 平台使用（SIGKILL 兜底关闭本地 shell）；Windows 无此概念。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies.russh]
 version = "0.62"
 default-features = false
@@ -26,3 +30,5 @@ version = "2.4"
 
 [dev-dependencies]
 env_logger = "0.11"
+# known_hosts 测试生成临时密钥对（版本与 russh 0.62 的 rand_core 一致）。
+rand = "0.10"

@@ -57,11 +57,26 @@ impl HostConfig {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// 保存配置到文件。
+    /// 保存配置到文件（unix 下强制 0600：配置含明文密码/私钥口令，
+    /// 默认 umask 022 会产生 0644，本机其他用户可读）。
+    ///
+    /// 原子写入：先写临时文件再 rename 覆盖——进程被杀/磁盘满时不会把
+    /// hosts.toml 截断或清空（曾因直接 write 出现主机列表丢失）。
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
         let content = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, content)
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 }
 

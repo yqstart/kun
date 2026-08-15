@@ -9,7 +9,7 @@ use alacritty_terminal::vte::ansi::{Color as AColor, CursorShape, NamedColor, Rg
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, Rect, Stroke, TextFormat, Ui, Vec2};
 use kun_core::terminal::keys::{self, Key, Mods};
-use kun_core::terminal::{Session, SessionEvent, TermMode, TermSize};
+use kun_core::terminal::{Session, SessionEvent, TermMode};
 
 /// 行缓存：内容 hash 未变时复用 LayoutJob，避免每帧重建。
 #[derive(Clone)]
@@ -156,11 +156,8 @@ impl TerminalView {
         if cols as u16 != self.cols || rows as u16 != self.rows {
             self.cols = cols as u16;
             self.rows = rows as u16;
-            // 通知 PTY 调整窗口尺寸。
+            // 通知 PTY 并同步终端状态机网格（Session::resize 内部完成锁内 resize）。
             self.session.resize(self.cols, self.rows);
-            // 同步更新终端状态机的网格。
-            let mut guard = term_arc.lock();
-            guard.resize(TermSize { rows, cols });
             self.rows_cache.clear();
         }
 
@@ -693,8 +690,12 @@ impl TerminalView {
                 self.input.backspace();
                 self.recompute_candidates();
             }
-            // Tab（shell 自身补全）：不改变输入内容。
-            b"\t" => {}
+            // Tab（shell 自身补全/移动光标）：输入行已被 shell 改写（zsh 菜单
+            // 补全会原地扩展命令），模型无法追踪，失效禁用浮层避免给出错候选。
+            b"\t" => {
+                self.input.invalidate();
+                self.candidates.clear();
+            }
             _ => {
                 // 可见文本（ASCII 可打印 / 空格 / 非 ASCII）。
                 if let Ok(s) = std::str::from_utf8(bytes) {
@@ -755,21 +756,23 @@ impl TerminalView {
         let popup_w = 260.0;
         let row_h = 22.0;
         let rows = self.candidates.len().min(8) as f32;
-        let popup_h = rows * row_h + 12.0;
-        // 显示在光标行上方；空间不足时移到光标行下方。
-        // cursor_pos 是光标行底部：上方模式浮层底边 = 光标行顶上方 4px（完全不遮输入行），
-        // 下方模式浮层顶边 = 光标行底下方 4px（紧贴输入行）。
-        let pos = completion_popup_pos(
+        // 估算高度（含行间 item_spacing 与边框/内边距，另加 8px 余量）仅用于
+        // 上下模式判定；实际定位用锚点，与真实渲染高度无关。
+        let popup_h = rows * row_h + (rows - 1.0).max(0.0) * 3.0 + 12.0 + 8.0;
+        // 锚定：上方空间充足时浮层底边固定在光标行顶上方 4px（实际渲染多高都
+        // 向上生长，绝不遮输入行）；不足时顶边固定在光标行底下方 4px。
+        let (anchor, offset) = completion_popup_anchor(
             cursor_pos,
             self.cell_height,
             egui::vec2(popup_w, popup_h),
             inner,
+            ui.ctx().content_rect(),
         );
         egui::Area::new(egui::Id::new("completion_popup"))
             .order(egui::Order::Foreground)
             // 不拦截鼠标交互（interactable 的 Area 会导致终端焦点被释放）。
             .interactable(false)
-            .fixed_pos(pos)
+            .anchor(anchor, offset)
             .show(ui.ctx(), |ui| {
                 egui::Frame::new()
                     .fill(theme.bg_elevated)
@@ -831,26 +834,38 @@ impl TerminalView {
     }
 }
 
-/// 计算补全浮层左上角位置（独立函数便于单测）。
+/// 计算补全浮层的锚定方式（独立函数便于单测）。
 ///
-/// `cursor` 为光标行**底部**坐标；上方空间充足时浮层显示在输入行上方
-/// （底边 = 光标行顶上方 4px，完全不遮输入行），不足时显示在输入行下方
-/// （顶边 = 光标行底下方 4px，紧贴输入行）。x 方向以光标为轴向左偏移并
-/// 限制在终端内容区内。
-fn completion_popup_pos(
+/// `cursor` 为光标行**底部**坐标。返回 `(anchor, offset)`，供 `Area::anchor` 使用
+/// （offset 相对屏幕内容区 `content` 的对应锚角）：
+/// - 上方空间充足时返回 `LEFT_BOTTOM` 锚定：浮层底边固定在光标行顶上方 4px，
+///   实际渲染多高都向上生长，**与浮层真实尺寸无关，绝不遮挡输入行**；
+/// - 不足时返回 `LEFT_TOP` 锚定：顶边固定在光标行底下方 4px，向下生长。
+///
+/// x 方向以光标为轴向左偏移并限制在终端内容区内。
+fn completion_popup_anchor(
     cursor: egui::Pos2,
     cell_height: f32,
     popup_size: egui::Vec2,
     inner: egui::Rect,
-) -> egui::Pos2 {
-    let mut pos = egui::pos2(
-        (cursor.x - popup_size.x * 0.35).clamp(inner.left(), inner.right() - popup_size.x - 4.0),
-        cursor.y - cell_height - popup_size.y - 4.0,
+    content: egui::Rect,
+) -> (egui::Align2, egui::Vec2) {
+    let x = (cursor.x - popup_size.x * 0.35).clamp(
+        inner.left(),
+        (inner.right() - popup_size.x - 4.0).max(inner.left()),
     );
-    if pos.y < inner.top() {
-        pos.y = cursor.y + 4.0;
+    if cursor.y - cell_height - popup_size.y - 4.0 >= inner.top() {
+        // 上方模式：浮层底边锚定在光标行顶上方 4px。
+        let offset = egui::vec2(
+            x - content.left(),
+            (cursor.y - cell_height - 4.0) - content.bottom(),
+        );
+        (egui::Align2::LEFT_BOTTOM, offset)
+    } else {
+        // 下方模式：浮层顶边锚定在光标行底下方 4px。
+        let offset = egui::vec2(x - content.left(), (cursor.y + 4.0) - content.top());
+        (egui::Align2::LEFT_TOP, offset)
     }
-    pos
 }
 
 /// 一帧内的终端输入动作（闭包内收集，闭包外统一应用到补全模型）。
@@ -1161,6 +1176,69 @@ mod tests {
         if let Some(t) = text {
             harness.event(egui::Event::Text(t.to_string()));
         }
+    }
+
+    /// 渲染级回归：光标在视口底行输入时，浮层实际渲染矩形不得遮挡输入行
+    /// （曾因浮层高度估算漏算行间距，底边侵入输入行约 15px）。
+    #[test]
+    fn 浮层实际渲染不遮输入行() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        assert!(
+            wait_text(&view, &mut harness, "kun"),
+            "zsh 未就绪，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+
+        // 输出足够多行让光标到视口底行。
+        view.borrow().session().write(b"seq 40\r");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            harness.step();
+            if grid_text(view.borrow().session())
+                .lines()
+                .any(|l| l.trim_end() == "40")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+
+        // 输入 "l" 触发补全候选（最多 8 条）。
+        send_key(&mut harness, egui::Key::L, Some("l"));
+        for _ in 0..6 {
+            harness.step();
+        }
+
+        let (n, cursor_pos, cell_height) = {
+            let v = view.borrow();
+            (v.candidates.len(), v.cursor_pos, v.cell_height)
+        };
+        assert!(n > 0, "输入 l 后应有补全候选");
+
+        let popup_rect = harness
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::new("completion_popup")));
+        let cursor = cursor_pos.expect("光标位置未记录");
+        let input_row = egui::Rect::from_min_max(
+            egui::pos2(0.0, cursor.y - cell_height),
+            egui::pos2(5000.0, cursor.y),
+        );
+        let pr = popup_rect.expect("浮层未渲染（area_rect 为 None）");
+        assert!(
+            !pr.intersects(input_row),
+            "浮层盖住输入行：浮层 {pr:?} 与输入行 {input_row:?} 相交"
+        );
     }
 
     /// 退格键应删除已输入字符（回归测试：曾出现删除键异常）。
@@ -1682,69 +1760,74 @@ mod ime_backspace_tests {
 
 #[cfg(test)]
 mod completion_popup_tests {
-    use super::completion_popup_pos;
+    use super::completion_popup_anchor;
 
     /// 内边距后的终端内容区（800x600 面板去 PADDING）。
     fn inner() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0))
     }
 
-    /// 3 条候选的浮层尺寸（3 * 22 + 12）。
-    fn popup() -> egui::Vec2 {
-        egui::vec2(260.0, 78.0)
+    /// 屏幕内容区（含标签栏高度，与 ctx.content_rect 同构）。
+    fn content() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 560.0))
     }
 
-    /// 输入行在视口中部：浮层显示在输入行上方，且完全不遮输入行
-    /// （底边 ≤ 光标行顶上方 4px；回归测试：曾向下偏移一整行盖住输入行底部）。
+    /// 3 条候选的浮层尺寸（3 * 22 + 2 * 3 + 12 + 8）。
+    fn popup() -> egui::Vec2 {
+        egui::vec2(260.0, 86.0)
+    }
+
+    /// 输入行在视口中部：上方模式，浮层底边锚定在光标行顶上方 4px。
     #[test]
     fn 输入行在中部浮层在上方() {
         let cursor = egui::pos2(120.0, 160.0); // 光标行底部（第 10 行）
-        let pos = completion_popup_pos(cursor, 16.0, popup(), inner());
+        let (anchor, offset) = completion_popup_anchor(cursor, 16.0, popup(), inner(), content());
+        assert_eq!(anchor, egui::Align2::LEFT_BOTTOM, "空间充足应用上方模式");
         assert_eq!(
-            pos.y,
-            160.0 - 16.0 - 78.0 - 4.0,
-            "浮层底边应在光标行顶上方 4px"
-        );
-        assert!(
-            pos.y + 78.0 <= cursor.y - 16.0 - 4.0,
-            "浮层不得遮挡输入行（底边 {} > 输入行顶上方 4px {}）",
-            pos.y + 78.0,
-            cursor.y - 16.0 - 4.0
+            content().bottom() + offset.y,
+            160.0 - 16.0 - 4.0,
+            "浮层底边应锚定在光标行顶上方 4px"
         );
     }
 
-    /// 输入行在视口顶部（上方放不下）：浮层移到输入行下方紧贴，不遮输入行。
+    /// 输入行在视口顶部（上方放不下）：下方模式，顶边锚定在光标行底下方 4px。
     #[test]
     fn 输入行在顶部浮层在下方() {
-        let cursor = egui::pos2(120.0, 32.0); // 第 2 行底，上方仅 1 行
-        let pos = completion_popup_pos(cursor, 16.0, popup(), inner());
+        let cursor = egui::pos2(120.0, 42.0); // 内容区第 1 行底
+        let (anchor, offset) = completion_popup_anchor(cursor, 16.0, popup(), inner(), content());
+        assert_eq!(anchor, egui::Align2::LEFT_TOP, "上方放不下应用下方模式");
         assert_eq!(
-            pos.y,
-            cursor.y + 4.0,
-            "下方模式浮层顶边应紧贴输入行底下方 4px"
-        );
-        assert!(
-            pos.y >= cursor.y + 4.0,
-            "浮层不得遮挡输入行（顶边 {} < 光标行底 {}）",
-            pos.y,
-            cursor.y
+            content().top() + offset.y,
+            42.0 + 4.0,
+            "浮层顶边应锚定在光标行底下方 4px"
         );
     }
 
     /// 上方空间恰好放得下（浮层顶边 == 终端顶）时仍用上方模式。
     #[test]
     fn 上方空间恰好放得下() {
-        let cursor = egui::pos2(120.0, 98.0); // 98 - 16 - 78 - 4 = 0 == inner.top()
-        let pos = completion_popup_pos(cursor, 16.0, popup(), inner());
-        assert_eq!(pos.y, 0.0, "恰好放得下时应保持上方模式");
+        // 106 - 16 - 86 - 4 = 0 == inner.top()
+        let cursor = egui::pos2(120.0, 106.0);
+        let (anchor, _) = completion_popup_anchor(cursor, 16.0, popup(), inner(), content());
+        assert_eq!(
+            anchor,
+            egui::Align2::LEFT_BOTTOM,
+            "恰好放得下时应保持上方模式"
+        );
     }
 
     /// x 方向限制在终端内容区内（光标靠边时浮层不越界）。
     #[test]
     fn 浮层x方向不越界() {
-        let left = completion_popup_pos(egui::pos2(0.0, 160.0), 16.0, popup(), inner());
-        assert_eq!(left.x, 0.0, "浮层不得超出内容区左缘");
-        let right = completion_popup_pos(egui::pos2(800.0, 160.0), 16.0, popup(), inner());
-        assert_eq!(right.x, 800.0 - 260.0 - 4.0, "浮层不得超出内容区右缘");
+        let left =
+            completion_popup_anchor(egui::pos2(0.0, 160.0), 16.0, popup(), inner(), content());
+        assert_eq!(content().left() + left.1.x, 0.0, "浮层不得超出内容区左缘");
+        let right =
+            completion_popup_anchor(egui::pos2(800.0, 160.0), 16.0, popup(), inner(), content());
+        assert_eq!(
+            content().left() + right.1.x,
+            800.0 - 260.0 - 4.0,
+            "浮层不得超出内容区右缘"
+        );
     }
 }

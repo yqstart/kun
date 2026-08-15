@@ -181,9 +181,11 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
         Key::Insert => Some(b"\x1b[2~".to_vec()),
         Key::Delete => Some(b"\x1b[3~".to_vec()),
         // 功能键：F1-F4 用 SS3，F5-F12 用 CSI；带修饰键时用 CSI 修饰形式。
+        // 修饰形式末尾字母按 xterm 规范随键递增（P/Q/R/S = F1-F4）——
+        // 曾固定发 'P'，导致 F2-F4 带修饰键时被终端识别为 F1。
         Key::F(n) => Some(match n {
             1..=4 if mods.shift || mods.alt || mods.ctrl => {
-                format!("\x1b[1;{}P", mods.csi_modifier()).into_bytes()
+                format!("\x1b[1;{}{}", mods.csi_modifier(), (b'P' + (n - 1)) as char).into_bytes()
             }
             1 => b"\x1bOP".to_vec(),
             2 => b"\x1bOQ".to_vec(),
@@ -303,6 +305,36 @@ mod tests {
         assert_eq!(
             encode_key(Key::F(5), no_mods(), TermMode::NONE).unwrap(),
             b"\x1b[15~"
+        );
+    }
+
+    #[test]
+    fn 功能键带修饰键按xterm规范编码() {
+        // 回归测试：F2-F4 带修饰键曾固定发 'P'（F1 的末尾字母），
+        // 终端把 F2-F4 全识别为 F1。xterm 规范末尾字母随键递增。
+        let shift = Mods {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(Key::F(1), shift, TermMode::NONE).unwrap(),
+            b"\x1b[1;2P"
+        );
+        assert_eq!(
+            encode_key(Key::F(2), shift, TermMode::NONE).unwrap(),
+            b"\x1b[1;2Q"
+        );
+        assert_eq!(
+            encode_key(Key::F(3), shift, TermMode::NONE).unwrap(),
+            b"\x1b[1;2R"
+        );
+        let ctrl = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(Key::F(4), ctrl, TermMode::NONE).unwrap(),
+            b"\x1b[1;5S"
         );
     }
 }

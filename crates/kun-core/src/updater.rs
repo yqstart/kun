@@ -104,6 +104,7 @@ fn asset_url_for(repo: &str, tag: &str, version: &str, arch: &str) -> String {
 /// 下载资产到本地文件，并持续回调 `(已下载字节, 总字节)`。
 ///
 /// GitHub 的下载直链会 302 到 S3，ureq 默认跟随重定向。
+/// 失败时清理半成品文件（不残留损坏的 dmg 误导安装）。
 pub fn download_asset(
     url: &str,
     dest: &std::path::Path,
@@ -111,45 +112,51 @@ pub fn download_asset(
 ) -> Result<(), String> {
     use std::io::{Read, Write};
 
-    let agent = make_agent();
-    let mut response = agent
-        .get(url)
-        .header("User-Agent", "kun-updater")
-        .call()
-        .map_err(|e| format!("下载请求失败：{e}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("下载失败：HTTP {status}"));
-    }
-
-    let total = response
-        .headers()
-        .get("Content-Length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
-    }
-    let mut file = std::fs::File::create(dest).map_err(|e| format!("创建文件失败：{e}"))?;
-    let mut reader = response.body_mut().as_reader();
-    let mut buf = [0u8; 256 * 1024];
-    let mut downloaded: u64 = 0;
-    on_progress(0, total);
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("下载中断：{e}"))?;
-        if n == 0 {
-            break;
+    let result = (|| -> Result<(), String> {
+        let agent = make_agent();
+        let mut response = agent
+            .get(url)
+            .header("User-Agent", "kun-updater")
+            .call()
+            .map_err(|e| format!("下载请求失败：{e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("下载失败：HTTP {status}"));
         }
-        file.write_all(&buf[..n])
-            .map_err(|e| format!("写入文件失败：{e}"))?;
-        downloaded += n as u64;
-        on_progress(downloaded, total);
+
+        let total = response
+            .headers()
+            .get("Content-Length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
+        }
+        let mut file = std::fs::File::create(dest).map_err(|e| format!("创建文件失败：{e}"))?;
+        let mut reader = response.body_mut().as_reader();
+        let mut buf = [0u8; 256 * 1024];
+        let mut downloaded: u64 = 0;
+        on_progress(0, total);
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| format!("下载中断：{e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("写入文件失败：{e}"))?;
+            downloaded += n as u64;
+            on_progress(downloaded, total);
+        }
+        file.sync_all().map_err(|e| format!("落盘失败：{e}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
     }
-    file.sync_all().map_err(|e| format!("落盘失败：{e}"))?;
-    Ok(())
+    result
 }
 
 /// 解析 releases.atom 首个 `<entry>`（GitHub 按发布时间倒序，首个即最新）。

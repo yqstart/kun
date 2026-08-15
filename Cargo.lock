@@ -2856,7 +2856,7 @@ dependencies = [
 
 [[package]]
 name = "kun-app"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "accesskit",
  "alacritty_terminal",
@@ -2877,11 +2877,13 @@ dependencies = [
 
 [[package]]
 name = "kun-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "alacritty_terminal",
  "env_logger",
+ "libc",
  "log",
+ "rand 0.10.2",
  "russh",
  "russh-sftp",
  "serde",

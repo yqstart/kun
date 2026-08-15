@@ -52,8 +52,19 @@ fn wait_event(
     Err(format!("等待事件超时，已收到：{seen:?}"))
 }
 
+/// 将测试 sshd 的 known_hosts 记录与 hostkey 放在同一目录（/tmp/kun-test-sshd）：
+/// hostkey 随 /tmp 清理重建时指纹记录一并消失，避免旧指纹不匹配导致测试失败。
+/// `call_once` 保证进程内只设置一次（测试并行安全）。
+static KNOWN_HOSTS_INIT: std::sync::Once = std::sync::Once::new();
+fn init_test_env() {
+    KNOWN_HOSTS_INIT.call_once(|| {
+        std::env::set_var("KUN_KNOWN_HOSTS", "/tmp/kun-test-sshd/known_hosts.toml");
+    });
+}
+
 #[test]
 fn sftp_完整操作流程() {
+    init_test_env();
     let profile = test_profile();
     if let Auth::Key { path, .. } = &profile.auth {
         if !path.exists() {

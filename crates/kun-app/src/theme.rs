@@ -1,7 +1,7 @@
 //! 主题与配色。
 //!
-//! 视觉体系参照 Warp 终端：深灰近黑的分层背景、极淡半透明边线、
-//! 紫青品牌渐变、圆角卡片与克制的高亮。三套深色皮肤共用同一套结构。
+//! 视觉体系参照 Tabby 终端：深蓝灰分层背景、极淡半透明边线、扁平控件、
+//! 低对比 hover 高亮、小圆角与紧凑排版。三套深色皮肤共用同一套结构。
 
 use alacritty_terminal::vte::ansi::Rgb;
 use egui::{Color32, Context, CornerRadius, Stroke, Visuals};
@@ -10,32 +10,33 @@ use egui::{Color32, Context, CornerRadius, Stroke, Visuals};
 pub mod tokens {
     use egui::Color32;
 
-    // ==================== 背景分层 ====================
-    pub const BG_APP: Color32 = Color32::from_rgb(0x0e, 0x0e, 0x11);
-    pub const BG_HEADER: Color32 = Color32::from_rgb(0x15, 0x15, 0x19);
-    pub const BG_PANEL: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x20);
-    pub const BG_ELEVATED: Color32 = Color32::from_rgb(0x24, 0x24, 0x2c);
-    pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x0b, 0x0b, 0x0f);
+    // ==================== 背景分层（Tabby 蓝灰基调） ====================
+    pub const BG_APP: Color32 = Color32::from_rgb(0x0e, 0x15, 0x1d);
+    pub const BG_HEADER: Color32 = Color32::from_rgb(0x0a, 0x10, 0x17);
+    pub const BG_PANEL: Color32 = Color32::from_rgb(0x16, 0x20, 0x2b);
+    pub const BG_ELEVATED: Color32 = Color32::from_rgb(0x1d, 0x27, 0x2d);
+    pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x0b, 0x10, 0x16);
 
     pub const BORDER_SUBTLE: Color32 =
-        Color32::from_rgba_unmultiplied_const(0xff, 0xff, 0xff, 0x10);
+        Color32::from_rgba_unmultiplied_const(0xff, 0xff, 0xff, 0x18);
 
-    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xf4, 0xf4, 0xf6);
-    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xbc, 0xbc, 0xc4);
-    pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x80, 0x80, 0x8a);
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xe2, 0xe9, 0xf0);
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xb3, 0xc0, 0xcc);
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x6e, 0x7d, 0x8c);
 
-    pub const ACCENT: Color32 = Color32::from_rgb(0x8b, 0x5c, 0xf6);
-    pub const ACCENT_2: Color32 = Color32::from_rgb(0x22, 0xd3, 0xee);
-    pub const ACCENT_SOFT: Color32 = Color32::from_rgba_unmultiplied_const(0x8b, 0x5c, 0xf6, 0x26);
+    // 强调蓝（Tabby 激活态 #4fadff 系）+ 青蓝辅助。
+    pub const ACCENT: Color32 = Color32::from_rgb(0x4f, 0x9d, 0xf5);
+    pub const ACCENT_2: Color32 = Color32::from_rgb(0x5b, 0xc0, 0xde);
+    pub const ACCENT_SOFT: Color32 = Color32::from_rgba_unmultiplied_const(0x4f, 0x9d, 0xf5, 0x26);
     pub const ACCENT_FG: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
-    pub const FOCUS_RING: Color32 = Color32::from_rgba_unmultiplied_const(0x8b, 0x5c, 0xf6, 0x80);
+    pub const FOCUS_RING: Color32 = Color32::from_rgba_unmultiplied_const(0x4f, 0x9d, 0xf5, 0x80);
 
-    pub const SUCCESS: Color32 = Color32::from_rgb(0x34, 0xd3, 0x99);
-    pub const WARNING: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
-    pub const DANGER: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
+    pub const SUCCESS: Color32 = Color32::from_rgb(0x5c, 0xb8, 0x5c);
+    pub const WARNING: Color32 = Color32::from_rgb(0xf0, 0xad, 0x4e);
+    pub const DANGER: Color32 = Color32::from_rgb(0xd9, 0x53, 0x4f);
 
-    pub const RADIUS_SM: f32 = 8.0;
-    pub const RADIUS_ITEM: f32 = 7.0;
+    pub const RADIUS_SM: f32 = 6.0;
+    pub const RADIUS_ITEM: f32 = 5.0;
 }
 
 // ==================== 终端调色板（Catppuccin Mocha 基准） ====================
@@ -123,19 +124,19 @@ pub const TERM_PALETTE_16: [Rgb; 16] = [
 ];
 
 pub const TERM_FG: Rgb = Rgb {
-    r: 0xd8,
-    g: 0xda,
-    b: 0xe5,
+    r: 0xd5,
+    g: 0xdc,
+    b: 0xe4,
 };
 pub const TERM_BG: Rgb = Rgb {
     r: 0x0b,
-    g: 0x0b,
-    b: 0x0f,
+    g: 0x10,
+    b: 0x16,
 };
 pub const TERM_CURSOR: Rgb = Rgb {
-    r: 0xb4,
-    g: 0xa6,
-    b: 0xff,
+    r: 0xf2,
+    g: 0xf5,
+    b: 0xf8,
 };
 
 /// xterm 256 色表（16 基本 + 216 立方色 + 24 灰阶）。
@@ -227,8 +228,10 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, theme.text_primary);
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, theme.border);
 
-    visuals.widgets.hovered.bg_fill = theme.accent_soft;
-    visuals.widgets.hovered.weak_bg_fill = theme.accent_soft;
+    // Tabby 风 hover：白色低透明度叠加（而非强调色底），克制朴素。
+    let hover_overlay = Color32::from_rgba_unmultiplied(255, 255, 255, 20);
+    visuals.widgets.hovered.bg_fill = hover_overlay;
+    visuals.widgets.hovered.weak_bg_fill = hover_overlay;
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, theme.text_primary);
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::TRANSPARENT);
 
@@ -241,21 +244,21 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, theme.border);
 
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.button_padding = egui::vec2(9.0, 4.0);
     style.spacing.interact_size = egui::vec2(28.0, 24.0);
 
-    visuals.window_corner_radius = CornerRadius::same(12);
+    visuals.window_corner_radius = CornerRadius::same(10);
     visuals.window_shadow = egui::Shadow {
-        offset: [0, 10],
-        blur: 32,
+        offset: [0, 6],
+        blur: 24,
         spread: 0,
-        color: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0xc0),
+        color: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0xb0),
     };
     visuals.popup_shadow = egui::Shadow {
-        offset: [0, 6],
-        blur: 20,
+        offset: [0, 4],
+        blur: 16,
         spread: 0,
-        color: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0xa0),
+        color: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0x90),
     };
 
     // 所有可点击控件 hover 时显示小手光标（egui 默认不设置；
