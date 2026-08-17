@@ -29,10 +29,11 @@ crates/
     ├── src/main.rs           # 入口 + 字体加载（SF Mono + CJK fallback）+ 圆角注入
     ├── src/native.rs         # macOS 原生窗口定制（无边框窗口整体圆角，AppKit layer）
     ├── src/app.rs            # KunApp：tabs 列表 + 设置弹窗（show_settings）+ 布局/连接管理/对话框/快捷键
-    ├── src/theme.rs          # Dracula 深色主题
+    ├── src/perf.rs           # 性能 HUD（帧耗时/FPS/分段打点统计，⌥P 切换）
+    ├── src/theme.rs          # 三套深色主题
     └── src/views/
-        ├── terminal_view.rs  # cell 渲染（增量 hash 缓存）、输入转发、滚动
-        └── sftp_view.rs      # 文件面板：列表/导航/传输进度/确认对话框
+        ├── terminal_view.rs  # cell 渲染（行级增量 + Galley 缓存）、输入转发、滚动
+        └── sftp_view.rs      # 文件面板：列表（show_rows 虚拟化）/导航/传输进度/确认对话框
 ```
 
 ## 核心数据流
@@ -45,12 +46,27 @@ crates/
 - 写操作：本地走 `EventLoopSender`，远程走命令队列（UI 线程非阻塞）
 - 渲染：UI 锁 `FairMutex<Term>` → `renderable_content()` → 逐行 hash 缓存 LayoutJob（增量重建）
 
+### 终端渲染（v0.7 起为行级增量，`terminal_view.rs`）
+
+- **行级增量核心**：每帧锁内先 `Term::damage()` 收集损坏行 + `reset_damage()`（必须同一持锁内），再 `renderable_content()` 拿 display_offset/cursor/colors。**damage 返回行号 = 网格行号 + display_offset = 显示行号**（`TermDamageIterator` 内部 `line.line + display_offset`），直接用 `damaged.contains(&v)` 判断显示行 v 是否需重建
+- **显示行 ↔ 网格行映射**：显示行 v ↔ 网格行 `Line(v - display_offset)`（display_iter 同语义：每个网格行一个显示行，wrap 续行独立成行）。按此映射直接 `grid[Line(g)]` 读单行 cell（负行号 scrollback 行用 `Line::from(0) - n` 构造，`Line` tuple 构造器不公开）
+- **行缓存 = `HashMap<i32 网格行号, RowCache>`**：`RowCache { hash, galley: Arc<Galley>, backgrounds }`——按网格行号索引，滚动后同一网格行直接命中（滚动只重建滚入的新行）。命中行绘制直接 `painter.galley(缓存 Arc clone)`，**完全跳过 layout_job**（曾每行每帧 `fonts_mut` 写锁 + 整行文本 hash）
+- **hash 指纹**：fg+bg+样式+字符（`CellStyle::key` 含 bg 色），不含光标效果——**光标行不再反色 swap**（Block 光标最终被光标色实心矩形覆盖，反色不可见，视觉等价），光标移动/闪烁不触发行重建
+- **内容未变行跳过 layout**：损坏行重建后若 `hash == 缓存 hash`（如光标行被标记但文本没变）跳过 layout 复用旧 Galley
+- **pixels_per_point 失效**：Galley 与 ppp 绑定，每帧读 `ctx.pixels_per_point()`，变化时清空全部缓存（跨屏缩放）
+- **cell 尺寸缓存**：`glyph_width/row_height` 只查一次（字体启动后不变），不每帧 fonts_mut
+- **缓存上限**：`rows_cache.len() > rows*4` 时只保留当前可见网格行（滚动浏览大量历史防无限增长）
+- **单锁化**：光标形状 `cursor_style()` 在第一次锁内读取（曾帧内二次上锁）
+- **Wakeup 单次 repaint**：drain_events 不再对 Wakeup 二次 request（kun-core `Listener::send_event` 已直接调 on_event=request_repaint）
+- 性能验证：idle 帧（无内容变化）构建耗时 0.03ms（此前全量扫描 0.5-2ms，降 15-60 倍）
+
 ### 基础补全（`kun-app/src/completion.rs`，Warp 风格）
 
 - 仅本地会话启用（远程无本机文件系统对应）；`InputModel` 跟踪输入行（与写入 PTY 的字节同步：可见文本追加、退格删尾、`\r` 执行并解析 `cd` 更新 cwd、Ctrl+C 重置、箭头/编辑键使模型失效、**Tab（shell 自身补全会原地改写输入行）也使模型失效**）
 - **`cd` 解析的前缀判定**：`strip_prefix("cd")` 后必须为空或以空白开头——`cdfoo` 是另一个命令，不能误判为 `cd foo`（回归测试 `cd前缀词不误判`）
 - 候选：命令位置匹配 PATH 可执行文件（`command_index()` OnceLock 懒扫描，只收有执行位的文件）；其余匹配 cwd 文件/目录（含 `~/` 展开与子路径），目录补 `/` 后缀
-- 浮层（`terminal_view.rs::render_completion_popup`）：光标行上方 Area 列表（命令 accent2/目录 accent/文件次要色），Tab 确认（按字符退格替换 word 后写 PTY）、↑/↓ 选择、Esc 关闭；输入变化即时重算（最多 8 条）。**定位用 `Area::anchor` 锚定（`completion_popup_anchor` 纯函数算锚点/offset）：`cursor_pos` 为光标行底部，上方空间充足时 `LEFT_BOTTOM` 锚定浮层底边 = 光标行顶上方 4px、不足时 `LEFT_TOP` 锚定顶边 = 光标行底下方 4px——锚角固定、内容向另一侧生长，浮层真实渲染高度（行间 item_spacing 等）不再影响定位，绝不遮输入行（回归测试：曾用 fixed_pos + 高度估算，漏算行间距致底边侵入输入行 15px）**
+- **候选计算去抖（v0.7）**：命令候选是内存索引扫描，按键立即算；路径候选（`read_dir` + 逐项 `metadata()` 同步 syscall，大目录卡顿）**去抖 120ms**——连续打字只重算一次，去抖期间 `recompute_pending` 挂起由 show() 到点执行（`request_repaint_after` 驱动）；另带同输入快照跳过（`last_recompute_text`，退格恢复场景不重复 read_dir）。kittest 的 `step()` 不推进虚拟时间且真实时间 < 120ms，命令候选路径（测试输入 "ca"）不受影响
+- 浮层（`terminal_view.rs::render_completion_popup`）：光标行上方 Area 列表（命令 accent2/目录 accent/文件次要色），Tab 确认（按字符退格替换 word 后写 PTY）、↑/↓ 选择、Esc 关闭；输入变化重算（最多 8 条，命令即时/路径去抖 120ms，见上）。**定位用 `Area::anchor` 锚定（`completion_popup_anchor` 纯函数算锚点/offset）：`cursor_pos` 为光标行底部，上方空间充足时 `LEFT_BOTTOM` 锚定浮层底边 = 光标行顶上方 4px、不足时 `LEFT_TOP` 锚定顶边 = 光标行底下方 4px——锚角固定、内容向另一侧生长，浮层真实渲染高度（行间 item_spacing 等）不再影响定位，绝不遮输入行（回归测试：曾用 fixed_pos + 高度估算，漏算行间距致底边侵入输入行 15px）**
 - 键盘拦截在 `handle_input` 的 Key 分支（菜单打开时 Tab/↑/↓/Esc 不转发 shell）；输入动作用 `InputAction` 枚举在 ui.input 闭包内收集、闭包外统一应用（闭包内 `session` 不可变借用，无法直接改 self）
 - **egui 0.36 焦点坑：Text/Key 事件帧后终端焦点可能被清除（`Memory::end_pass` dead-man-switch，kittest 必现）**——`TerminalView` 维护 `had_focus`，曾聚焦且当前 `focused().is_none()` 时每帧 `request_focus` 恢复（对话框输入框后渲染覆盖，不冲突）
 
@@ -62,6 +78,10 @@ crates/
 - **传输失败清理半成品**：下载失败删本地半成品文件、上传失败删远程半成品（不残留截断文件误导用户）
 - **文件时间列**：`format_time` 用 civil_from_days 公版算法精确换算 UTC 日期（曾用 `天/365 + 天%365/30` 近似，月长不均/闰年导致日期错位）；测试断言已知时间戳（0=1970-01-01、951782400=2000-02-29 闰日、1800000000=2027-01-15）
 - **SFTP 主机名绑定在连接上**（`pending_sftp/ready_sftp` 元组携带 host label）：状态栏从 `tab.sftp.host_name()` 读取——曾用全局 `sftp_host` 字段，多远程标签共存时状态栏串台成"最后一次连接的主机名"
+- **文件列表虚拟化（v0.7）**：`ScrollArea::vertical().show_rows(ui, row_h, total_rows, ...)` 只构建可见行（index 0 = ".." 上级行，其余 = entries）——千级目录不再每帧全量构建 String/RichText/Label/子 Ui（曾每帧遍历全部 entries）；表头固定在滚动区外不滚动；行渲染抽成 `render_list_row`（导航/选中动作写入 `open_dir`/`select` 闭包外统一应用，避免借用冲突）；`show_rows` 闭包内必须 `item_spacing.y = 0.0`（行高由 show_rows 精确分配）
+- **事件驱动重绘（v0.7）**：`poll_events()` 返回是否收到新事件，show() 收到后 `request_repaint()`——传输进度/列表刷新不再依赖其它重绘源（曾面板自身从不 request_repaint，传输中进度条不刷新）
+- **cell_width 缓存（v0.7）**：'0' 字符宽首次查询后缓存到字段（字体启动后不变），不再每帧 `fonts_mut`（Context 写锁）
+- **加载指示静态化（v0.7）**：`ui.spinner()` 替换为静态圆点 + 文字（egui Spinner 内部每帧 `request_repaint` 强制 60fps 全帧重绘）
 
 ### 连接生命周期
 
@@ -87,7 +107,7 @@ crates/
 - **display_iter 行号是网格坐标**（alacritty `grid/mod.rs::display_iter`）：viewport 顶行为 0，向上滚动后可见的 scrollback 行是**负行号**（`Line(-(display_offset)-1)`）。渲染循环必须用相对视口顶行的显示行号（换行时计数），**严禁 `point.line.0 as usize`**——负行号 cast 成 usize::MAX 级巨值，`rows_cache.resize` 直接 `capacity overflow` 闪退（offset=1 时则是 index 越界）；光标定位同样需换算：显示行 = 光标网格行 + `display_offset`。回归测试：`滚动scrollback后渲染不崩溃`
 - 主机条目（设置弹窗 → 主机管理卡片内）：单击选中、双击连接；样式：**accent 圆形头像（主机名首字符）+ 名称（超长截断不换行）+ 🗑 删除图标**（行右缘，hover 红底）；**行点击区横向扩展到面板可用宽度**（`row_rect`），短名称主机也能整行点击
 - **egui 0.36 交互坑：`Response::interact()`（scope_builder(...).response.interact(...)）的点击无法命中**（响应链问题，kittest 实测 clicked/hovered 恒 false）——必须用 `ui.interact(rect, id, sense)` 显式注册交互区，删除按钮等行内控件最后注册以覆盖行点击区
-- 终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）在渲染层解析（`theme.rs::TERM_PALETTE_16`/`xterm256`），优先级：Spec > OSC 覆盖（term.colors）> 内置调色板；`Term.colors` 默认全 None，不设调色板则全部渲染为白色
+- 终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）在渲染层解析（`theme.rs::TERM_PALETTE_16`/`xterm256`），优先级：Spec > OSC 覆盖（term.colors）> 内置调色板；`Term.colors` 默认全 None，不设调色板则全部渲染为白色；**v0.7：xterm256 固定部分（index ≥ 16）用 `XTERM_FIXED` OnceLock 查表**（曾逐 cell 现算乘除，全彩色屏每帧上万次算术）
 - 选中主机条目左侧 2px accent 竖条；标签页底部有选中指示条（白色细线，宽度动画，Tabby current-tab-indicator）
 - **标签页（tab）无双边框**：tab 内容用无边框透明 `Button`（`selectable_label` 选中自带边框，与手绘高亮叠加会成"双重框"），高亮只有一层手绘——**激活 tab 用面板色（`bg_panel`）凸起底 + 底部白色指示条，hover 用白 8% 叠加**（Tabby 风：标签栏比激活 tab 深一级）。**选中底必须画在内容之前**：用 `egui::Frame`（fill=bg_panel 随 sel_alpha 动画、inner_margin(2,3)）+ `.show()` 包住 tab 内容（Frame 先铺底再放内容）——曾把不透明面板色 `painter.rect_filled` 画在内容之后（同一 layer 后画在上），激活 tab 文字被整块盖住完全不可见（像素扫描验证：除底部指示条外无任何文字像素）；hover 白 8% 叠加是极淡提亮，画在内容之后无害
 - **三套深色主题**（`theme.rs::THEMES`）：深色（Tabby 蓝灰）/ 深蓝 / 霓虹；每套含 UI token + 终端调色板（16 色 + fg/bg/cursor）；`current_theme()` 静态读取，**设置弹窗 → 外观卡片**切换（`set_theme`）——ComboBox 选当前主题名（**勿用 ◐ 等 unicode 符号作为图标，SF 字体缺字形渲染为方块**）
@@ -110,7 +130,9 @@ crates/
 - 主题快捷键：⌥1-⌥3 快速切换三套主题
 - **新建连接表单**（`connect_dialog`）：默认用户名 `root`、端口 `22`（`ConnectForm` 手写 `Default`，可修改）；输入框统一走 `form_input` helper——圆角深色底（`bg_elevated`）+ 焦点 accent 边框 + `vertical_align(Center)`（**TextEdit 默认 `Align2::LEFT_TOP` 文字偏上，单行输入框必须居中**）
 - **状态栏**（底部）：左侧会话状态（状态点 + 会话标题 + SFTP 状态/错误），**右下角快捷键提示块已移除**（曾显示 ⌘B/⌘T/⌘W/⌘N/⌥1-3 五个圆角块，用户要求删除）；主题快捷键 ⌥1-3 仍在（勿写 ⌥1-4）
-- **SFTP 面板**（tabby 形式）：`Panel::right("sftp_panel")` **必须是顶层面板（先于 CentralPanel 注册）**——嵌套在 CentralPanel 内时面板状态会被顶层布局污染，面板错位覆盖终端（表现为"面板打不开"）；**默认收起只显示终端，终端右上角悬浮 `sftp_floating_button`（app.rs 顶层函数，"SFTP" 圆角按钮，点击切换 `TerminalTab.sftp_open`）**；展开用官方 `show_collapsible`（滑动动画，收起后右缘保留细拖拽把手可拖开）；尺寸 `default_size(窗口 40%)/min_size(260)/max_size(窗口 50%)`——曾固定 340px（大窗口下偏窄）与 45% 上限（用户要求 40% 默认、50% 上限）；曾 resizable 无上限拖到 ~70% 窗口宽把终端压成窄条，max_size 每帧按 `viewport_rect().width()*0.50` 钳制；面板 frame 内边距 `Margin::symmetric(12, 10)`；**工具栏三行布局**（`sftp_view.rs`）：①标题行=左 `SFTP · 主机名`（truncate 截断占剩余宽）+ 右缘「刷新」按钮（right_to_left 分居两端，曾与「删除」重叠）②操作行=`horizontal_wrapped` 五按钮（上传/下载/新建目录/重命名/删除，空间不足自动换行——曾单行 horizontal 塞全部按钮，340 宽面板溢出右缘被裁剪）③路径行=「上级」按钮 + 路径 truncate 截断（曾长路径溢出被裁）；按钮统一 `sftp_tool_button` 紧凑样式（11.5px 文字 + bg_elevated 底 + 细边框 + RADIUS_ITEM 圆角）；回归测试 `工具栏按钮不截断不重叠`（340 宽内各按钮 rect 不越界且两两不相交）；`poll_sftp` 处理 `Closed` 事件（连接中断时不能停在"连接中…"），失败写入 `sftp_error` 字段由状态栏**持久显示**（toast 一闪而过易忽略），下次 `start_connect` 清空；**文件列表列布局**（`sftp_view.rs`）：名称列左对齐、大小/时间列右对齐（均 `.halign(egui::Align::LEFT/RIGHT)` 显式声明，避免依赖默认对齐），`new_child` 子 Ui 需 `spacing_mut().item_spacing.x = 0.0` 归零自动间距（否则子项间默认 8px 叠加导致列位错乱），列间距用 add_space 精确控制，名称 `Label::truncate()` 截断；**`cell_width` 必须用 `'0'` 字符宽（数字等宽字体的真实字宽）而非空格宽**——空格 ≈ 0.25em、数字 ≈ 0.6em，用空格宽估算列宽会导致时间列 "2026-08-14" 被截到 "2026-01"（曾用空格宽 + 11 字符列宽只能容 7 字符数字）；大小/时间列宽 12 字符等宽（足够显示 10 字符日期 + 缓冲），名称列 = 总宽 - 12×2 - 12；回归测试 `文件列表列对齐`、`sftp面板默认收起悬浮按钮切换`；kittest 截图布局断言：上传按钮 left > 400（面板在右半侧）、齿轮按钮 right > 400（标签栏最右侧）；**2026-08 面板升级与目录导航**：①标题行加 accent2 状态点（与状态栏同款）②路径改为**圆角"地址条"**（bg_elevated 底 + 细边框 + 内部 truncate）③文件列表**表头行首留 22px 图标位**（`icon_pad`，表头与行共用基准）、行高 22、表头 11px muted ④**".." 行**置顶（点击返回上级目录，文件管理器通用习惯）⑤**行首矢量图标**（`paint_entry_icon`：文件夹 accent2 填充提手+圆角主体、文件细描边轮廓——矢量绘制避免 emoji 字形随字体变化）⑥目录名 text_primary/文件名 text_secondary，选中 accent_soft 底 + 左侧 2px accent 竖条（与主机行一致）、hover 白 8% 叠加 ⑦传输记录用主题语义色（success/danger/accent2）⑧**目录导航 = 单击选中、再次单击已选中的目录进入**（不用 `double_clicked`——egui 多击计数被无关点击污染，双击时灵时不灵）；**行点击必须显式 `ui.interact(row_rect, 稳定 Id, Sense::click())` 且注册在列内容之后**——`allocate_exact_size` 的自动 Id 帧间漂移 + `new_child` 子 Ui 叠加，行点击从未生效（"点击文件夹进不去"的根因，kittest 探针逐步定位：snap_clicked 指向行内容区而非行交互区）；hover 用 `pointer.hover_pos()` 判定（子 Ui 会抢走 `response.hovered()`）；目录进入后 `loading=true` 出现 spinner 持续重绘，相关测试用 `run_steps(6)` 显式步进（`Harness::run()` 会超 max_steps）；回归测试 `单击选中再次单击进入目录`（断言第一次单击只选中无 List 命令、再次单击发 `List("/workspace")`、文件两次单击不导航）、`文件列表列对齐` 已适配 ".." 行（"—" 共 3 个：.. 时间/.. 大小/目录大小）
+- **持续重绘治理（v0.7）**：egui `Spinner` 内部每帧 `request_repaint` 强制 60fps 全帧重绘，全部替换为 `loading_hint`（app.rs 静态圆点 + 文字，零重绘）：连接等待页/状态栏 SFTP 连接中/更新安装中/SFTP 面板加载中；**toast 降频**：滑入动画期（~0.32s）16ms 重绘，动画结束后仅 `request_repaint_after(剩余时长)` 安排到期关闭帧（曾 4 秒全程 60fps）
+- **性能 HUD（`perf.rs`，v0.7）**：`⌥P` 切换（设置弹窗「关于」卡片也有开关），右上角半透明面板显示帧耗时/FPS/终端构建/布局/绘制分段耗时（滑动平均）；`KunApp::ui` 开头 `perf.begin_frame()`、末尾 `end_frame()`，活动标签页 `terminal.last_timing()` 喂分段统计；terminal_view 内 `build_start/layout_start/paint_start` 三段打点；默认关闭不影响 kittest 截图断言
+- **SFTP 面板**（tabby 形式）：`Panel::right("sftp_panel")` **必须是顶层面板（先于 CentralPanel 注册）**——嵌套在 CentralPanel 内时面板状态会被顶层布局污染，面板错位覆盖终端（表现为"面板打不开"）；**默认收起只显示终端，终端右上角悬浮 `sftp_floating_button`（app.rs 顶层函数，"SFTP" 圆角按钮，点击切换 `TerminalTab.sftp_open`）**；展开用官方 `show_collapsible`（滑动动画，收起后右缘保留细拖拽把手可拖开）；尺寸 `default_size(窗口 40%)/min_size(260)/max_size(窗口 50%)`——曾固定 340px（大窗口下偏窄）与 45% 上限（用户要求 40% 默认、50% 上限）；曾 resizable 无上限拖到 ~70% 窗口宽把终端压成窄条，max_size 每帧按 `viewport_rect().width()*0.50` 钳制；面板 frame 内边距 `Margin::symmetric(12, 10)`；**工具栏三行布局**（`sftp_view.rs`）：①标题行=左 `SFTP · 主机名`（truncate 截断占剩余宽）+ 右缘「刷新」按钮（right_to_left 分居两端，曾与「删除」重叠）②操作行=`horizontal_wrapped` 五按钮（上传/下载/新建目录/重命名/删除，空间不足自动换行——曾单行 horizontal 塞全部按钮，340 宽面板溢出右缘被裁剪）③路径行=「上级」按钮 + 路径 truncate 截断（曾长路径溢出被裁）；按钮统一 `sftp_tool_button` 紧凑样式（11.5px 文字 + bg_elevated 底 + 细边框 + RADIUS_ITEM 圆角）；回归测试 `工具栏按钮不截断不重叠`（340 宽内各按钮 rect 不越界且两两不相交）；`poll_sftp` 处理 `Closed` 事件（连接中断时不能停在"连接中…"），失败写入 `sftp_error` 字段由状态栏**持久显示**（toast 一闪而过易忽略），下次 `start_connect` 清空；**文件列表列布局**（`sftp_view.rs`）：名称列左对齐、大小/时间列右对齐（均 `.halign(egui::Align::LEFT/RIGHT)` 显式声明，避免依赖默认对齐），`new_child` 子 Ui 需 `spacing_mut().item_spacing.x = 0.0` 归零自动间距（否则子项间默认 8px 叠加导致列位错乱），列间距用 add_space 精确控制，名称 `Label::truncate()` 截断；**`cell_width` 必须用 `'0'` 字符宽（数字等宽字体的真实字宽）而非空格宽**——空格 ≈ 0.25em、数字 ≈ 0.6em，用空格宽估算列宽会导致时间列 "2026-08-14" 被截到 "2026-01"（曾用空格宽 + 11 字符列宽只能容 7 字符数字）；大小/时间列宽 12 字符等宽（足够显示 10 字符日期 + 缓冲），名称列 = 总宽 - 12×2 - 12；回归测试 `文件列表列对齐`、`sftp面板默认收起悬浮按钮切换`；kittest 截图布局断言：上传按钮 left > 400（面板在右半侧）、齿轮按钮 right > 400（标签栏最右侧）；**2026-08 面板升级与目录导航**：①标题行加 accent2 状态点（与状态栏同款）②路径改为**圆角"地址条"**（bg_elevated 底 + 细边框 + 内部 truncate）③文件列表**表头行首留 22px 图标位**（`icon_pad`，表头与行共用基准）、行高 22、表头 11px muted ④**".." 行**置顶（点击返回上级目录，文件管理器通用习惯）⑤**行首矢量图标**（`paint_entry_icon`：文件夹 accent2 填充提手+圆角主体、文件细描边轮廓——矢量绘制避免 emoji 字形随字体变化）⑥目录名 text_primary/文件名 text_secondary，选中 accent_soft 底 + 左侧 2px accent 竖条（与主机行一致）、hover 白 8% 叠加 ⑦传输记录用主题语义色（success/danger/accent2）⑧**目录导航 = 单击选中、再次单击已选中的目录进入**（不用 `double_clicked`——egui 多击计数被无关点击污染，双击时灵时不灵）；**行点击必须显式 `ui.interact(row_rect, 稳定 Id, Sense::click())` 且注册在列内容之后**——`allocate_exact_size` 的自动 Id 帧间漂移 + `new_child` 子 Ui 叠加，行点击从未生效（"点击文件夹进不去"的根因，kittest 探针逐步定位：snap_clicked 指向行内容区而非行交互区）；hover 用 `pointer.hover_pos()` 判定（子 Ui 会抢走 `response.hovered()`）；目录进入后 `loading=true` 显示静态加载指示（v0.7 起非 spinner，零持续重绘），相关测试用 `run_steps(6)` 显式步进（`Harness::run()` 会超 max_steps）；回归测试 `单击选中再次单击进入目录`（断言第一次单击只选中无 List 命令、再次单击发 `List("/workspace")`、文件两次单击不导航）、`文件列表列对齐` 已适配 ".." 行（"—" 共 3 个：.. 时间/.. 大小/目录大小）
 
 ## 关键约定
 
@@ -126,7 +148,7 @@ crates/
 ## 验证
 
 ```bash
-cargo test --workspace         # 75 个测试（单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页 + 双击交互 + 表单默认值 + 补全模型/候选 + 补全浮层交互 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单）
+cargo test --workspace         # 75 个测试（单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页 + 双击交互 + 表单默认值 + 补全模型/候选 + 补全浮层交互 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单）；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
 cargo clippy --workspace --all-targets   # 零警告
 cargo fmt --all
 ```

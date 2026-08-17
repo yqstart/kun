@@ -1,21 +1,33 @@
 //! 终端视图：cell 渲染、键盘输入转发、滚动。
+//!
+//! 渲染为**行级增量**：每帧用 `Term::damage()` 拿到终端损坏行集合（行号即显示行号），
+//! 只对损坏/新出现/滚入的行重建文本段与 Galley（已布局文本），其余行直接复用缓存
+//! Galley 绘制（零扫描、零 layout）。内容未变的帧（PTY 空转、光标闪烁、无输入）仅
+//! 绘制已有 Galley。
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::TermDamage;
 use alacritty_terminal::vte::ansi::{Color as AColor, CursorShape, NamedColor, Rgb};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, Rect, Stroke, TextFormat, Ui, Vec2};
 use kun_core::terminal::keys::{self, Key, Mods};
 use kun_core::terminal::{Session, SessionEvent, TermMode};
 
-/// 行缓存：内容 hash 未变时复用 LayoutJob，避免每帧重建。
+/// 行缓存：内容 hash 未变时复用已布局文本（Galley），避免每帧重建。
+/// `galley` 与 pixels_per_point 绑定，窗口缩放后需全量失效（见 `show`）。
 #[derive(Clone)]
 struct RowCache {
+    /// 内容指纹（fg+bg+样式+字符；不含光标效果，光标移动不触发重建）。
     hash: u64,
-    job: LayoutJob,
+    /// 已布局文本（绘制直接使用，无需 layout_job）。
+    galley: std::sync::Arc<egui::Galley>,
+    /// 背景段（合并相邻相同背景色，含起止列）。
+    backgrounds: Vec<BgRect>,
 }
 
 /// 文本段（合并相邻相同前景样式的 cell）。
@@ -29,15 +41,15 @@ struct Segment {
 }
 
 /// 背景矩形（合并相邻相同背景色的 cell，含起止列）。
+#[derive(Clone)]
 struct BgRect {
     start: usize,
     end: usize,
     color: Color32,
 }
 
-/// 单行渲染数据。
+/// 单行渲染数据（锁内构建，锁外 layout）。
 struct LineData {
-    line: usize,
     hash: u64,
     segments: Vec<Segment>,
     backgrounds: Vec<BgRect>,
@@ -49,12 +61,16 @@ const PADDING: f32 = 10.0;
 /// 终端视图。
 pub struct TerminalView {
     session: Session,
-    rows_cache: Vec<RowCache>,
+    /// 行缓存：网格行号 → 渲染数据（Galley + 背景段 + hash）。
+    /// 按网格行号索引：滚动后同一网格行直接命中，无需重建。
+    rows_cache: HashMap<i32, RowCache>,
     font_size: f32,
     cell_width: f32,
     cell_height: f32,
     cols: u16,
     rows: u16,
+    /// 上次渲染时的 pixels_per_point（Galley 与其绑定，变化需全量失效）。
+    last_ppp: f32,
     focus_id: egui::Id,
     initialized: bool,
     last_mode: TermMode,
@@ -72,6 +88,18 @@ pub struct TerminalView {
     cursor_pos: Option<egui::Pos2>,
     /// 上一帧终端是否持有焦点（焦点自动恢复用）。
     had_focus: bool,
+    /// 分段耗时打点（性能 HUD 读数；默认不共享，仅本视图内部使用）。
+    last_build_ms: f32,
+    last_layout_ms: f32,
+    last_paint_ms: f32,
+    /// 上次补全候选重算时刻（去抖：连续打字不重复 read_dir/metadata）。
+    last_recompute: std::time::Instant,
+    /// 去抖期间挂起的重算请求（到点后由 show() 执行）。
+    recompute_pending: bool,
+    /// 上次重算时的输入快照（同快照不重算，退格后恢复场景）。
+    last_recompute_text: String,
+    /// 会话标题缓存（`SessionEvent::Title` 时更新，避免每帧 Mutex + String clone）。
+    cached_title: String,
 }
 
 impl TerminalView {
@@ -86,14 +114,17 @@ impl TerminalView {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_default()
         };
+        // 会话标题初值（一次 Mutex；后续由 Title 事件增量更新）。
+        let cached_title = session.title();
         Self {
             session,
-            rows_cache: Vec::new(),
+            rows_cache: HashMap::new(),
             font_size: 13.0,
             cell_width: 8.0,
             cell_height: 16.0,
             cols: 80,
             rows: 24,
+            last_ppp: 0.0,
             focus_id: egui::Id::new("terminal_view"),
             initialized: false,
             last_mode: TermMode::NONE,
@@ -103,12 +134,29 @@ impl TerminalView {
             candidate_selected: 0,
             cursor_pos: None,
             had_focus: false,
+            last_build_ms: 0.0,
+            last_layout_ms: 0.0,
+            last_paint_ms: 0.0,
+            last_recompute: std::time::Instant::now(),
+            recompute_pending: false,
+            last_recompute_text: String::new(),
+            cached_title,
         }
+    }
+
+    /// 本帧终端渲染分段耗时（性能 HUD 读取；未渲染时均为 0）。
+    pub fn last_timing(&self) -> (f32, f32, f32) {
+        (self.last_build_ms, self.last_layout_ms, self.last_paint_ms)
     }
 
     /// 会话引用（供状态栏等读取标题）。
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// 会话标题（缓存，`Title` 事件时更新；避免每帧 Mutex + String clone）。
+    pub fn session_title(&self) -> &str {
+        &self.cached_title
     }
 
     /// 每帧渲染入口。
@@ -134,21 +182,46 @@ impl TerminalView {
         if self.session.pty_thread_finished() {
             log::warn!("PTY 读取线程已退出！输入将无法写入终端。");
         }
+        // 注意：Wakeup 不再在此处二次 request_repaint——kun-core 的
+        // `Listener::send_event` 已在事件到达时直接调过 on_event
+        // （app.rs 的 `ctx.request_repaint()`），此处仅处理 PtyWrite 回写
+        // 与标题缓存更新。
         for event in self.session.drain_events() {
             match event {
-                SessionEvent::Wakeup => ctx.request_repaint(),
                 SessionEvent::PtyWrite(text) => self.session.write(text.as_bytes()),
+                SessionEvent::Title(title) => self.cached_title = title,
                 _ => {}
             }
         }
 
+        // 补全去抖：挂起的重算到点后执行（需请求一帧重绘驱动）。
+        if self.recompute_pending {
+            const DEBOUNCE: Duration = Duration::from_millis(120);
+            if self.last_recompute.elapsed() >= DEBOUNCE {
+                self.recompute_candidates();
+                // 重算可能产生候选，浮层渲染依赖本帧，无需额外 repaint；
+                // 若结果为空则关闭浮层，本帧已完成。
+            } else {
+                ctx.request_repaint_after(DEBOUNCE - self.last_recompute.elapsed().min(DEBOUNCE));
+            }
+        }
+
         // ==================== 尺寸计算与 resize ====================
-        let (cell_width, cell_height) = ui.fonts_mut(|f| {
-            let font = FontId::monospace(self.font_size);
-            (f.glyph_width(&font, ' '), f.row_height(&font))
-        });
-        self.cell_width = cell_width;
-        self.cell_height = cell_height;
+        // cell 尺寸只依赖字体（启动时加载），缓存到字段避免每帧 fonts_mut。
+        let ppp = ui.ctx().pixels_per_point();
+        if self.cell_width == 0.0 || ppp != self.last_ppp {
+            self.last_ppp = ppp;
+            let (cell_width, cell_height) = ui.fonts_mut(|f| {
+                let font = FontId::monospace(self.font_size);
+                (f.glyph_width(&font, ' '), f.row_height(&font))
+            });
+            self.cell_width = cell_width;
+            self.cell_height = cell_height;
+            // Galley 与 pixels_per_point 绑定：缩放变化后旧布局失效，全量重建。
+            self.rows_cache.clear();
+        }
+        let cell_width = self.cell_width;
+        let cell_height = self.cell_height;
 
         let avail = inner.size();
         let cols = ((avail.x / cell_width).floor() as usize).max(2);
@@ -161,16 +234,29 @@ impl TerminalView {
             self.rows_cache.clear();
         }
 
-        // ==================== 构建渲染数据（锁内） ====================
-        let mut lines_data: Vec<LineData> = Vec::with_capacity(self.rows as usize);
+        // ==================== 构建渲染数据（锁内，行级增量） ====================
+        // 只处理损坏行（`Term::damage`，行号 = 显示行号）与尚未缓存的行：
+        // 内容未变的帧零遍历、零 layout；滚动只重建滚入的新行。
+        let mut lines_data: Vec<(i32, LineData)> = Vec::new();
         let mut cursor_rect: Option<Rect> = None;
         let mut cursor_color: Option<Color32> = None;
+        let cursor_shape: CursorShape;
+        let display_offset: usize;
+        let build_start = std::time::Instant::now();
 
         {
-            let guard = term_arc.lock();
+            let mut guard = term_arc.lock();
+            // damage 收集（行号 = 网格行号 + display_offset = 显示行号），
+            // 必须在同一持锁内 reset，否则下帧重复返回旧损伤。
+            let (full_damage, damaged) = match guard.damage() {
+                TermDamage::Full => (true, Vec::new()),
+                TermDamage::Partial(iter) => (false, iter.map(|b| b.line).collect::<Vec<_>>()),
+            };
+            guard.reset_damage();
+
             let content = guard.renderable_content();
             let colors = content.colors;
-            let display_offset = content.display_offset;
+            display_offset = content.display_offset;
             let default_fg =
                 colors[NamedColor::Foreground].unwrap_or(crate::theme::current_theme().term_fg);
             // 背景色强制跟随主题（忽略 OSC 背景覆盖——zsh 主题常设置深色背景，
@@ -180,6 +266,7 @@ impl TerminalView {
             let mode = content.mode;
             let cursor = content.cursor;
             let cursor_style = guard.cursor_style();
+            cursor_shape = cursor_style.shape;
 
             // 光标可见性（含闪烁）。
             let time = ctx.input(|i| i.time);
@@ -190,141 +277,35 @@ impl TerminalView {
                 ctx.request_repaint_after(Duration::from_millis(500));
             }
 
-            // 逐行构建（跳过宽字符占位格）。
-            let mut segments: Vec<Segment> = Vec::new();
-            let mut backgrounds: Vec<BgRect> = Vec::new();
-            let mut hash: u64 = 0;
-            let mut current_line = usize::MAX;
-            // display_iter 的行号是网格坐标（向上滚动后 scrollback 行为负），
-            // 仅用于换行检测；渲染定位与行缓存索引用相对视口顶行的显示行号（0 起）。
-            let mut prev_grid_line: i32 = i32::MIN;
-            let mut display_line: usize = 0;
+            // 逐显示行：缓存命中（未损坏且 hash 一致）则跳过，否则锁内构建段。
+            // 显示行 v ↔ 网格行 Line(v - display_offset)（display_iter 同语义：
+            // 每个网格行一个显示行，wrap 续行独立成行）。
             let default_bg_egui = to_egui(default_bg);
-
-            for item in content.display_iter {
-                let point = item.point;
-                let cell = item.cell;
-
-                // 占位格只参与背景合并，不进入文本。
-                let is_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                    || cell.flags.contains(Flags::HIDDEN);
-                if is_spacer {
-                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                        && !cell.flags.contains(Flags::HIDDEN)
-                    {
-                        // 宽字符占位格继承前一格的背景，合并背景段。
-                        let bg = resolve_color(cell.bg, colors, default_bg, false);
-                        if bg != default_bg_egui {
-                            if let Some(last) = backgrounds.last_mut() {
-                                if last.color == bg {
-                                    last.end = (point.column + 1).0;
-                                } else {
-                                    backgrounds.push(BgRect {
-                                        start: point.column.0,
-                                        end: (point.column + 1).0,
-                                        color: bg,
-                                    });
-                                }
-                            } else {
-                                backgrounds.push(BgRect {
-                                    start: point.column.0,
-                                    end: (point.column + 1).0,
-                                    color: bg,
-                                });
-                            }
-                        }
-                    }
+            let grid = guard.grid();
+            for v in 0..self.rows as usize {
+                let grid_line = v as i32 - display_offset as i32;
+                let cached = self.rows_cache.get(&grid_line);
+                // 未损坏且已缓存：直接复用（不再遍历该行 cell）。
+                if !full_damage && !damaged.contains(&v) && cached.is_some() {
                     continue;
                 }
-
-                if point.line.0 != prev_grid_line {
-                    if current_line != usize::MAX {
-                        lines_data.push(LineData {
-                            line: current_line,
-                            hash,
-                            segments: std::mem::take(&mut segments),
-                            backgrounds: std::mem::take(&mut backgrounds),
-                        });
-                    }
-                    hash = 0;
-                    current_line = display_line;
-                    display_line += 1;
-                    prev_grid_line = point.line.0;
-                }
-
-                // 解析颜色（含粗体 → 亮色映射）。
-                let mut fg = resolve_color(
-                    cell.fg,
+                // 锁内读取该网格行构建段与 hash。
+                let data = build_line_data(
+                    grid,
+                    grid_line,
+                    self.cols as usize,
                     colors,
                     default_fg,
-                    cell.flags.contains(Flags::BOLD),
+                    default_bg,
+                    default_bg_egui,
                 );
-                let mut bg = resolve_color(cell.bg, colors, default_bg, false);
-                let bold = cell.flags.contains(Flags::BOLD);
-                let italic = cell.flags.contains(Flags::ITALIC);
-                let underline = cell.flags.contains(Flags::UNDERLINE);
-                let strikeout = cell.flags.contains(Flags::STRIKEOUT);
-
-                // INVERSE 反色。
-                if cell.flags.contains(Flags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                // DIM 减暗（粗体不减）。
-                if cell.flags.contains(Flags::DIM) && !bold {
-                    fg = Color32::from_rgb(fg.r() / 2, fg.g() / 2, fg.b() / 2);
-                }
-
-                // 光标 cell：Block 光标下文本反色，由光标矩形覆盖。
-                let is_cursor = cursor_visible
-                    && cursor.shape == CursorShape::Block
-                    && point.line.0 == cursor.point.line.0
-                    && point.column == cursor.point.column;
-                if is_cursor {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-
-                // 背景段合并（默认背景不绘制）。
-                if bg != default_bg_egui {
-                    if let Some(last) = backgrounds.last_mut() {
-                        if last.color == bg {
-                            last.end = (point.column + 1).0;
-                        } else {
-                            backgrounds.push(BgRect {
-                                start: point.column.0,
-                                end: (point.column + 1).0,
-                                color: bg,
-                            });
-                        }
-                    } else {
-                        backgrounds.push(BgRect {
-                            start: point.column.0,
-                            end: (point.column + 1).0,
-                            color: bg,
-                        });
+                // 内容未变（如光标行被标记损伤但文本没变）：跳过 layout 复用旧 Galley。
+                if let Some(c) = cached {
+                    if c.hash == data.hash {
+                        continue;
                     }
                 }
-
-                // 文本段合并。
-                push_or_merge(
-                    &mut segments,
-                    cell.c,
-                    CellStyle {
-                        fg,
-                        bold,
-                        italic,
-                        underline,
-                        strikeout,
-                    },
-                    &mut hash,
-                );
-            }
-            if current_line != usize::MAX {
-                lines_data.push(LineData {
-                    line: current_line,
-                    hash,
-                    segments: std::mem::take(&mut segments),
-                    backgrounds: std::mem::take(&mut backgrounds),
-                });
+                lines_data.push((grid_line, data));
             }
 
             // 光标矩形（Block 之外的光标形状）。
@@ -350,34 +331,49 @@ impl TerminalView {
                 ));
             }
         }
+        self.last_build_ms = build_start.elapsed().as_secs_f32() * 1000.0;
 
         // ==================== 绘制（锁外） ====================
+        let layout_start = std::time::Instant::now();
+        // 先为新构建的行做文本布局并写缓存（命中行不进入此循环）。
+        for (grid_line, data) in &lines_data {
+            let job = build_job(&data.segments, self.font_size);
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            self.rows_cache.insert(
+                *grid_line,
+                RowCache {
+                    hash: data.hash,
+                    galley,
+                    backgrounds: data.backgrounds.clone(),
+                },
+            );
+        }
+        self.last_layout_ms = layout_start.elapsed().as_secs_f32() * 1000.0;
+
+        let paint_start = std::time::Instant::now();
         let painter = ui.painter();
         let origin = inner.min;
-        for data in &lines_data {
-            // 绘制背景矩形（行内连续背景段）。
-            for bg in &data.backgrounds {
+        for v in 0..self.rows as usize {
+            let grid_line = v as i32 - display_offset as i32;
+            let Some(cache) = self.rows_cache.get(&grid_line) else {
+                continue;
+            };
+            // 背景矩形（行内连续背景段）。
+            for bg in &cache.backgrounds {
                 let rect = Rect::from_min_size(
-                    origin
-                        + Vec2::new(bg.start as f32 * cell_width, data.line as f32 * cell_height),
+                    origin + Vec2::new(bg.start as f32 * cell_width, v as f32 * cell_height),
                     Vec2::new((bg.end - bg.start) as f32 * cell_width, cell_height),
                 );
                 painter.rect_filled(rect, 0.0, bg.color);
             }
-            // 文本（复用或重建 LayoutJob）。
-            let job = self.job_for_line(data);
-            let pos = origin + Vec2::new(0.0, data.line as f32 * cell_height);
-            let galley = ui.fonts_mut(|f| f.layout_job(job));
-            painter.galley(pos, galley, Color32::WHITE);
+            // 文本（直接绘制缓存的 Galley，Arc clone 零成本；不再 layout_job）。
+            let pos = origin + Vec2::new(0.0, v as f32 * cell_height);
+            painter.galley(pos, cache.galley.clone(), Color32::WHITE);
         }
 
-        // 光标形状绘制。
+        // 光标形状绘制（shape 已在锁内读取，无需二次上锁）。
         if let (Some(rect), Some(color)) = (cursor_rect, cursor_color) {
-            let shape = {
-                let guard = term_arc.lock();
-                guard.cursor_style().shape
-            };
-            match shape {
+            match cursor_shape {
                 CursorShape::Block => {
                     painter.rect_filled(rect, 0.0, color);
                 }
@@ -407,6 +403,16 @@ impl TerminalView {
                 CursorShape::Hidden => {}
             }
         }
+        // 绘制耗时（背景 rect + 文本 galley + 光标形状）。
+        self.last_paint_ms = paint_start.elapsed().as_secs_f32() * 1000.0;
+
+        // 缓存上限：滚动浏览大量历史时防止无限增长，超限只保留当前可见行。
+        if self.rows_cache.len() > (self.rows as usize).saturating_mul(4).max(64) {
+            let visible: std::collections::HashSet<i32> = (0..self.rows as usize)
+                .map(|v| v as i32 - display_offset as i32)
+                .collect();
+            self.rows_cache.retain(|g, _| visible.contains(g));
+        }
 
         // ==================== 焦点与输入 ====================
         if !self.initialized {
@@ -429,31 +435,6 @@ impl TerminalView {
         if ui.memory(|m| m.has_focus(self.focus_id)) {
             self.handle_input(ui);
         }
-    }
-
-    /// 获取（或重建）某一行的 LayoutJob。
-    fn job_for_line(&mut self, data: &LineData) -> LayoutJob {
-        if let Some(cache) = self.rows_cache.get_mut(data.line) {
-            if cache.hash == data.hash {
-                return cache.job.clone();
-            }
-            cache.hash = data.hash;
-            cache.job = build_job(&data.segments, self.font_size);
-            return cache.job.clone();
-        }
-        let job = build_job(&data.segments, self.font_size);
-        if self.rows_cache.len() <= data.line {
-            self.rows_cache.resize(
-                data.line + 1,
-                RowCache {
-                    hash: 0,
-                    job: LayoutJob::default(),
-                },
-            );
-        }
-        self.rows_cache[data.line].hash = data.hash;
-        self.rows_cache[data.line].job = job;
-        self.rows_cache[data.line].job.clone()
     }
 
     /// 处理键盘与鼠标输入（转发到 PTY / 网格滚动）。
@@ -647,7 +628,7 @@ impl TerminalView {
             InputAction::Bytes(bytes) => self.track_input_bytes(&bytes),
             InputAction::Text(text) => {
                 self.input.push_text(&text);
-                self.recompute_candidates();
+                self.request_recompute();
             }
             InputAction::Paste => {
                 // 粘贴内容不可逐字节信任，模型失效禁用补全直到回车。
@@ -688,7 +669,7 @@ impl TerminalView {
             // 退格/删除。
             b"\x7f" | b"\x08" => {
                 self.input.backspace();
-                self.recompute_candidates();
+                self.request_recompute();
             }
             // Tab（shell 自身补全/移动光标）：输入行已被 shell 改写（zsh 菜单
             // 补全会原地扩展命令），模型无法追踪，失效禁用浮层避免给出错候选。
@@ -703,7 +684,7 @@ impl TerminalView {
                         .all(|c| c.is_ascii_graphic() || c == ' ' || !c.is_ascii())
                     {
                         self.input.push_text(s);
-                        self.recompute_candidates();
+                        self.request_recompute();
                         return;
                     }
                 }
@@ -714,12 +695,43 @@ impl TerminalView {
         }
     }
 
-    /// 重新计算补全候选。
+    /// 请求重新计算补全候选（路径候选去抖）。
+    ///
+    /// 命令候选是内存索引扫描（`command_index` 进程级缓存），毫秒级，立即算；
+    /// 路径候选每次都要 `read_dir` + 逐项 `metadata()` 同步 syscall
+    /// （大目录下卡顿），连续打字时去抖 120ms 只重算一次，去抖期间挂起
+    /// 由 show() 到点执行。
+    fn request_recompute(&mut self) {
+        if self.session.is_remote() {
+            self.candidates.clear();
+            return;
+        }
+        let (word_start, word) = crate::completion::last_word(&self.input.text);
+        let is_command_pos = word_start == 0 && !word.contains('/');
+        if is_command_pos && !word.is_empty() {
+            self.recompute_candidates();
+            return;
+        }
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+        if self.last_recompute.elapsed() >= DEBOUNCE {
+            self.recompute_candidates();
+        } else {
+            self.recompute_pending = true;
+        }
+    }
+
+    /// 实际执行候选重算（含同输入快照跳过：退格后恢复原文本等场景不重复 read_dir）。
     fn recompute_candidates(&mut self) {
         if self.session.is_remote() {
             self.candidates.clear();
             return;
         }
+        self.last_recompute = std::time::Instant::now();
+        self.recompute_pending = false;
+        if self.input.text == self.last_recompute_text {
+            return;
+        }
+        self.last_recompute_text = self.input.text.clone();
         self.candidates = crate::completion::compute_candidates(
             &self.input,
             crate::completion::command_index(),
@@ -887,6 +899,128 @@ enum InputAction {
 }
 
 // ==================== 辅助函数 ====================
+
+/// 锁内构建单个网格行的渲染数据（段 + 背景 + hash）。
+///
+/// `grid_line` 为网格行号（滚动到 scrollback 时为负）。复用 `display_iter` 的
+/// 单行语义：占位格跳过、颜色解析、背景段合并、文本段合并。
+/// 注意：不再对光标 cell 做反色——Block 光标最终由光标色实心矩形覆盖，反色不可见，
+/// 剔除后光标行内容 hash 稳定，光标移动不触发行重建。
+#[allow(clippy::too_many_arguments)]
+fn build_line_data(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    grid_line: i32,
+    cols: usize,
+    colors: &Colors,
+    default_fg: Rgb,
+    default_bg: Rgb,
+    default_bg_egui: Color32,
+) -> LineData {
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut backgrounds: Vec<BgRect> = Vec::new();
+    let mut hash: u64 = 0;
+    // `Line` 的 tuple 构造器不公开，负行号（scrollback）用 `Line(0) - n` 构造。
+    let row = &grid[if grid_line >= 0 {
+        alacritty_terminal::index::Line::from(grid_line as usize)
+    } else {
+        alacritty_terminal::index::Line::from(0) - grid_line.unsigned_abs() as usize
+    }];
+
+    for (col, cell) in row.into_iter().enumerate().take(cols) {
+        // 占位格只参与背景合并，不进入文本。
+        let is_spacer =
+            cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN);
+        if is_spacer {
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && !cell.flags.contains(Flags::HIDDEN) {
+                // 宽字符占位格继承前一格的背景，合并背景段。
+                let bg = resolve_color(cell.bg, colors, default_bg, false);
+                if bg != default_bg_egui {
+                    if let Some(last) = backgrounds.last_mut() {
+                        if last.color == bg {
+                            last.end = col + 1;
+                        } else {
+                            backgrounds.push(BgRect {
+                                start: col,
+                                end: col + 1,
+                                color: bg,
+                            });
+                        }
+                    } else {
+                        backgrounds.push(BgRect {
+                            start: col,
+                            end: col + 1,
+                            color: bg,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        // 解析颜色（含粗体 → 亮色映射）。
+        let mut fg = resolve_color(
+            cell.fg,
+            colors,
+            default_fg,
+            cell.flags.contains(Flags::BOLD),
+        );
+        let mut bg = resolve_color(cell.bg, colors, default_bg, false);
+        let bold = cell.flags.contains(Flags::BOLD);
+        let italic = cell.flags.contains(Flags::ITALIC);
+        let underline = cell.flags.contains(Flags::UNDERLINE);
+        let strikeout = cell.flags.contains(Flags::STRIKEOUT);
+
+        // INVERSE 反色。
+        if cell.flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        // DIM 减暗（粗体不减）。
+        if cell.flags.contains(Flags::DIM) && !bold {
+            fg = Color32::from_rgb(fg.r() / 2, fg.g() / 2, fg.b() / 2);
+        }
+
+        // 背景段合并（默认背景不绘制）。
+        if bg != default_bg_egui {
+            if let Some(last) = backgrounds.last_mut() {
+                if last.color == bg {
+                    last.end = col + 1;
+                } else {
+                    backgrounds.push(BgRect {
+                        start: col,
+                        end: col + 1,
+                        color: bg,
+                    });
+                }
+            } else {
+                backgrounds.push(BgRect {
+                    start: col,
+                    end: col + 1,
+                    color: bg,
+                });
+            }
+        }
+
+        // 文本段合并。
+        push_or_merge(
+            &mut segments,
+            cell.c,
+            CellStyle {
+                fg,
+                bold,
+                italic,
+                underline,
+                strikeout,
+            },
+            &mut hash,
+        );
+    }
+
+    LineData {
+        hash,
+        segments,
+        backgrounds,
+    }
+}
 
 /// 解析终端颜色为 egui 颜色（Catppuccin 调色板 + xterm 256 色表）。
 ///

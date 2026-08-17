@@ -115,13 +115,13 @@ impl TerminalTab {
         }
     }
 
-    /// 标签显示标题（跟随会话标题变化）。
+    /// 标签显示标题（跟随会话标题变化；读缓存避免每帧 Mutex + clone）。
     fn title(&self) -> String {
-        let t = self.terminal.session().title();
+        let t = self.terminal.session_title();
         if t.is_empty() {
             self.label.clone()
         } else {
-            t
+            t.to_string()
         }
     }
 }
@@ -167,6 +167,10 @@ pub struct KunApp {
     manual_update: bool,
     /// 安装脚本已启动，到该时间点关闭应用重启。
     restart_at: Option<f64>,
+    /// 性能 HUD 是否显示（`⌥P` 切换；默认关闭，不影响测试截图）。
+    show_perf_hud: bool,
+    /// 帧耗时统计（UI 线程打点）。
+    perf: crate::perf::PerfStats,
 }
 
 /// 本地终端会话选项：默认工作目录为 home，注入 TERM 与颜色环境变量。
@@ -452,6 +456,8 @@ impl KunApp {
             download_rx: None,
             manual_update: false,
             restart_at: None,
+            show_perf_hud: false,
+            perf: crate::perf::PerfStats::new(),
         };
         // 启动时自动检查更新（后台线程，延迟 3 秒，静默）。
         if load_error {
@@ -886,6 +892,30 @@ impl KunApp {
                                 {
                                     self.start_update_check(false);
                                 }
+                            });
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            // 性能 HUD 开关（调试用）。
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("性能 HUD")
+                                        .size(12.0)
+                                        .color(theme.text_secondary),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let mut enabled = self.show_perf_hud;
+                                        if ui
+                                            .checkbox(&mut enabled, "")
+                                            .on_hover_text("显示帧耗时 / FPS（⌥P 切换）")
+                                            .changed()
+                                        {
+                                            self.show_perf_hud = enabled;
+                                        }
+                                    },
+                                );
                             });
                         });
                     });
@@ -1653,14 +1683,15 @@ impl KunApp {
             ui.add_space(6.0);
             if let Some(tab) = self.tabs.get(self.active_tab) {
                 let session = tab.terminal.session();
-                let title = session.title();
+                // 标题读缓存（避免每帧 Mutex + String clone）。
+                let title = tab.terminal.session_title();
                 let exited = session.has_exited();
                 status_dot(ui, if exited { theme.danger } else { theme.success }, false);
                 ui.label(
                     egui::RichText::new(if title.is_empty() {
                         tab.label.clone()
                     } else {
-                        title
+                        title.to_string()
                     })
                     .size(11.5)
                     .color(theme.text_secondary),
@@ -1678,12 +1709,7 @@ impl KunApp {
             }
             if self.pending_sftp.is_some() {
                 ui.separator();
-                ui.spinner();
-                ui.label(
-                    egui::RichText::new("SFTP 连接中…")
-                        .size(11.5)
-                        .color(theme.text_muted),
-                );
+                loading_hint(ui, "SFTP 连接中…");
             }
             if let Some(e) = &self.sftp_error {
                 ui.separator();
@@ -1822,14 +1848,7 @@ impl KunApp {
                     });
                     ui.add_space(8.0);
                 } else if matches!(self.update_state, UpdateState::Installing(_)) {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            egui::RichText::new("正在挂载并安装，请稍候…")
-                                .size(12.5)
-                                .color(theme.text_secondary),
-                        );
-                    });
+                    loading_hint(ui, "正在挂载并安装，请稍候…");
                     ui.add_space(8.0);
                 } else if matches!(self.update_state, UpdateState::Installed) {
                     ui.horizontal(|ui| {
@@ -1953,10 +1972,16 @@ impl KunApp {
             self.toast = None;
             return;
         }
-        // 动画期间持续重绘。
-        ctx.request_repaint_after(Duration::from_millis(16));
-
+        // 滑入动画期间持续重绘（约 0.32s）；动画结束后不再 60fps 循环，
+        // 仅安排到期关闭帧——Toast 停留期终端无输出时整帧静止省电。
         let in_t = (elapsed / 0.32).clamp(0.0, 1.0) as f32;
+        if in_t < 1.0 {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(
+                ((DURATION - elapsed) * 1000.0).max(16.0) as u64,
+            ));
+        }
         let out_t = ((DURATION - elapsed) / 0.35).clamp(0.0, 1.0) as f32;
         let alpha = anim::ease_out_cubic(in_t) * anim::ease_out_cubic(out_t);
         let slide = (1.0 - anim::ease_out_back(in_t)) * 24.0;
@@ -2140,6 +2165,28 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32, pulse: bool) {
     }
 }
 
+/// 静态加载指示（accent2 圆点 + 文字）。
+///
+/// 替代 egui `Spinner`：其内部每帧 `request_repaint` 强制 60fps 全帧重绘
+/// （连接等待/安装期间终端无输出时整帧白烧 CPU），静态点零重绘。
+fn loading_hint(ui: &mut egui::Ui, text: &str) {
+    let theme = crate::theme::current_theme();
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+        ui.painter()
+            .circle_filled(rect.center(), 3.2, theme.accent2);
+        ui.label(
+            egui::RichText::new(text)
+                .size(if ui.available_height() > 24.0 {
+                    12.5
+                } else {
+                    11.5
+                })
+                .color(theme.text_secondary),
+        );
+    });
+}
+
 /// 自定义渐变进度条（未知总量时显示流动光带）。
 fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
     let theme = crate::theme::current_theme();
@@ -2216,8 +2263,13 @@ impl eframe::App for KunApp {
         let ctx = ui.ctx().clone();
         // 缓存 ctx 供非 UI 回调使用（如复制 tab 时构造 Session）。
         self.last_ctx = ctx.clone();
+        self.perf.begin_frame();
 
         // ==================== 快捷键 ====================
+        // ⌥P：切换性能 HUD。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::P)) {
+            self.show_perf_hud = !self.show_perf_hud;
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
             self.show_new_conn = true;
         }
@@ -2332,14 +2384,7 @@ impl eframe::App for KunApp {
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(_pending) = &self.pending {
                 ui.centered_and_justified(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            egui::RichText::new(format!("正在连接 {} …", self.pending_label))
-                                .size(13.0)
-                                .color(theme.text_secondary),
-                        );
-                    });
+                    loading_hint(ui, &format!("正在连接 {} …", self.pending_label));
                 });
             } else if self.tabs.is_empty() {
                 self.empty_state(ui, &ctx);
@@ -2375,7 +2420,43 @@ impl eframe::App for KunApp {
                 }
             }
         }
+
+        // ==================== 性能 HUD ====================
+        self.perf.end_frame();
+        // 活动标签页的终端分段耗时喂给统计（无标签页时为 0 不影响）。
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let (build, layout, paint) = tab.terminal.last_timing();
+            self.perf.add_build(build);
+            self.perf.add_layout(layout);
+            self.perf.add_paint(paint);
+        }
+        if self.show_perf_hud {
+            render_perf_hud(&ctx, &self.perf);
+        }
     }
+}
+
+/// 渲染性能 HUD（右上角半透明小面板，调试用）。
+fn render_perf_hud(ctx: &egui::Context, perf: &crate::perf::PerfStats) {
+    let theme = crate::theme::current_theme();
+    egui::Area::new(egui::Id::new("perf_hud"))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 44.0))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(ctx, |ui| {
+            let frame = egui::Frame::new()
+                .fill(theme.bg_elevated.gamma_multiply(0.92))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 6));
+            frame.show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(perf.summary())
+                        .monospace()
+                        .size(10.5)
+                        .color(theme.text_muted),
+                );
+            });
+        });
 }
 
 #[cfg(test)]

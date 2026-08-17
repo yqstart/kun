@@ -54,6 +54,8 @@ pub struct SftpView {
     error: Option<String>,
     /// 连接已关闭。
     closed: bool,
+    /// 等宽字符宽缓存（'0' 字符，数字等宽字体的真实字宽；字体启动时加载后不变）。
+    cell_width: f32,
 }
 
 impl SftpView {
@@ -71,6 +73,7 @@ impl SftpView {
             dialog: None,
             error: None,
             closed: false,
+            cell_width: 0.0,
         };
         // 初始列出根目录。
         view.handle.list("/");
@@ -82,9 +85,12 @@ impl SftpView {
         &self.host_name
     }
 
-    /// 处理后台事件。
-    pub(crate) fn poll_events(&mut self) {
+    /// 处理后台事件。返回本帧是否收到新事件（调用方据此请求重绘——
+    /// 传输进度/列表到达后若无其它重绘源，进度条不会自行刷新）。
+    pub(crate) fn poll_events(&mut self) -> bool {
+        let mut any = false;
         while let Ok(event) = self.rx.try_recv() {
+            any = true;
             match event {
                 SftpEvent::Listed { path, entries } => {
                     self.current_path = path;
@@ -133,6 +139,7 @@ impl SftpView {
                 _ => {}
             }
         }
+        any
     }
 
     /// 远程路径拼接。
@@ -175,9 +182,207 @@ impl SftpView {
         }
     }
 
+    /// 渲染列表中的一行（虚拟化：`show_rows` 只对可见行调用本方法）。
+    ///
+    /// `idx == 0` 为 ".." 上级行，其余对应 `entries[idx - 1]`。
+    /// 导航/选中动作不直接改 self（闭包内借用冲突），写入 `open_dir`/`select`
+    /// 由调用方在闭包外统一应用。
+    #[allow(clippy::too_many_arguments)]
+    fn render_list_row(
+        &mut self,
+        ui: &mut Ui,
+        idx: usize,
+        table_width: f32,
+        name_col: f32,
+        size_col: f32,
+        time_col: f32,
+        icon_pad: f32,
+        row_h: f32,
+        theme: &'static crate::theme::Theme,
+        open_dir: &mut Option<String>,
+        select: &mut Option<String>,
+    ) {
+        let (row_rect, _) =
+            ui.allocate_exact_size(egui::vec2(table_width, row_h), egui::Sense::hover());
+        // hover 用指针位置判定（子 Ui 会抢走 response.hovered()）。
+        let pointer_in_row =
+            ui.input(|i| i.pointer.hover_pos().is_some_and(|p| row_rect.contains(p)));
+        let row_id = if idx == 0 {
+            egui::Id::new(("sftp_row", ".."))
+        } else {
+            egui::Id::new(("sftp_row", self.entries[idx - 1].name.as_str()))
+        };
+
+        // ".." 行：返回上级目录（文件管理器通用习惯，导航更直观）。
+        if idx == 0 {
+            if pointer_in_row {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                ui.painter().rect_filled(
+                    row_rect,
+                    crate::theme::tokens::RADIUS_ITEM,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                );
+            }
+            let icon = egui::Rect::from_center_size(
+                egui::pos2(row_rect.left() + 6.0 + 7.0, row_rect.center().y),
+                egui::vec2(14.0, 14.0),
+            );
+            paint_entry_icon(ui.painter(), icon, true);
+            let mut inner = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(row_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            inner.spacing_mut().item_spacing.x = 0.0;
+            inner.add_space(icon_pad);
+            inner.add_sized(
+                [name_col - icon_pad, row_h],
+                egui::Label::new(RichText::new("..").monospace().color(theme.text_primary))
+                    .halign(egui::Align::LEFT)
+                    .truncate(),
+            );
+            inner.add_space(6.0);
+            inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.set_min_size(egui::vec2(size_col + time_col + 6.0, row_h));
+                ui.add_sized(
+                    [time_col, row_h],
+                    egui::Label::new(RichText::new("—").color(theme.text_muted))
+                        .halign(egui::Align::RIGHT),
+                );
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [size_col, row_h],
+                    egui::Label::new(RichText::new("—").color(theme.text_muted))
+                        .halign(egui::Align::RIGHT),
+                );
+            });
+            // 整行点击区：显式 ui.interact + 稳定 Id，且必须在列内容
+            // 之后注册（后注册 widget 在顶层；见条目行注释）。
+            let response = ui.interact(row_rect, row_id, egui::Sense::click());
+            if response.clicked() {
+                let parent = Self::parent_of(&self.current_path);
+                self.handle.list(&parent);
+                self.loading = true;
+                self.selected = None;
+            }
+            return;
+        }
+
+        let entry = &self.entries[idx - 1];
+        let selected = self.selected.as_deref() == Some(entry.name.as_str());
+        let label = if entry.is_dir {
+            format!("{}/", entry.name)
+        } else {
+            entry.name.clone()
+        };
+        // 整行点击区：单击选中，再次单击已选中的目录进入下级目录
+        //（不用 double_clicked——egui 多击计数会被无关点击污染，
+        // 双击时灵时不灵）。
+        // 选中：accent 软底 + 左侧 accent 竖条；hover：白色低透明度
+        // 叠加（Tabby 风，先画背景，列内容绘制在其上）。
+        if selected {
+            ui.painter().rect_filled(
+                row_rect,
+                crate::theme::tokens::RADIUS_ITEM,
+                theme.accent_soft,
+            );
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(row_rect.left() + 1.0, row_rect.top() + 4.0),
+                    egui::pos2(row_rect.left() + 3.0, row_rect.bottom() - 4.0),
+                ),
+                1.5,
+                theme.accent,
+            );
+        } else if pointer_in_row {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            ui.painter().rect_filled(
+                row_rect,
+                crate::theme::tokens::RADIUS_ITEM,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+            );
+        }
+        // 行首矢量图标：文件夹 accent2 填充 / 文件描边轮廓。
+        let icon = egui::Rect::from_center_size(
+            egui::pos2(row_rect.left() + 6.0 + 7.0, row_rect.center().y),
+            egui::vec2(14.0, 14.0),
+        );
+        paint_entry_icon(ui.painter(), icon, entry.is_dir);
+        // 三列内容：名称（目录主色/文件次要色）+ 大小/时间定宽右排。
+        let name_text = RichText::new(label)
+            .monospace()
+            .color(if entry.is_dir || selected {
+                theme.text_primary
+            } else {
+                theme.text_secondary
+            });
+        let weak_color = if selected {
+            theme.text_secondary
+        } else {
+            theme.text_muted
+        };
+        let mut inner = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("sftp_cols", entry.name.as_str()))
+                .max_rect(row_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        // 归零自动间距（见表头注释）。
+        inner.spacing_mut().item_spacing.x = 0.0;
+        inner.add_space(icon_pad);
+        inner.add_sized(
+            [name_col - icon_pad, row_h],
+            egui::Label::new(name_text)
+                .halign(egui::Align::LEFT)
+                .truncate(),
+        );
+        inner.add_space(6.0);
+        inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.set_min_size(egui::vec2(size_col + time_col + 6.0, row_h));
+            // 时间缺失时以 "—" 占位，保持列位稳定。
+            let time_text = entry
+                .modified
+                .map(Self::format_time)
+                .unwrap_or_else(|| "—".to_string());
+            ui.add_sized(
+                [time_col, row_h],
+                egui::Label::new(RichText::new(time_text).color(weak_color))
+                    .halign(egui::Align::RIGHT)
+                    .truncate(),
+            );
+            ui.add_space(6.0);
+            let size_text = if entry.is_dir {
+                "—".to_string()
+            } else {
+                Self::format_size(entry.size)
+            };
+            ui.add_sized(
+                [size_col, row_h],
+                egui::Label::new(RichText::new(size_text).color(weak_color))
+                    .halign(egui::Align::RIGHT)
+                    .truncate(),
+            );
+        });
+        // 整行点击区：显式 ui.interact + 稳定 Id，且必须在列内容
+        // 之后注册（后注册 widget 在顶层）——allocate_exact_size
+        // 的自动 Id 帧间漂移、new_child 子 Ui 叠加，行点击从未
+        // 生效（"点击文件夹进不去"的根因）。
+        let response = ui.interact(row_rect, row_id, egui::Sense::click());
+        if response.clicked() {
+            if entry.is_dir && self.selected.as_deref() == Some(entry.name.as_str()) {
+                *open_dir = Some(entry.name.clone());
+            } else {
+                *select = Some(entry.name.clone());
+            }
+        }
+    }
+
     /// 每帧渲染。
     pub fn show(&mut self, ui: &mut Ui) {
-        self.poll_events();
+        // 后台事件到达后请求重绘（传输进度/列表刷新不依赖其它重绘源）。
+        if self.poll_events() {
+            ui.ctx().request_repaint();
+        }
         let theme = crate::theme::current_theme();
 
         // ==================== 标题行：状态点 + 主机名 + 刷新 ====================
@@ -324,10 +529,14 @@ impl SftpView {
         // 用 '0' 字符宽（数字等宽字体的真实字宽）计算列宽：
         // 此前用 ' '（空格 ≈ 0.25em）低估了数字宽度（'0' ≈ 0.6em），
         // 导致时间列 "2026-08-14" 被截到 "2026-01"。
-        let cell_width = ui.fonts_mut(|f| {
-            let font = egui::FontId::monospace(13.0);
-            f.glyph_width(&font, '0')
-        });
+        // 字体启动时加载后不变，缓存到字段避免每帧 fonts_mut（Context 写锁）。
+        if self.cell_width == 0.0 {
+            self.cell_width = ui.fonts_mut(|f| {
+                let font = egui::FontId::monospace(13.0);
+                f.glyph_width(&font, '0')
+            });
+        }
+        let cell_width = self.cell_width;
         // 行首图标占位宽度（16px 图标 + 两侧留白），表头与行共用基准。
         let icon_pad = 22.0;
         let row_h = 22.0;
@@ -336,265 +545,110 @@ impl SftpView {
         // 大小/时间列挤出面板右缘，且各行列位随名称长度漂移错位。
         let size_col = cell_width * 12.0;
         let time_col = cell_width * 12.0;
+        let table_width = ui.available_width();
+        // 名称列让出两个 6px 间隔（名称|大小|时间），大小/时间定宽。
+        let name_col = (table_width - size_col - time_col - 12.0).max(40.0);
 
+        // 表头（固定不滚动，与行同列基准：名称左对齐、大小/时间定宽右排）。
+        let (header_rect, _) =
+            ui.allocate_exact_size(egui::vec2(table_width, row_h), egui::Sense::hover());
+        let mut header = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(header_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        // 归零自动间距：列间距完全由 add_space 精确控制
+        // （否则子项间默认 8px item_spacing 会叠加，列位错乱）。
+        header.spacing_mut().item_spacing.x = 0.0;
+        header.add_space(icon_pad);
+        header.add_sized(
+            [name_col - icon_pad, row_h],
+            egui::Label::new(
+                RichText::new("名称")
+                    .strong()
+                    .size(11.0)
+                    .color(theme.text_muted),
+            )
+            .halign(egui::Align::LEFT),
+        );
+        header.add_space(6.0);
+        header.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.set_min_size(egui::vec2(size_col + time_col + 6.0, row_h));
+            ui.add_sized(
+                [time_col, row_h],
+                egui::Label::new(
+                    RichText::new("修改时间")
+                        .strong()
+                        .size(11.0)
+                        .color(theme.text_muted),
+                )
+                .halign(egui::Align::RIGHT),
+            );
+            ui.add_space(6.0);
+            ui.add_sized(
+                [size_col, row_h],
+                egui::Label::new(
+                    RichText::new("大小")
+                        .strong()
+                        .size(11.0)
+                        .color(theme.text_muted),
+                )
+                .halign(egui::Align::RIGHT),
+            );
+        });
+        ui.separator();
+
+        // 加载中 / 空目录提示（滚动区外，随面板固定）。
+        if self.loading {
+            ui.horizontal(|ui| {
+                // 静态指示点（不滚动动画）：egui `Spinner` 每帧 request_repaint
+                // 强制 60fps 全帧重绘（含终端全量扫描），静态点零重绘。
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3.2, theme.accent2);
+                ui.label(RichText::new("加载中…").size(12.0).color(theme.text_muted));
+            });
+        } else if self.entries.is_empty() {
+            ui.add_space(14.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("空目录").size(12.0).color(theme.text_muted));
+            });
+        }
+
+        // 虚拟化列表：`show_rows` 只构建可见行（大目录不再每帧全量构建
+        // String/RichText/Label/子 Ui）。index 0 = ".." 上级行，其余 = entries。
+        let total_rows = self.entries.len() + 1;
+        let mut open_dir: Option<String> = None;
+        let mut select: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let table_width = ui.available_width();
-                // 名称列让出两个 6px 间隔（名称|大小|时间），大小/时间定宽。
-                let name_col = (table_width - size_col - time_col - 12.0).max(40.0);
-
-                if self.loading {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("加载中…").size(12.0).color(theme.text_muted));
-                    });
-                }
-                // 表头（与行同列基准：名称左对齐、大小/时间定宽右排）。
-                let (header_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(table_width, row_h), egui::Sense::hover());
-                let mut header = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(header_rect)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                );
-                // 归零自动间距：列间距完全由 add_space 精确控制
-                // （否则子项间默认 8px item_spacing 会叠加，列位错乱）。
-                header.spacing_mut().item_spacing.x = 0.0;
-                header.add_space(icon_pad);
-                header.add_sized(
-                    [name_col - icon_pad, row_h],
-                    egui::Label::new(
-                        RichText::new("名称")
-                            .strong()
-                            .size(11.0)
-                            .color(theme.text_muted),
-                    )
-                    .halign(egui::Align::LEFT),
-                );
-                header.add_space(6.0);
-                header.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.set_min_size(egui::vec2(size_col + time_col + 6.0, row_h));
-                    ui.add_sized(
-                        [time_col, row_h],
-                        egui::Label::new(
-                            RichText::new("修改时间")
-                                .strong()
-                                .size(11.0)
-                                .color(theme.text_muted),
-                        )
-                        .halign(egui::Align::RIGHT),
+            .show_rows(ui, row_h, total_rows, |ui, row_range| {
+                // 行间距归零：行高由 show_rows 精确分配，避免叠加默认间距错位。
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for idx in row_range {
+                    self.render_list_row(
+                        ui,
+                        idx,
+                        table_width,
+                        name_col,
+                        size_col,
+                        time_col,
+                        icon_pad,
+                        row_h,
+                        theme,
+                        &mut open_dir,
+                        &mut select,
                     );
-                    ui.add_space(6.0);
-                    ui.add_sized(
-                        [size_col, row_h],
-                        egui::Label::new(
-                            RichText::new("大小")
-                                .strong()
-                                .size(11.0)
-                                .color(theme.text_muted),
-                        )
-                        .halign(egui::Align::RIGHT),
-                    );
-                });
-                ui.separator();
-
-                // ".." 行：返回上级目录（文件管理器通用习惯，导航更直观）。
-                {
-                    let (row_rect, _) = ui
-                        .allocate_exact_size(egui::vec2(table_width, row_h), egui::Sense::hover());
-                    // hover 用指针位置判定（子 Ui 会抢走 response.hovered()）。
-                    let pointer_in_row =
-                        ui.input(|i| i.pointer.hover_pos().is_some_and(|p| row_rect.contains(p)));
-                    if pointer_in_row {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        ui.painter().rect_filled(
-                            row_rect,
-                            crate::theme::tokens::RADIUS_ITEM,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
-                        );
-                    }
-                    let icon = egui::Rect::from_center_size(
-                        egui::pos2(row_rect.left() + 6.0 + 7.0, row_rect.center().y),
-                        egui::vec2(14.0, 14.0),
-                    );
-                    paint_entry_icon(ui.painter(), icon, true);
-                    let mut inner = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(row_rect)
-                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    );
-                    inner.spacing_mut().item_spacing.x = 0.0;
-                    inner.add_space(icon_pad);
-                    inner.add_sized(
-                        [name_col - icon_pad, row_h],
-                        egui::Label::new(RichText::new("..").monospace().color(theme.text_primary))
-                            .halign(egui::Align::LEFT)
-                            .truncate(),
-                    );
-                    inner.add_space(6.0);
-                    inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.set_min_size(egui::vec2(size_col + time_col + 6.0, row_h));
-                        ui.add_sized(
-                            [time_col, row_h],
-                            egui::Label::new(RichText::new("—").color(theme.text_muted))
-                                .halign(egui::Align::RIGHT),
-                        );
-                        ui.add_space(6.0);
-                        ui.add_sized(
-                            [size_col, row_h],
-                            egui::Label::new(RichText::new("—").color(theme.text_muted))
-                                .halign(egui::Align::RIGHT),
-                        );
-                    });
-                    // 整行点击区：显式 ui.interact + 稳定 Id，且必须在列内容
-                    // 之后注册（后注册 widget 在顶层；见条目行注释）。
-                    let response = ui.interact(
-                        row_rect,
-                        egui::Id::new(("sftp_row", "..")),
-                        egui::Sense::click(),
-                    );
-                    if response.clicked() {
-                        let parent = Self::parent_of(&self.current_path);
-                        self.handle.list(&parent);
-                        self.loading = true;
-                        self.selected = None;
-                    }
-                }
-
-                let mut open_dir: Option<String> = None;
-                let mut select: Option<String> = None;
-                for entry in &self.entries {
-                    let selected = self.selected.as_deref() == Some(entry.name.as_str());
-                    let label = if entry.is_dir {
-                        format!("{}/", entry.name)
-                    } else {
-                        entry.name.clone()
-                    };
-                    // 整行点击区：单击选中，再次单击已选中的目录进入下级目录
-                    //（不用 double_clicked——egui 多击计数会被无关点击污染，
-                    // 双击时灵时不灵）。
-                    let (row_rect, _) = ui
-                        .allocate_exact_size(egui::vec2(table_width, row_h), egui::Sense::hover());
-                    let row_id = egui::Id::new(("sftp_row", entry.name.as_str()));
-                    // hover 用指针位置判定（子 Ui 会抢走 response.hovered()）。
-                    let pointer_in_row =
-                        ui.input(|i| i.pointer.hover_pos().is_some_and(|p| row_rect.contains(p)));
-                    // 选中：accent 软底 + 左侧 accent 竖条；hover：白色低透明度
-                    // 叠加（Tabby 风，先画背景，列内容绘制在其上）。
-                    if selected {
-                        ui.painter().rect_filled(
-                            row_rect,
-                            crate::theme::tokens::RADIUS_ITEM,
-                            theme.accent_soft,
-                        );
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(row_rect.left() + 1.0, row_rect.top() + 4.0),
-                                egui::pos2(row_rect.left() + 3.0, row_rect.bottom() - 4.0),
-                            ),
-                            1.5,
-                            theme.accent,
-                        );
-                    } else if pointer_in_row {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        ui.painter().rect_filled(
-                            row_rect,
-                            crate::theme::tokens::RADIUS_ITEM,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
-                        );
-                    }
-                    // 行首矢量图标：文件夹 accent2 填充 / 文件描边轮廓。
-                    let icon = egui::Rect::from_center_size(
-                        egui::pos2(row_rect.left() + 6.0 + 7.0, row_rect.center().y),
-                        egui::vec2(14.0, 14.0),
-                    );
-                    paint_entry_icon(ui.painter(), icon, entry.is_dir);
-                    // 三列内容：名称（目录主色/文件次要色）+ 大小/时间定宽右排。
-                    let name_text =
-                        RichText::new(label)
-                            .monospace()
-                            .color(if entry.is_dir || selected {
-                                theme.text_primary
-                            } else {
-                                theme.text_secondary
-                            });
-                    let weak_color = if selected {
-                        theme.text_secondary
-                    } else {
-                        theme.text_muted
-                    };
-                    let mut inner = ui.new_child(
-                        egui::UiBuilder::new()
-                            .id_salt(("sftp_cols", entry.name.as_str()))
-                            .max_rect(row_rect)
-                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    );
-                    // 归零自动间距（见表头注释）。
-                    inner.spacing_mut().item_spacing.x = 0.0;
-                    inner.add_space(icon_pad);
-                    inner.add_sized(
-                        [name_col - icon_pad, row_h],
-                        egui::Label::new(name_text)
-                            .halign(egui::Align::LEFT)
-                            .truncate(),
-                    );
-                    inner.add_space(6.0);
-                    inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.set_min_size(egui::vec2(size_col + time_col + 6.0, row_h));
-                        // 时间缺失时以 "—" 占位，保持列位稳定。
-                        let time_text = entry
-                            .modified
-                            .map(Self::format_time)
-                            .unwrap_or_else(|| "—".to_string());
-                        ui.add_sized(
-                            [time_col, row_h],
-                            egui::Label::new(RichText::new(time_text).color(weak_color))
-                                .halign(egui::Align::RIGHT)
-                                .truncate(),
-                        );
-                        ui.add_space(6.0);
-                        let size_text = if entry.is_dir {
-                            "—".to_string()
-                        } else {
-                            Self::format_size(entry.size)
-                        };
-                        ui.add_sized(
-                            [size_col, row_h],
-                            egui::Label::new(RichText::new(size_text).color(weak_color))
-                                .halign(egui::Align::RIGHT)
-                                .truncate(),
-                        );
-                    });
-                    // 整行点击区：显式 ui.interact + 稳定 Id，且必须在列内容
-                    // 之后注册（后注册 widget 在顶层）——allocate_exact_size
-                    // 的自动 Id 帧间漂移、new_child 子 Ui 叠加，行点击从未
-                    // 生效（"点击文件夹进不去"的根因）。
-                    let response = ui.interact(row_rect, row_id, egui::Sense::click());
-                    if response.clicked() {
-                        if entry.is_dir && self.selected.as_deref() == Some(entry.name.as_str()) {
-                            open_dir = Some(entry.name.clone());
-                        } else {
-                            select = Some(entry.name.clone());
-                        }
-                    }
-                }
-                if let Some(name) = open_dir {
-                    let path = self.join(&name);
-                    self.handle.list(&path);
-                    self.loading = true;
-                    self.selected = None;
-                }
-                if let Some(name) = select {
-                    self.selected = Some(name);
-                }
-                if self.entries.is_empty() && !self.loading {
-                    ui.add_space(14.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("空目录").size(12.0).color(theme.text_muted));
-                    });
                 }
             });
+        if let Some(name) = open_dir {
+            let path = self.join(&name);
+            self.handle.list(&path);
+            self.loading = true;
+            self.selected = None;
+        }
+        if let Some(name) = select {
+            self.selected = Some(name);
+        }
 
         // ==================== 传输进度 ====================
         if !self.transfers.is_empty() {
@@ -971,6 +1025,7 @@ mod tests {
             dialog: None,
             error: None,
             closed: false,
+            cell_width: 0.0,
         };
 
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
@@ -1017,6 +1072,7 @@ mod tests {
             dialog: None,
             error: None,
             closed: false,
+            cell_width: 0.0,
         };
 
         // 模拟 340 宽面板（app.rs sftp_frame 左右内边距各 12；默认宽为
@@ -1093,6 +1149,7 @@ mod tests {
             dialog: None,
             error: None,
             closed: false,
+            cell_width: 0.0,
         };
 
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
@@ -1177,6 +1234,7 @@ mod tests {
             dialog: None,
             error: None,
             closed: false,
+            cell_width: 0.0,
         };
 
         let mut harness = egui_kittest::Harness::new_ui(|ui| {

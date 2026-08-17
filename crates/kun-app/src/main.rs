@@ -4,6 +4,7 @@ pub mod anim;
 mod app;
 pub mod completion;
 mod native;
+pub mod perf;
 pub mod theme;
 pub mod views;
 

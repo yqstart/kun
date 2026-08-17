@@ -139,24 +139,36 @@ pub const TERM_CURSOR: Rgb = Rgb {
     b: 0xf8,
 };
 
+/// xterm 256 色表固定部分（index ≥ 16：216 立方色 + 24 灰阶，与主题调色板无关）。
+/// 一次计算后查表，避免逐 cell 现算乘除（全彩色屏时每帧上万次）。
+static XTERM_FIXED: std::sync::OnceLock<[Rgb; 240]> = std::sync::OnceLock::new();
+
 /// xterm 256 色表（16 基本 + 216 立方色 + 24 灰阶）。
 pub fn xterm256(index: u8, palette: [Rgb; 16]) -> Rgb {
     if index < 16 {
         palette[index as usize]
-    } else if index < 232 {
-        let n = index - 16;
-        let r = n / 36;
-        let g = (n % 36) / 6;
-        let b = n % 6;
-        let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-        Rgb {
-            r: level(r),
-            g: level(g),
-            b: level(b),
-        }
     } else {
-        let v = 8 + (index - 232) * 10;
-        Rgb { r: v, g: v, b: v }
+        let table = XTERM_FIXED.get_or_init(|| {
+            std::array::from_fn(|i| {
+                let n = i as u8 + 16;
+                if n < 232 {
+                    let n2 = n - 16;
+                    let r = n2 / 36;
+                    let g = (n2 % 36) / 6;
+                    let b = n2 % 6;
+                    let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+                    Rgb {
+                        r: level(r),
+                        g: level(g),
+                        b: level(b),
+                    }
+                } else {
+                    let v = 8 + (n - 232) * 10;
+                    Rgb { r: v, g: v, b: v }
+                }
+            })
+        });
+        table[(index - 16) as usize]
     }
 }
 
