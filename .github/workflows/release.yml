@@ -21,6 +21,8 @@ concurrency:
 jobs:
   build:
     name: Build (${{ matrix.name }})
+    # v0.7.0：ARM runner 曾在 UI 测试中挂死 4.5h（手动取消）；限时失败以便重试。
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
