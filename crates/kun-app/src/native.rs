@@ -1,6 +1,6 @@
 //! macOS 原生窗口定制（非 macOS 平台为空实现）。
 //!
-//! 关闭系统标题栏（`with_decorations(false)`）后窗口是方角矩形，
+//! 窗口使用透明的全尺寸标题栏，并隐藏系统标题与按钮；
 //! 这里通过 AppKit 给窗口 contentView 的 layer 设置圆角 + 裁切，
 //! 并将窗口背景设为透明，使圆角外侧露出桌面，形成整体圆角观感。
 //!
@@ -15,7 +15,7 @@ use objc2_app_kit::NSView;
 #[cfg(target_os = "macos")]
 const WINDOW_CORNER_RADIUS: f64 = 12.0;
 
-/// 给无边框窗口应用整体圆角。失败（非 macOS / 无 AppKit 句柄）时静默忽略。
+/// 给应用窗口应用整体圆角。失败（非 macOS / 无 AppKit 句柄）时静默忽略。
 pub fn apply_rounded_window(cc: &eframe::CreationContext<'_>) {
     #[cfg(target_os = "macos")]
     apply_rounded_window_macos(cc);

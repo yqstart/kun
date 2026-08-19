@@ -2856,7 +2856,7 @@ dependencies = [
 
 [[package]]
 name = "kun-app"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "accesskit",
  "alacritty_terminal",
@@ -2877,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "kun-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "alacritty_terminal",
  "env_logger",

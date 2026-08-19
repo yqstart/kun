@@ -174,10 +174,14 @@ fn main() -> eframe::Result {
         .with_inner_size([960.0, 640.0])
         .with_min_inner_size([400.0, 300.0])
         .with_title("kun")
-        // 关闭 eframe 标题栏（macOS 上 traffic lights 也消失），
-        // 由 `tab_bar` 在最左自绘三个圆点 + drag region 模拟。
-        // 与 Terminal.app/iTerm2 类应用风格一致——标签栏与红绿灯同处一行。
-        .with_decorations(false);
+        // 保留 macOS 的 Titled 窗口样式，避免无边框窗口退出时触发 AppKit 的
+        // NSTouchBarFinderObservation 崩溃；标题栏本身仍做成透明并与内容重叠，
+        // 外观继续由应用自绘。
+        .with_decorations(true)
+        .with_fullsize_content_view(true)
+        .with_title_shown(false)
+        .with_titlebar_buttons_shown(false)
+        .with_titlebar_shown(false);
     // 设置应用图标（macOS Dock 图标由 eframe 运行时写入 NSApp）。
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
@@ -192,7 +196,7 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
-            // 无边框窗口整体圆角（AppKit layer；非 macOS/测试环境静默跳过）。
+            // 应用窗口圆角与透明背景（非 macOS/测试环境静默跳过）。
             native::apply_rounded_window(cc);
             Ok(Box::new(KunApp::new(cc)))
         }),

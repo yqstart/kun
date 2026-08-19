@@ -17,9 +17,7 @@ struct Transfer {
 /// 文件操作确认对话框。
 enum ConfirmDialog {
     Delete {
-        name: String,
-        path: String,
-        is_dir: bool,
+        items: Vec<DeleteTarget>,
     },
     Rename {
         from: String,
@@ -32,6 +30,27 @@ enum ConfirmDialog {
     },
 }
 
+/// 待确认删除的远程条目。
+#[derive(Clone)]
+struct DeleteTarget {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+/// 列表右键菜单产生的动作，统一在 `show` 结束后执行，避免菜单闭包
+/// 与当前列表的可变借用互相冲突。
+enum ContextAction {
+    Open(String),
+    Refresh,
+    Upload,
+    Download(Vec<String>),
+    Rename(String),
+    Delete(Vec<String>),
+    Mkdir,
+    Locate(String),
+}
+
 /// SFTP 面板状态。
 pub struct SftpView {
     /// 主机名称（显示用）。
@@ -42,8 +61,10 @@ pub struct SftpView {
     current_path: String,
     /// 当前目录条目。
     entries: Vec<RemoteEntry>,
-    /// 选中条目。
-    selected: Option<String>,
+    /// 选中条目（按当前目录顺序保存，支持 Shift/Cmd(Ctrl) 多选）。
+    selected: Vec<String>,
+    /// Shift 范围选择的锚点。
+    selection_anchor: Option<String>,
     /// 加载中。
     loading: bool,
     /// 传输任务。
@@ -61,13 +82,29 @@ pub struct SftpView {
 impl SftpView {
     /// 创建 SFTP 面板（连接就绪后）。
     pub fn new(host_name: &str, handle: SftpHandle, rx: UnboundedReceiver<SftpEvent>) -> Self {
+        Self::new_at_path(host_name, handle, rx, "/")
+    }
+
+    /// 创建 SFTP 面板并从指定的远程初始目录开始浏览。
+    pub fn new_at_path(
+        host_name: &str,
+        handle: SftpHandle,
+        rx: UnboundedReceiver<SftpEvent>,
+        initial_path: &str,
+    ) -> Self {
+        let initial_path = if initial_path.is_empty() {
+            "/"
+        } else {
+            initial_path
+        };
         let view = Self {
             host_name: host_name.to_string(),
             handle,
             rx,
-            current_path: "/".to_string(),
+            current_path: initial_path.to_string(),
             entries: Vec::new(),
-            selected: None,
+            selected: Vec::new(),
+            selection_anchor: None,
             loading: true,
             transfers: Vec::new(),
             dialog: None,
@@ -75,14 +112,84 @@ impl SftpView {
             closed: false,
             cell_width: 0.0,
         };
-        // 初始列出根目录。
-        view.handle.list("/");
+        // 初始列出 SFTP 会话的目录（通常与远程终端登录目录一致）。
+        view.handle.list(initial_path);
         view
     }
 
     /// 会话引用（供状态栏等读取标题）。
     pub fn host_name(&self) -> &str {
         &self.host_name
+    }
+
+    /// 请求列出目录并清理已失效的选择状态。
+    fn navigate_to(&mut self, path: &str) {
+        let path = if path.is_empty() { "/" } else { path };
+        self.handle.list(path);
+        self.loading = true;
+        self.error = None;
+        self.selected.clear();
+        self.selection_anchor = None;
+    }
+
+    /// 按文件管理器习惯更新选择：普通点击单选，Shift 选择范围，
+    /// Cmd(macOS)/Ctrl 追加或取消单项。
+    fn update_selection(&mut self, idx: usize, name: &str, modifiers: egui::Modifiers) {
+        if modifiers.shift {
+            let anchor_idx = self
+                .selection_anchor
+                .as_deref()
+                .and_then(|anchor| self.entries.iter().position(|e| e.name == anchor))
+                .unwrap_or(idx.saturating_sub(1));
+            let clicked_idx = idx.saturating_sub(1);
+            let (start, end) = if anchor_idx <= clicked_idx {
+                (anchor_idx, clicked_idx)
+            } else {
+                (clicked_idx, anchor_idx)
+            };
+            self.selected = self.entries[start..=end]
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect();
+            return;
+        }
+
+        if modifiers.command || modifiers.ctrl {
+            if let Some(position) = self.selected.iter().position(|item| item == name) {
+                self.selected.remove(position);
+            } else {
+                self.selected.push(name.to_string());
+            }
+            self.selection_anchor = Some(name.to_string());
+            return;
+        }
+
+        self.selected.clear();
+        self.selected.push(name.to_string());
+        self.selection_anchor = Some(name.to_string());
+    }
+
+    /// 右键已选中条目时保留整个多选集合；右键未选中条目则先按当前修饰键
+    /// 更新选择，再打开该条目的菜单。
+    fn update_secondary_selection(&mut self, idx: usize, name: &str, modifiers: egui::Modifiers) {
+        let already_selected = self.selected.iter().any(|item| item == name);
+        if !already_selected || modifiers.shift || modifiers.command || modifiers.ctrl {
+            self.update_selection(idx, name, modifiers);
+        }
+    }
+
+    /// 记录一项传输，先于后台事件进入队列，保证上传区域立即出现。
+    fn begin_transfer(&mut self, label: String, total: u64) {
+        if self.transfers.iter().any(|item| item.label == label) {
+            return;
+        }
+        self.transfers.push(Transfer {
+            label,
+            done: 0,
+            total,
+            finished: false,
+            failed: false,
+        });
     }
 
     /// 处理后台事件。返回本帧是否收到新事件（调用方据此请求重绘——
@@ -95,6 +202,11 @@ impl SftpView {
                 SftpEvent::Listed { path, entries } => {
                     self.current_path = path;
                     self.entries = entries;
+                    self.selected
+                        .retain(|name| self.entries.iter().any(|entry| entry.name == *name));
+                    if self.selected.is_empty() {
+                        self.selection_anchor = None;
+                    }
                     self.loading = false;
                 }
                 SftpEvent::Progress { label, done, total } => {
@@ -200,7 +312,8 @@ impl SftpView {
         row_h: f32,
         theme: &'static crate::theme::Theme,
         open_dir: &mut Option<String>,
-        select: &mut Option<String>,
+        context_action: &mut Option<ContextAction>,
+        terminal_cwd: Option<&str>,
     ) {
         let (row_rect, _) =
             ui.allocate_exact_size(egui::vec2(table_width, row_h), egui::Sense::hover());
@@ -261,15 +374,26 @@ impl SftpView {
             let response = ui.interact(row_rect, row_id, egui::Sense::click());
             if response.clicked() {
                 let parent = Self::parent_of(&self.current_path);
-                self.handle.list(&parent);
-                self.loading = true;
-                self.selected = None;
+                *open_dir = Some(parent);
             }
+            let parent = Self::parent_of(&self.current_path);
+            response.context_menu(|ui| {
+                ui.set_min_width(180.0);
+                if ui.button("打开上级目录").clicked() {
+                    *context_action = Some(ContextAction::Open(parent.clone()));
+                    ui.close();
+                }
+                if ui.button("刷新").clicked() {
+                    *context_action = Some(ContextAction::Refresh);
+                    ui.close();
+                }
+            });
             return;
         }
 
-        let entry = &self.entries[idx - 1];
-        let selected = self.selected.as_deref() == Some(entry.name.as_str());
+        // 克隆一份可见条目，后续右键菜单闭包需要持有它，避免借用整个 entries。
+        let entry = self.entries[idx - 1].clone();
+        let selected = self.selected.iter().any(|name| name == &entry.name);
         let label = if entry.is_dir {
             format!("{}/", entry.name)
         } else {
@@ -368,154 +492,169 @@ impl SftpView {
         // 的自动 Id 帧间漂移、new_child 子 Ui 叠加，行点击从未
         // 生效（"点击文件夹进不去"的根因）。
         let response = ui.interact(row_rect, row_id, egui::Sense::click());
-        if response.clicked() {
-            if entry.is_dir && self.selected.as_deref() == Some(entry.name.as_str()) {
-                *open_dir = Some(entry.name.clone());
+        let modifiers = response.ctx.input(|input| input.modifiers);
+        if response.secondary_clicked() {
+            self.update_secondary_selection(idx, &entry.name, modifiers);
+        } else if response.clicked() {
+            let was_only_selected = self.selected.len() == 1
+                && self
+                    .selected
+                    .first()
+                    .is_some_and(|name| name == &entry.name);
+            if entry.is_dir
+                && was_only_selected
+                && !modifiers.shift
+                && !modifiers.command
+                && !modifiers.ctrl
+            {
+                *open_dir = Some(self.join(&entry.name));
             } else {
-                *select = Some(entry.name.clone());
+                self.update_selection(idx, &entry.name, modifiers);
             }
         }
+
+        let selected_names = self.selected.clone();
+        let selected_count = selected_names.len();
+        let entry_name = entry.name.clone();
+        let entry_path = self.join(&entry_name);
+        let terminal_cwd = terminal_cwd.map(str::to_string);
+        response.context_menu(|ui| {
+            ui.set_min_width(190.0);
+            if entry.is_dir && selected_count == 1 && ui.button("打开目录").clicked() {
+                *context_action = Some(ContextAction::Open(entry_path.clone()));
+                ui.close();
+            }
+            if selected_count > 0 {
+                let label = if selected_count == 1 {
+                    "下载"
+                } else {
+                    "下载选中项"
+                };
+                if ui.button(label).clicked() {
+                    *context_action = Some(ContextAction::Download(selected_names.clone()));
+                    ui.close();
+                }
+            }
+            if selected_count == 1 && ui.button("重命名").clicked() {
+                *context_action = Some(ContextAction::Rename(entry_name.clone()));
+                ui.close();
+            }
+            if selected_count > 0 {
+                let label = if selected_count == 1 {
+                    "删除"
+                } else {
+                    "删除选中项"
+                };
+                if ui.button(label).clicked() {
+                    *context_action = Some(ContextAction::Delete(selected_names.clone()));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("新建文件夹").clicked() {
+                *context_action = Some(ContextAction::Mkdir);
+                ui.close();
+            }
+            if ui.button("上传文件").clicked() {
+                *context_action = Some(ContextAction::Upload);
+                ui.close();
+            }
+            if let Some(path) = terminal_cwd.as_deref() {
+                if ui
+                    .button("定位到当前终端目录  ⌘⇧L")
+                    .on_hover_text(path)
+                    .clicked()
+                {
+                    *context_action = Some(ContextAction::Locate(path.to_string()));
+                    ui.close();
+                }
+            }
+            if ui.button("刷新").clicked() {
+                *context_action = Some(ContextAction::Refresh);
+                ui.close();
+            }
+        });
     }
 
-    /// 每帧渲染。
+    /// 每帧渲染（无终端目录上下文时的测试/嵌入入口）。
     pub fn show(&mut self, ui: &mut Ui) {
+        self.show_with_terminal_cwd(ui, None);
+    }
+
+    /// 每帧渲染，并接收当前终端已知的远程目录。
+    pub fn show_with_terminal_cwd(&mut self, ui: &mut Ui, terminal_cwd: Option<&str>) {
         // 后台事件到达后请求重绘（传输进度/列表刷新不依赖其它重绘源）。
         if self.poll_events() {
             ui.ctx().request_repaint();
         }
         let theme = crate::theme::current_theme();
 
-        // ==================== 标题行：状态点 + 主机名 + 刷新 ====================
-        // 标题占剩余宽度超长截断、刷新按钮锚定右缘（分居两端不重叠）。
-        let refresh_clicked = ui
-            .horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                // accent2 状态点（与底部状态栏同款）。
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 3.2, theme.accent2);
-                let mut clicked = false;
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    clicked = sftp_tool_button(ui, "刷新")
-                        .on_hover_text("刷新目录")
-                        .clicked();
-                    ui.add_sized(
-                        [ui.available_width().max(0.0), 18.0],
-                        egui::Label::new(
-                            RichText::new(format!("SFTP · {}", self.host_name))
-                                .strong()
-                                .size(12.5)
-                                .color(theme.text_primary),
-                        )
-                        .truncate(),
-                    );
-                });
-                clicked
-            })
-            .inner;
-        if refresh_clicked {
-            self.handle.list(&self.current_path);
-            self.loading = true;
-        }
+        // ⌘⇧L（Windows/Linux 为 Ctrl+Shift+L）定位到当前终端目录。
+        let locate_shortcut = ui.input_mut(|input| {
+            input.consume_key(
+                egui::Modifiers {
+                    shift: true,
+                    command: true,
+                    ..egui::Modifiers::NONE
+                },
+                egui::Key::L,
+            )
+        });
+        let mut context_action = if locate_shortcut {
+            terminal_cwd.map(|path| ContextAction::Locate(path.to_string()))
+        } else {
+            None
+        };
+
+        // ==================== 标题行：状态点 + 主机名 ====================
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 3.2, theme.accent2);
+            ui.add_sized(
+                [ui.available_width().max(0.0), 18.0],
+                egui::Label::new(
+                    RichText::new(format!("SFTP · {}", self.host_name))
+                        .strong()
+                        .size(12.5)
+                        .color(theme.text_primary),
+                )
+                .truncate(),
+            );
+        });
         ui.add_space(8.0);
 
-        // ==================== 操作行 ====================
-        // 空间不足时自动换行（horizontal_wrapped）：按钮不截断、不互相重叠。
-        let mut upload = false;
-        let mut download = false;
-        let mut mkdir = false;
-        let mut rename = false;
-        let mut delete = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            upload = sftp_tool_button(ui, "上传")
-                .on_hover_text("上传文件")
-                .clicked();
-            download = sftp_tool_button(ui, "下载")
-                .on_hover_text("下载选中文件")
-                .clicked();
-            mkdir = sftp_tool_button(ui, "新建目录").clicked();
-            rename = sftp_tool_button(ui, "重命名").clicked();
-            delete = sftp_tool_button(ui, "删除").clicked();
-        });
-        if upload {
-            self.upload_dialog();
-        }
-        if download {
-            self.download_selected();
-        }
-        if mkdir {
-            self.dialog = Some(ConfirmDialog::Mkdir {
-                path: self.join(""),
-                input: String::new(),
-            });
-        }
-        if rename {
-            if let Some(name) = self.selected.clone() {
-                self.dialog = Some(ConfirmDialog::Rename {
-                    from: name.clone(),
-                    path: self.join(&name),
-                    input: name,
-                });
-            }
-        }
-        if delete {
-            if let Some(name) = self.selected.clone() {
-                let entry = self.entries.iter().find(|e| e.name == name);
-                self.dialog = Some(ConfirmDialog::Delete {
-                    name: name.clone(),
-                    path: self.join(&name),
-                    is_dir: entry.map(|e| e.is_dir).unwrap_or(false),
-                });
-            }
-        }
-        ui.add_space(10.0);
-
         // ==================== 路径栏（圆角地址条） ====================
-        // 路径放在 bg_elevated 圆角条里，超长截断（曾溢出面板右缘被裁剪）。
-        let up_clicked = ui
-            .horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let clicked = sftp_tool_button(ui, "上级")
-                    .on_hover_text("返回上级目录")
-                    .clicked();
-                let bar_h = 22.0;
-                let avail = ui.available_width().max(0.0);
-                let (bar_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(avail, bar_h), egui::Sense::hover());
-                ui.painter().rect_filled(
-                    bar_rect,
-                    crate::theme::tokens::RADIUS_ITEM,
-                    theme.bg_elevated,
-                );
-                ui.painter().rect_stroke(
-                    bar_rect,
-                    crate::theme::tokens::RADIUS_ITEM,
-                    egui::Stroke::new(1.0, theme.border),
-                    egui::StrokeKind::Inside,
-                );
-                let mut inner = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(bar_rect.shrink2(egui::vec2(8.0, 0.0)))
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                );
-                inner.add_sized(
-                    [(bar_rect.width() - 16.0).max(0.0), bar_h],
-                    egui::Label::new(
-                        RichText::new(&self.current_path)
-                            .monospace()
-                            .size(11.5)
-                            .color(theme.text_muted),
-                    )
-                    .truncate(),
-                );
-                clicked
-            })
-            .inner;
-        if up_clicked {
-            let parent = Self::parent_of(&self.current_path);
-            self.handle.list(&parent);
-            self.loading = true;
-        }
+        // 路径本身不再放置操作按钮；上级目录通过 `..` 行或空白处右键菜单进入。
+        let bar_h = 22.0;
+        let avail = ui.available_width().max(0.0);
+        let (bar_rect, _) = ui.allocate_exact_size(egui::vec2(avail, bar_h), egui::Sense::hover());
+        ui.painter().rect_filled(
+            bar_rect,
+            crate::theme::tokens::RADIUS_ITEM,
+            theme.bg_elevated,
+        );
+        ui.painter().rect_stroke(
+            bar_rect,
+            crate::theme::tokens::RADIUS_ITEM,
+            egui::Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Inside,
+        );
+        let mut inner = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(bar_rect.shrink2(egui::vec2(8.0, 0.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        inner.add_sized(
+            [(bar_rect.width() - 16.0).max(0.0), bar_h],
+            egui::Label::new(
+                RichText::new(&self.current_path)
+                    .monospace()
+                    .size(11.5)
+                    .color(theme.text_muted),
+            )
+            .truncate(),
+        );
 
         // ==================== 错误提示 ====================
         if let Some(err) = &self.error {
@@ -598,6 +737,30 @@ impl SftpView {
         });
         ui.separator();
 
+        // 先注册列表背景，再注册具体行；后注册的行会覆盖背景的命中，
+        // 因而空白处可右键而不会抢走文件行的点击。空目录提示也包含在
+        // 这块背景里，用户不必精确点到列表下方才可打开菜单。
+        let blank_rect = ui.available_rect_before_wrap();
+        let blank_response = ui.interact(
+            blank_rect,
+            egui::Id::new("sftp_list_blank"),
+            egui::Sense::click(),
+        );
+        if blank_response.clicked() {
+            self.selected.clear();
+            self.selection_anchor = None;
+        }
+        let blank_path = self.current_path.clone();
+        let blank_terminal_cwd = terminal_cwd.map(str::to_string);
+        blank_response.context_menu(|ui| {
+            render_blank_context_menu(
+                ui,
+                &blank_path,
+                blank_terminal_cwd.as_deref(),
+                &mut context_action,
+            );
+        });
+
         // 加载中 / 空目录提示（滚动区外，随面板固定）。
         if self.loading {
             ui.horizontal(|ui| {
@@ -610,7 +773,20 @@ impl SftpView {
         } else if self.entries.is_empty() {
             ui.add_space(14.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("空目录").size(12.0).color(theme.text_muted));
+                let response = ui.add(
+                    egui::Label::new(RichText::new("空目录").size(12.0).color(theme.text_muted))
+                        .sense(egui::Sense::click()),
+                );
+                let empty_path = self.current_path.clone();
+                let empty_terminal_cwd = terminal_cwd.map(str::to_string);
+                response.context_menu(|ui| {
+                    render_blank_context_menu(
+                        ui,
+                        &empty_path,
+                        empty_terminal_cwd.as_deref(),
+                        &mut context_action,
+                    );
+                });
             });
         }
 
@@ -618,7 +794,6 @@ impl SftpView {
         // String/RichText/Label/子 Ui）。index 0 = ".." 上级行，其余 = entries。
         let total_rows = self.entries.len() + 1;
         let mut open_dir: Option<String> = None;
-        let mut select: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_h, total_rows, |ui, row_range| {
@@ -636,59 +811,121 @@ impl SftpView {
                         row_h,
                         theme,
                         &mut open_dir,
-                        &mut select,
+                        &mut context_action,
+                        terminal_cwd,
                     );
                 }
             });
-        if let Some(name) = open_dir {
-            let path = self.join(&name);
-            self.handle.list(&path);
-            self.loading = true;
-            self.selected = None;
-        }
-        if let Some(name) = select {
-            self.selected = Some(name);
+        if let Some(path) = open_dir {
+            self.navigate_to(&path);
         }
 
-        // ==================== 传输进度 ====================
-        if !self.transfers.is_empty() {
-            ui.separator();
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("传输")
-                    .strong()
-                    .size(11.5)
-                    .color(theme.text_secondary),
-            );
-            // 只保留最近的传输记录（上限 12 条）。
-            if self.transfers.len() > 12 {
-                self.transfers.drain(..self.transfers.len() - 12);
-            }
-            for transfer in &self.transfers {
-                ui.horizontal(|ui| {
-                    let (color, text) = if transfer.failed {
-                        (theme.danger, "失败")
-                    } else if transfer.finished {
-                        (theme.success, "完成")
-                    } else {
-                        (theme.accent2, "进行中")
-                    };
-                    ui.colored_label(color, RichText::new(text).size(11.5));
+        if let Some(action) = context_action.take() {
+            self.apply_context_action(action);
+            ui.ctx().request_repaint();
+        }
+
+        // ==================== 上传进度区域 ====================
+        // 只保留最近的传输记录（上限 12 条），上传单独放在带边框区域中，
+        // 避免进度条被目录列表淹没。
+        if self.transfers.len() > 12 {
+            self.transfers.drain(..self.transfers.len() - 12);
+        }
+        let has_upload = self
+            .transfers
+            .iter()
+            .any(|transfer| transfer.label.starts_with("上传 "));
+        if has_upload {
+            egui::Frame::new()
+                .fill(theme.bg_elevated)
+                .stroke(egui::Stroke::new(1.0, theme.border))
+                .corner_radius(crate::theme::tokens::RADIUS_ITEM)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
                     ui.label(
-                        RichText::new(&transfer.label)
+                        RichText::new("上传进度")
+                            .strong()
+                            .size(11.5)
+                            .color(theme.text_primary),
+                    );
+                    for transfer in self
+                        .transfers
+                        .iter()
+                        .filter(|transfer| transfer.label.starts_with("上传 "))
+                    {
+                        render_transfer_row(ui, transfer, theme);
+                    }
+                });
+        }
+        let has_other_transfer = self
+            .transfers
+            .iter()
+            .any(|transfer| !transfer.label.starts_with("上传 "));
+        if has_other_transfer {
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(theme.bg_elevated)
+                .stroke(egui::Stroke::new(1.0, theme.border))
+                .corner_radius(crate::theme::tokens::RADIUS_ITEM)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("传输记录")
+                            .strong()
                             .size(11.5)
                             .color(theme.text_secondary),
                     );
-                    if !transfer.finished && !transfer.failed && transfer.total > 0 {
-                        let progress = transfer.done as f32 / transfer.total as f32;
-                        ui.add(egui::ProgressBar::new(progress).desired_width(120.0).text(
-                            format!(
-                                "{} / {}",
-                                Self::format_size(transfer.done),
-                                Self::format_size(transfer.total)
-                            ),
-                        ));
+                    for transfer in self
+                        .transfers
+                        .iter()
+                        .filter(|transfer| !transfer.label.starts_with("上传 "))
+                    {
+                        render_transfer_row(ui, transfer, theme);
                     }
+                });
+        }
+    }
+
+    /// 执行列表右键菜单动作。
+    fn apply_context_action(&mut self, action: ContextAction) {
+        match action {
+            ContextAction::Open(path) | ContextAction::Locate(path) => self.navigate_to(&path),
+            ContextAction::Refresh => {
+                let path = self.current_path.clone();
+                self.handle.list(&path);
+                self.loading = true;
+            }
+            ContextAction::Upload => self.upload_dialog(),
+            ContextAction::Download(names) => self.download_selected(&names),
+            ContextAction::Rename(name) => {
+                self.dialog = Some(ConfirmDialog::Rename {
+                    from: name.clone(),
+                    path: self.join(&name),
+                    input: name,
+                });
+            }
+            ContextAction::Delete(names) => {
+                let items = names
+                    .iter()
+                    .filter_map(|name| {
+                        self.entries
+                            .iter()
+                            .find(|entry| entry.name == *name)
+                            .map(|entry| DeleteTarget {
+                                name: entry.name.clone(),
+                                path: self.join(&entry.name),
+                                is_dir: entry.is_dir,
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                if !items.is_empty() {
+                    self.dialog = Some(ConfirmDialog::Delete { items });
+                }
+            }
+            ContextAction::Mkdir => {
+                self.dialog = Some(ConfirmDialog::Mkdir {
+                    path: self.current_path.clone(),
+                    input: String::new(),
                 });
             }
         }
@@ -721,19 +958,51 @@ impl SftpView {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".to_string());
-            self.handle.upload(&path, &self.join(&name));
+            let label = format!("上传 {name}");
+            let total = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            self.begin_transfer(label, total);
+            let remote = self.join(&name);
+            self.handle.upload(&path, &remote);
         }
     }
 
-    /// 下载选中文件。
-    fn download_selected(&mut self) {
-        let Some(name) = self.selected.clone() else {
+    /// 下载选中文件。单项选择保存文件，多项选择保存目录；目录本身暂不
+    /// 递归下载，只会跳过并保留在远程列表中。
+    fn download_selected(&mut self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let files = names
+            .iter()
+            .filter_map(|name| {
+                self.entries
+                    .iter()
+                    .find(|entry| entry.name == *name && !entry.is_dir)
+                    .map(|entry| (entry.name.clone(), entry.size))
+            })
+            .collect::<Vec<_>>();
+        if files.is_empty() {
+            self.error = Some("选中的项目没有可下载的文件".to_string());
+            return;
+        }
+
+        if names.len() == 1 && files.len() == 1 {
+            let (name, size) = &files[0];
+            let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() else {
+                return;
+            };
+            self.begin_transfer(format!("下载 {name}"), *size);
+            self.handle.download(&self.join(name), &path);
+            return;
+        }
+
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        let Some(path) = rfd::FileDialog::new().set_file_name(&name).save_file() else {
-            return;
-        };
-        self.handle.download(&self.join(&name), &path);
+        for (name, size) in files {
+            self.begin_transfer(format!("下载 {name}"), size);
+            self.handle.download(&self.join(&name), &folder.join(&name));
+        }
     }
 
     /// 确认对话框渲染。
@@ -749,12 +1018,17 @@ impl SftpView {
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| match dialog {
-                ConfirmDialog::Delete { name, is_dir, .. } => {
-                    ui.label(format!(
-                        "确定删除{} {}？此操作不可恢复。",
-                        if *is_dir { "目录" } else { "文件" },
-                        name
-                    ));
+                ConfirmDialog::Delete { items } => {
+                    if items.len() == 1 {
+                        let item = &items[0];
+                        ui.label(format!(
+                            "确定删除{} {}？此操作不可恢复。",
+                            if item.is_dir { "目录" } else { "文件" },
+                            item.name
+                        ));
+                    } else {
+                        ui.label(format!("确定删除 {} 个项目？此操作不可恢复。", items.len()));
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button("删除").clicked() {
@@ -801,8 +1075,10 @@ impl SftpView {
         }
         if let Some(dialog) = action {
             match dialog {
-                ConfirmDialog::Delete { path, is_dir, .. } => {
-                    self.handle.remove(&path, is_dir);
+                ConfirmDialog::Delete { items } => {
+                    for item in items {
+                        self.handle.remove(&item.path, item.is_dir);
+                    }
                 }
                 ConfirmDialog::Rename { path, input, .. } => {
                     let new_path = self.join(&input);
@@ -825,15 +1101,83 @@ impl SftpView {
     }
 }
 
-/// SFTP 工具栏紧凑按钮：深色底 + 细边框 + 圆角（Tabby 风）。
-fn sftp_tool_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let theme = crate::theme::current_theme();
+/// 绘制空白处的统一右键菜单。
+fn render_blank_context_menu(
+    ui: &mut egui::Ui,
+    current_path: &str,
+    terminal_cwd: Option<&str>,
+    action: &mut Option<ContextAction>,
+) {
+    ui.set_min_width(190.0);
+    if ui.button("上传文件").clicked() {
+        *action = Some(ContextAction::Upload);
+        ui.close();
+    }
+    if ui.button("新建文件夹").clicked() {
+        *action = Some(ContextAction::Mkdir);
+        ui.close();
+    }
+    if ui.button("刷新").clicked() {
+        *action = Some(ContextAction::Refresh);
+        ui.close();
+    }
+    let parent = SftpView::parent_of(current_path);
+    if ui.button("打开上级目录").clicked() {
+        *action = Some(ContextAction::Open(parent));
+        ui.close();
+    }
+    if let Some(path) = terminal_cwd {
+        if ui
+            .button("定位到当前终端目录  ⌘⇧L")
+            .on_hover_text(path)
+            .clicked()
+        {
+            *action = Some(ContextAction::Locate(path.to_string()));
+            ui.close();
+        }
+    }
+}
+
+/// 渲染一条带状态、文件名与字节数的传输记录。
+fn render_transfer_row(
+    ui: &mut egui::Ui,
+    transfer: &Transfer,
+    theme: &'static crate::theme::Theme,
+) {
+    let (color, status) = if transfer.failed {
+        (theme.danger, "失败")
+    } else if transfer.finished {
+        (theme.success, "完成")
+    } else {
+        (theme.accent2, "进行中")
+    };
+    ui.colored_label(color, RichText::new(status).size(11.5));
     ui.add(
-        egui::Button::new(RichText::new(label).size(11.5).color(theme.text_primary))
-            .fill(theme.bg_elevated)
-            .stroke(egui::Stroke::new(1.0, theme.border))
-            .corner_radius(crate::theme::tokens::RADIUS_ITEM),
-    )
+        egui::Label::new(
+            RichText::new(&transfer.label)
+                .size(11.5)
+                .color(theme.text_secondary),
+        )
+        .truncate(),
+    );
+    let progress = if transfer.total == 0 {
+        if transfer.finished {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        (transfer.done as f32 / transfer.total as f32).clamp(0.0, 1.0)
+    };
+    ui.add(
+        egui::ProgressBar::new(progress)
+            .desired_width(ui.available_width().max(80.0))
+            .text(format!(
+                "{} / {}",
+                SftpView::format_size(transfer.done),
+                SftpView::format_size(transfer.total)
+            )),
+    );
 }
 
 /// 行首文件/目录矢量图标：文件夹为 accent2 填充（提手 + 圆角主体），
@@ -865,10 +1209,8 @@ fn paint_entry_icon(painter: &egui::Painter, rect: egui::Rect, is_dir: bool) {
 impl Clone for ConfirmDialog {
     fn clone(&self) -> Self {
         match self {
-            ConfirmDialog::Delete { name, path, is_dir } => ConfirmDialog::Delete {
-                name: name.clone(),
-                path: path.clone(),
-                is_dir: *is_dir,
+            ConfirmDialog::Delete { items } => ConfirmDialog::Delete {
+                items: items.clone(),
             },
             ConfirmDialog::Rename { from, path, input } => ConfirmDialog::Rename {
                 from: from.clone(),
@@ -981,10 +1323,7 @@ mod tests {
             view.show(ui);
         });
         harness.run();
-        harness.get_by_label("刷新");
-        harness.get_by_label("上传");
-        harness.get_by_label("下载");
-        harness.get_by_label("新建目录");
+        harness.get_by_label("..");
         // 面板标题包含主机名。
         harness.get_by_label("SFTP · UI 测试主机");
     }
@@ -1019,7 +1358,8 @@ mod tests {
                     permissions: 0,
                 },
             ],
-            selected: Some("readme.md".into()),
+            selected: vec!["readme.md".into()],
+            selection_anchor: Some("readme.md".into()),
             loading: false,
             transfers: Vec::new(),
             dialog: None,
@@ -1035,9 +1375,11 @@ mod tests {
         });
         harness.run();
 
-        // 点击删除按钮 → 出现确认对话框。
+        // 右键条目 → 菜单中的删除 → 出现确认对话框。
+        harness.get_by_label("readme.md").click_secondary();
+        harness.run_steps(6);
         harness.get_by_label("删除").click();
-        harness.run();
+        harness.run_steps(6);
         harness.get_by_label("确认删除");
         harness.get_by_label("readme.md");
 
@@ -1050,11 +1392,183 @@ mod tests {
         );
     }
 
-    /// 渲染级回归：340 宽（比 40% 默认更窄的保守下界）下工具栏按钮
-    /// 不被右缘截断、互不重叠
-    /// （曾把全部按钮塞一行：溢出被裁剪，且右对齐的"刷新"与"删除"重叠）。
+    /// Shift 选择范围后，右键菜单应把多选操作显示为批量动作。
     #[test]
-    fn 工具栏按钮不截断不重叠() {
+    fn shift多选右键批量菜单() {
+        use kittest::Queryable;
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_raw(handle_tx);
+        let mut view = SftpView {
+            host_name: "测试主机".into(),
+            handle,
+            rx,
+            current_path: "/".into(),
+            entries: vec![
+                RemoteEntry {
+                    name: "a.txt".into(),
+                    is_dir: false,
+                    size: 1,
+                    modified: None,
+                    permissions: 0,
+                },
+                RemoteEntry {
+                    name: "b.txt".into(),
+                    is_dir: false,
+                    size: 2,
+                    modified: None,
+                    permissions: 0,
+                },
+                RemoteEntry {
+                    name: "folder".into(),
+                    is_dir: true,
+                    size: 0,
+                    modified: None,
+                    permissions: 0,
+                },
+            ],
+            selected: vec![],
+            selection_anchor: None,
+            loading: false,
+            transfers: Vec::new(),
+            dialog: None,
+            error: None,
+            closed: false,
+            cell_width: 0.0,
+        };
+        let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
+        harness.run();
+
+        harness.get_by_label("a.txt").click();
+        harness.run_steps(2);
+        harness
+            .get_by_label("folder/")
+            .click_modifiers(egui::Modifiers::SHIFT);
+        harness.run_steps(2);
+        harness.get_by_label("b.txt").click_secondary();
+        harness.run_steps(4);
+
+        harness.get_by_label("删除选中项");
+        harness.get_by_label("下载选中项");
+    }
+
+    /// 上传事件应落在独立的上传进度区域，而不是只显示一条状态文字。
+    #[test]
+    fn 上传进度独立区域() {
+        use kittest::Queryable;
+
+        let (event_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_raw(handle_tx);
+        let mut view = SftpView {
+            host_name: "测试主机".into(),
+            handle,
+            rx,
+            current_path: "/home/test".into(),
+            entries: Vec::new(),
+            selected: vec![],
+            selection_anchor: None,
+            loading: false,
+            transfers: Vec::new(),
+            dialog: None,
+            error: None,
+            closed: false,
+            cell_width: 0.0,
+        };
+        event_tx
+            .send(SftpEvent::Progress {
+                label: "上传 demo.bin".into(),
+                done: 512,
+                total: 1024,
+            })
+            .unwrap();
+
+        let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
+        harness.run_steps(2);
+        harness.get_by_label("上传进度");
+        harness.get_by_label("上传 demo.bin");
+    }
+
+    /// ⌘⇧L 应直接发出当前终端目录的列表请求。
+    #[test]
+    fn 快捷键定位终端目录() {
+        use kun_core::ssh::sftp::SftpCmd;
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_raw(handle_tx);
+        let mut view = SftpView {
+            host_name: "测试主机".into(),
+            handle,
+            rx,
+            current_path: "/".into(),
+            entries: Vec::new(),
+            selected: vec![],
+            selection_anchor: None,
+            loading: false,
+            transfers: Vec::new(),
+            dialog: None,
+            error: None,
+            closed: false,
+            cell_width: 0.0,
+        };
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            view.show_with_terminal_cwd(ui, Some("/srv/project"));
+        });
+        harness.run_steps(2);
+        harness.event(egui::Event::Key {
+            key: egui::Key::L,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+        });
+        harness.run_steps(2);
+
+        let cmd = cmd_rx.try_recv().expect("快捷键应发出目录定位请求");
+        assert!(matches!(cmd, SftpCmd::List { path } if path == "/srv/project"));
+    }
+
+    /// 目录列表空白区域右键应提供新建文件夹等操作。
+    #[test]
+    fn 空白处右键新建文件夹菜单() {
+        use kittest::Queryable;
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_raw(handle_tx);
+        let mut view = SftpView {
+            host_name: "测试主机".into(),
+            handle,
+            rx,
+            current_path: "/".into(),
+            entries: Vec::new(),
+            selected: vec![],
+            selection_anchor: None,
+            loading: false,
+            transfers: Vec::new(),
+            dialog: None,
+            error: None,
+            closed: false,
+            cell_width: 0.0,
+        };
+        let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
+        harness.run_steps(2);
+        harness.get_by_label("空目录").click_secondary();
+        harness.run_steps(4);
+        harness.get_by_label("新建文件夹");
+        harness.get_by_label("上传文件");
+    }
+
+    /// 渲染级回归：340 宽（比 40% 默认更窄的保守下界）下地址栏和标题
+    /// 不越出面板边界；操作入口由右键菜单提供。
+    #[test]
+    fn sftp面板窄宽不截断() {
         use kittest::Queryable;
 
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1066,7 +1580,8 @@ mod tests {
             rx,
             current_path: "/very/long/remote/path/that/overflows/".into(),
             entries: Vec::new(),
-            selected: None,
+            selected: vec![],
+            selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
             dialog: None,
@@ -1085,30 +1600,9 @@ mod tests {
         });
         harness.run();
 
-        let labels = ["刷新", "上传", "下载", "新建目录", "重命名", "删除"];
-        let rects: Vec<egui::Rect> = labels
-            .iter()
-            .map(|l| harness.get_by_label(l).rect())
-            .collect();
-        for (label, rect) in labels.iter().zip(&rects) {
-            assert!(
-                rect.right() <= PANEL_W - MARGIN_X + 0.5,
-                "{label} 按钮右缘 {:.1} 超出面板内容区（被截断）",
-                rect.right()
-            );
-        }
-        for i in 0..rects.len() {
-            for j in i + 1..rects.len() {
-                assert!(
-                    !rects[i].intersects(rects[j]),
-                    "按钮 {} 与 {} 重叠：{:?} vs {:?}",
-                    labels[i],
-                    labels[j],
-                    rects[i],
-                    rects[j]
-                );
-            }
-        }
+        let title = harness.get_by_label("SFTP · 测试主机").rect();
+        assert!(title.right() <= PANEL_W - MARGIN_X + 0.5);
+        harness.get_by_label("..");
     }
 
     /// 单击选中，再次单击已选中的目录进入下级目录（发 List 命令）。
@@ -1143,7 +1637,8 @@ mod tests {
                     permissions: 0,
                 },
             ],
-            selected: None,
+            selected: vec![],
+            selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
             dialog: None,
@@ -1228,7 +1723,8 @@ mod tests {
                     permissions: 0,
                 },
             ],
-            selected: None,
+            selected: vec![],
+            selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
             dialog: None,

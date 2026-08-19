@@ -1,6 +1,7 @@
 //! SFTP 客户端：后台线程驱动，UI 通过命令队列操作、事件流接收结果。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use russh_sftp::client::SftpSession;
@@ -9,6 +10,37 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::config::HostProfile;
 use crate::ssh::{connect_verified, ssh_config};
+
+/// 传输临时文件序号。临时文件与目标文件位于同一目录，成功后用 rename
+/// 原子替换目标，避免失败传输破坏已有文件。
+static PARTIAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn partial_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        PARTIAL_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn partial_remote_path(remote: &str) -> String {
+    if remote.is_empty() {
+        format!(".kun-partial-{}", partial_suffix())
+    } else {
+        format!("{remote}.kun-partial-{}", partial_suffix())
+    }
+}
+
+fn partial_local_path(local: &Path) -> PathBuf {
+    let name = local
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    local
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.kun-partial-{}", partial_suffix()))
+}
 
 /// 远程文件条目。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +67,8 @@ pub enum SftpCmd {
 /// SFTP 事件（后台 → UI）。
 #[derive(Debug, Clone)]
 pub enum SftpEvent {
-    /// 连接就绪。
-    Ready,
+    /// 连接就绪，同时返回 SFTP 会话的初始目录。
+    Ready { home: String },
     /// 连接失败。
     Failed(String),
     /// 目录列表完成。
@@ -202,7 +234,11 @@ async fn sftp_main(
     };
 
     log::info!("SFTP 连接就绪");
-    let _ = ev_tx.send(SftpEvent::Ready);
+    let home = sftp
+        .canonicalize(".")
+        .await
+        .unwrap_or_else(|_| "/".to_string());
+    let _ = ev_tx.send(SftpEvent::Ready { home });
 
     // ==================== 3. 操作循环 ====================
     while let Some(cmd) = cmd_rx.recv().await {
@@ -234,8 +270,6 @@ async fn sftp_main(
                         let _ = ev_tx.send(SftpEvent::Done { label });
                     }
                     Err(e) => {
-                        // 失败时清理半成品远程文件（不残留 0 字节/截断文件）。
-                        let _ = sftp.remove_file(&remote).await;
                         let _ = ev_tx.send(SftpEvent::Error { label, message: e });
                     }
                 }
@@ -253,8 +287,6 @@ async fn sftp_main(
                         let _ = ev_tx.send(SftpEvent::Done { label });
                     }
                     Err(e) => {
-                        // 失败时清理半成品本地文件（不残留截断文件误导用户）。
-                        let _ = tokio::fs::remove_file(&local).await;
                         let _ = ev_tx.send(SftpEvent::Error { label, message: e });
                     }
                 }
@@ -348,35 +380,48 @@ async fn upload_file(
     label: &str,
     ev_tx: &UnboundedSender<SftpEvent>,
 ) -> Result<(), String> {
-    let mut local_file = tokio::fs::File::open(local)
-        .await
-        .map_err(|e| e.to_string())?;
-    let total = local_file
-        .metadata()
-        .await
-        .map_err(|e| e.to_string())?
-        .len();
-    let mut remote_file = sftp.create(remote).await.map_err(|e| e.to_string())?;
-
-    let mut done = 0u64;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = local_file.read(&mut buf).await.map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        remote_file
-            .write_all(&buf[..n])
+    let partial = partial_remote_path(remote);
+    let result = async {
+        let mut local_file = tokio::fs::File::open(local)
             .await
             .map_err(|e| e.to_string())?;
-        done += n as u64;
-        let _ = ev_tx.send(SftpEvent::Progress {
-            label: label.to_string(),
-            done,
-            total,
-        });
+        let total = local_file
+            .metadata()
+            .await
+            .map_err(|e| e.to_string())?
+            .len();
+        let mut remote_file = sftp.create(&partial).await.map_err(|e| e.to_string())?;
+
+        let mut done = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = local_file.read(&mut buf).await.map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            remote_file
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| e.to_string())?;
+            done += n as u64;
+            let _ = ev_tx.send(SftpEvent::Progress {
+                label: label.to_string(),
+                done,
+                total,
+            });
+        }
+        remote_file.close().await.map_err(|e| e.to_string())
     }
-    remote_file.close().await.map_err(|e| e.to_string())
+    .await;
+    if let Err(error) = result {
+        let _ = sftp.remove_file(&partial).await;
+        return Err(error);
+    }
+    if let Err(error) = sftp.rename(&partial, remote).await {
+        let _ = sftp.remove_file(&partial).await;
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 /// 下载远程文件到本地（带进度）。
@@ -387,33 +432,69 @@ async fn download_file(
     label: &str,
     ev_tx: &UnboundedSender<SftpEvent>,
 ) -> Result<(), String> {
-    let meta = sftp.metadata(remote).await.map_err(|e| e.to_string())?;
-    let total = meta.len();
-    let mut remote_file = sftp.open(remote).await.map_err(|e| e.to_string())?;
-    let mut local_file = tokio::fs::File::create(local)
-        .await
-        .map_err(|e| e.to_string())?;
+    let partial = partial_local_path(local);
+    let result = async {
+        let meta = sftp.metadata(remote).await.map_err(|e| e.to_string())?;
+        let total = meta.len();
+        let mut remote_file = sftp.open(remote).await.map_err(|e| e.to_string())?;
+        let mut local_file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .await
+            .map_err(|e| e.to_string())?;
 
-    let mut done = 0u64;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = remote_file
-            .read(&mut buf)
-            .await
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
+        let mut done = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = remote_file
+                .read(&mut buf)
+                .await
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            local_file
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| e.to_string())?;
+            done += n as u64;
+            let _ = ev_tx.send(SftpEvent::Progress {
+                label: label.to_string(),
+                done,
+                total,
+            });
         }
-        local_file
-            .write_all(&buf[..n])
-            .await
-            .map_err(|e| e.to_string())?;
-        done += n as u64;
-        let _ = ev_tx.send(SftpEvent::Progress {
-            label: label.to_string(),
-            done,
-            total,
-        });
+        local_file.flush().await.map_err(|e| e.to_string())?;
+        local_file.sync_all().await.map_err(|e| e.to_string())
     }
-    local_file.flush().await.map_err(|e| e.to_string())
+    .await;
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(error);
+    }
+    if let Err(error) = tokio::fs::rename(&partial, local).await {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 传输临时文件与目标同目录() {
+        let local = Path::new("/tmp/result.txt");
+        let partial = partial_local_path(local);
+        assert_eq!(partial.parent(), local.parent());
+        assert!(partial
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".result.txt.kun-partial-")));
+
+        let remote = partial_remote_path("/srv/result.txt");
+        assert!(remote.starts_with("/srv/result.txt.kun-partial-"));
+    }
 }

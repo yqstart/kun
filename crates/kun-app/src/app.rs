@@ -155,9 +155,19 @@ pub struct KunApp {
     toast: Option<Toast>,
     /// 进行中的 SFTP 连接（句柄 + 事件流 + 主机名——主机名随连接绑定，
     /// 多连接并发时不会串到别的标签页上）。
-    pending_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>, String)>,
+    pending_sftp: Option<(
+        SftpHandle,
+        UnboundedReceiver<SftpEvent>,
+        String,
+        Option<String>,
+    )>,
     /// SFTP 已就绪但 SSH 标签尚未创建，等待挂载。
-    ready_sftp: Option<(SftpHandle, UnboundedReceiver<SftpEvent>, String)>,
+    ready_sftp: Option<(
+        SftpHandle,
+        UnboundedReceiver<SftpEvent>,
+        String,
+        Option<String>,
+    )>,
     /// SFTP 连接错误（状态栏持久显示，toast 易被忽略）。
     sftp_error: Option<String>,
     update_state: UpdateState,
@@ -704,7 +714,7 @@ impl KunApp {
 
         let (_sftp_thread, sftp_handle, sftp_rx) = connect_sftp(&profile);
         // 主机名随本连接绑定，避免与并发连接串台。
-        self.pending_sftp = Some((sftp_handle, sftp_rx, label));
+        self.pending_sftp = Some((sftp_handle, sftp_rx, label, None));
         self.sftp_error = None;
         self.ready_sftp = None;
         self.pending_tab = None;
@@ -713,11 +723,13 @@ impl KunApp {
     /// 将已就绪的 SFTP 会话挂载到 SSH 标签页。
     fn mount_ready_sftp(&mut self) {
         let Some(idx) = self.pending_tab else { return };
-        let Some((handle, rx, host)) = self.ready_sftp.take() else {
+        let Some((handle, rx, host, home)) = self.ready_sftp.take() else {
             return;
         };
         if let Some(tab) = self.tabs.get_mut(idx) {
-            tab.sftp = Some(SftpView::new(&host, handle, rx));
+            let home = home.unwrap_or_else(|| "/".to_string());
+            tab.terminal.set_remote_current_directory(&home);
+            tab.sftp = Some(SftpView::new_at_path(&host, handle, rx, &home));
         }
     }
 
@@ -726,10 +738,13 @@ impl KunApp {
         let mut ready = false;
         let mut failed: Option<String> = None;
         let mut closed = false;
-        if let Some((_handle, rx, _host)) = &mut self.pending_sftp {
+        if let Some((_handle, rx, _host, home)) = &mut self.pending_sftp {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
-                    SftpEvent::Ready => ready = true,
+                    SftpEvent::Ready { home: path } => {
+                        ready = true;
+                        *home = Some(path);
+                    }
                     SftpEvent::Failed(e) => failed = Some(e),
                     // 连接中途关闭（如被服务器断开）：不能继续等待，
                     // 否则状态栏会永远停在"SFTP 连接中…"。
@@ -952,16 +967,22 @@ impl KunApp {
     /// 无已保存主机时提示并可一键打开新建连接对话框。
     fn host_quick_menu(&mut self, ui: &mut egui::Ui) {
         let theme = crate::theme::current_theme();
-        ui.set_min_width(232.0);
+        const MENU_W: f32 = 256.0;
+        const ROW_H: f32 = 40.0;
+        const AVATAR: f32 = 22.0;
+        ui.set_min_width(MENU_W);
+        ui.set_max_width(MENU_W);
+        ui.spacing_mut().item_spacing.y = 2.0;
+
         if self.config.hosts.is_empty() {
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.vertical_centered(|ui| {
                 ui.label(
                     egui::RichText::new("暂无已保存主机")
                         .size(12.0)
                         .color(theme.text_muted),
                 );
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 if ui
                     .button(
                         egui::RichText::new("新建连接")
@@ -974,82 +995,89 @@ impl KunApp {
                     ui.close();
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             return;
         }
 
+        ui.add_space(2.0);
         let mut connect: Option<HostProfile> = None;
         for (i, host) in self.config.hosts.iter().enumerate() {
-            // 行内容（头像 + 名称 + user@host，超长截断）。
-            let inner = ui
-                .scope_builder(egui::UiBuilder::new().id_salt(("quick_host", i)), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let avatar_size = 18.0;
-                        let (avatar_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(avatar_size, avatar_size),
-                            egui::Sense::hover(),
-                        );
-                        anim::paint_rounded_gradient(
-                            ui.painter(),
-                            avatar_rect,
-                            avatar_size * 0.5,
-                            theme.accent,
-                            theme.accent2,
-                        );
-                        let initial = host.name.chars().next().unwrap_or('?');
-                        ui.painter().text(
-                            avatar_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            initial.to_string(),
-                            egui::FontId::proportional(9.0),
-                            egui::Color32::WHITE,
-                        );
-                        ui.vertical(|ui| {
-                            ui.add_sized(
-                                [170.0, 14.0],
-                                egui::Label::new(
-                                    egui::RichText::new(&host.name)
-                                        .size(12.5)
-                                        .color(theme.text_primary),
-                                )
-                                .truncate(),
-                            );
-                            ui.add_sized(
-                                [170.0, 13.0],
-                                egui::Label::new(
-                                    egui::RichText::new(format!("{}@{}", host.user, host.host))
-                                        .size(10.5)
-                                        .color(theme.text_muted),
-                                )
-                                .truncate(),
-                            );
-                        });
-                    });
-                })
-                .response;
-            // 整行点击区（显式 interact + 稳定 Id，注册在内容之后）。
-            let row_rect = inner.rect.expand2(egui::vec2(4.0, 2.0));
-            let resp = ui
-                .interact(
-                    row_rect,
-                    egui::Id::new(("quick_host_click", i)),
-                    egui::Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            if resp.hovered() {
+            let row_id = egui::Id::new(("quick_host", i));
+            // 先占满菜单宽度，hover 高亮才能贴齐左右内边距（曾按内容包围盒
+            // expand，短名称行高亮左右留白、像一块浮岛）。
+            let (row_rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), ROW_H),
+                egui::Sense::hover(),
+            );
+            let highlight = row_rect.shrink2(egui::vec2(4.0, 1.0));
+            let hovered = ui.rect_contains_pointer(highlight);
+            if hovered {
                 ui.painter().rect_filled(
-                    row_rect,
+                    highlight,
                     crate::theme::tokens::RADIUS_ITEM,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
                 );
             }
+
+            // 行内容：头像垂直居中 + 名称/地址左对齐截断。
+            // 不用 add_sized——其内部 Layout::centered_and_justified 会把短
+            // 名称水平居中，和长地址错位（回归：ssh快捷菜单行左对齐）。
+            let mut inner = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(row_id)
+                    .max_rect(row_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            inner.spacing_mut().item_spacing.x = 8.0;
+            inner.add_space(10.0);
+            let (avatar_rect, _) =
+                inner.allocate_exact_size(egui::vec2(AVATAR, AVATAR), egui::Sense::hover());
+            anim::paint_rounded_gradient(
+                inner.painter(),
+                avatar_rect,
+                AVATAR * 0.5,
+                theme.accent,
+                theme.accent2,
+            );
+            let initial = host.name.chars().next().unwrap_or('?');
+            inner.painter().text(
+                avatar_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                initial.to_string(),
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+            inner.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.set_max_width(ui.available_width() - 10.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&host.name)
+                            .size(12.5)
+                            .color(theme.text_primary),
+                    )
+                    .truncate(),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{}@{}", host.user, host.host))
+                            .size(10.5)
+                            .color(theme.text_secondary),
+                    )
+                    .truncate(),
+                );
+            });
+
+            // 整行点击区（显式 interact + 稳定 Id，注册在内容之后）。
+            let resp = ui
+                .interact(row_rect, row_id.with("click"), egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
             if resp.clicked() {
                 connect = Some(host.clone());
-                // 单击即连：关闭弹出菜单。
                 ui.close();
             }
         }
+        ui.add_space(2.0);
         if let Some(profile) = connect {
             self.start_connect(ui.ctx(), profile);
         }
@@ -1498,7 +1526,7 @@ impl KunApp {
         }
         let mut tl_clicked: Option<usize> = None;
         ui.horizontal(|ui| {
-            // macOS traffic lights（自绘，因为关闭了 eframe 标题栏）。
+            // macOS traffic lights（隐藏系统按钮后由应用自绘）。
             let (tl, _) = draw_traffic_lights(ui);
             tl_clicked = tl;
             let mut switch_to: Option<usize> = None;
@@ -2366,6 +2394,7 @@ impl eframe::App for KunApp {
         let max_sftp_w = viewport_w * 0.50;
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             if let Some(sftp) = &mut tab.sftp {
+                let terminal_cwd = tab.terminal.current_directory();
                 let sftp_frame = egui::Frame::new()
                     .fill(theme.bg_panel)
                     .inner_margin(egui::Margin::symmetric(12, 10));
@@ -2378,7 +2407,9 @@ impl eframe::App for KunApp {
                     .max_size(max_sftp_w)
                     .resizable(true)
                     .frame(sftp_frame)
-                    .show_collapsible(ui, &mut tab.sftp_open, |ui| sftp.show(ui));
+                    .show_collapsible(ui, &mut tab.sftp_open, |ui| {
+                        sftp.show_with_terminal_cwd(ui, terminal_cwd.as_deref())
+                    });
             }
         }
         egui::CentralPanel::default().show(ui, |ui| {
@@ -2625,19 +2656,18 @@ mod app_tests {
 
         // 默认：面板收起（面板内控件不可见），悬浮按钮可见。
         assert!(
-            harness.root().query_all_by_label("刷新").next().is_none(),
+            harness.root().query_all_by_label("..").next().is_none(),
             "SFTP 面板应默认收起"
         );
         harness.get_by_label("SFTP").click();
         harness.run_steps(6);
         // 点击悬浮按钮 → 面板展开。
-        harness.get_by_label("刷新");
-        harness.get_by_label("上传");
+        harness.get_by_label("..");
         // 再点 → 收起。
         harness.get_by_label("SFTP").click();
         harness.run_steps(6);
         assert!(
-            harness.root().query_all_by_label("刷新").next().is_none(),
+            harness.root().query_all_by_label("..").next().is_none(),
             "再次点击应收起面板"
         );
     }
@@ -3003,8 +3033,15 @@ mod connect_tests {
         for _ in 0..6 {
             harness.step();
         }
-        harness.get_by_label("上传");
-        harness.get_by_label("刷新");
+        assert!(
+            harness
+                .root()
+                .query_all_by_label("SFTP · 链路测试")
+                .next()
+                .is_some(),
+            "SFTP 标题应出现"
+        );
+        harness.get_by_label("..");
     }
 
     /// 回归：设置弹窗 → 新建连接 → 点"连接"后，新建连接对话框与设置弹窗
@@ -3221,11 +3258,15 @@ mod snapshot_tests {
             harness.step();
         }
         // 布局断言：SFTP 面板应位于窗口右侧（终端 + 面板 + 侧栏三段式）。
-        let up = harness.get_by_label("上传");
-        let r = up.rect();
+        let panel_title = harness
+            .root()
+            .query_all_by_label("SFTP · 链路测试")
+            .max_by(|a, b| a.rect().left().partial_cmp(&b.rect().left()).unwrap())
+            .expect("SFTP 标题应出现");
+        let r = panel_title.rect();
         assert!(
             r.left() > 400.0,
-            "SFTP 面板应位于窗口右半侧，实际上传按钮 x={}",
+            "SFTP 面板应位于窗口右半侧，实际标题 x={}",
             r.left()
         );
         // 设置入口齿轮按钮应在标签栏最右侧（> 700 视口），用 Button role 查找
@@ -3648,6 +3689,74 @@ mod settings_tests {
         harness.run_steps(6);
         harness.get_by_label("暂无已保存主机");
         harness.get_by_label("新建连接");
+
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// 快捷菜单行：短名称与长名称左缘对齐（不因 add_sized 居中），
+    /// 名称与 user@host 同一列。
+    #[test]
+    fn ssh快捷菜单行左对齐() {
+        use kittest::Queryable;
+
+        let config_path = test_config_path("ssh-quick-align");
+        let config = HostConfig {
+            hosts: vec![
+                HostProfile {
+                    name: "短名".into(),
+                    host: "10.0.0.1".into(),
+                    port: 9,
+                    user: "root".into(),
+                    auth: Auth::Password("x".into()),
+                },
+                HostProfile {
+                    name: "很长的主机名称对齐".into(),
+                    host: "192.168.31.233".into(),
+                    port: 9,
+                    user: "ubuntu".into(),
+                    auth: Auth::Password("x".into()),
+                },
+            ],
+        };
+        config.save(&config_path).expect("写入测试配置失败");
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            KunApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        harness.get_by_label(">_").click();
+        harness.run_steps(6);
+
+        let short = harness.get_by_label("短名").rect();
+        let long = harness.get_by_label("很长的主机名称对齐").rect();
+        let short_addr = harness.get_by_label("root@10.0.0.1").rect();
+        let long_addr = harness.get_by_label("ubuntu@192.168.31.233").rect();
+
+        assert!(
+            (short.left() - long.left()).abs() < 1.0,
+            "短名称与长名称应左对齐（曾被 add_sized 居中），短={:.1} 长={:.1}",
+            short.left(),
+            long.left()
+        );
+        assert!(
+            (short.left() - short_addr.left()).abs() < 1.0,
+            "名称与地址应同一列左对齐，名称={:.1} 地址={:.1}",
+            short.left(),
+            short_addr.left()
+        );
+        assert!(
+            (long.left() - long_addr.left()).abs() < 1.0,
+            "长名称与地址应同一列左对齐"
+        );
+        // 短名称若被居中，右缘会靠近/越过两列内容的水平中线。
+        let menu_right = long.right().max(long_addr.right());
+        let menu_center = (short.left() + menu_right) * 0.5;
+        assert!(
+            short.right() < menu_center,
+            "短名称右缘应在内容中线左侧（居中时会越过中线），right={:.1} center={:.1}",
+            short.right(),
+            menu_center
+        );
 
         std::fs::remove_file(&config_path).ok();
     }

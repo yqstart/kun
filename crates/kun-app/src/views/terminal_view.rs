@@ -80,6 +80,8 @@ pub struct TerminalView {
     suppress_blank_frames: u8,
     /// 补全输入模型（本地会话启用；远程会话恒失效）。
     input: crate::completion::InputModel,
+    /// 远程会话的初始目录（由 SFTP realpath(".") 提供）。
+    remote_home: Option<std::path::PathBuf>,
     /// 当前补全候选。
     candidates: Vec<crate::completion::Candidate>,
     /// 候选选中索引。
@@ -108,7 +110,7 @@ impl TerminalView {
         let is_remote = session.is_remote();
         // 本地会话初始工作目录：会话启动目录（HOME）；远程不启用补全。
         let cwd = if is_remote {
-            std::path::PathBuf::new()
+            std::path::PathBuf::from("/")
         } else {
             std::env::var("HOME")
                 .map(std::path::PathBuf::from)
@@ -130,6 +132,7 @@ impl TerminalView {
             last_mode: TermMode::NONE,
             suppress_blank_frames: 0,
             input: crate::completion::InputModel::new(cwd),
+            remote_home: None,
             candidates: Vec::new(),
             candidate_selected: 0,
             cursor_pos: None,
@@ -157,6 +160,24 @@ impl TerminalView {
     /// 会话标题（缓存，`Title` 事件时更新；避免每帧 Mutex + String clone）。
     pub fn session_title(&self) -> &str {
         &self.cached_title
+    }
+
+    /// 当前终端已知的工作目录（供 SFTP 快捷定位使用）。
+    pub fn current_directory(&self) -> Option<String> {
+        if self.session.is_remote() && self.remote_home.is_none() {
+            return None;
+        }
+        Some(self.input.cwd.to_string_lossy().into_owned())
+    }
+
+    /// 设置远程会话的初始工作目录。
+    pub fn set_remote_current_directory(&mut self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        let cwd = std::path::PathBuf::from(path);
+        self.remote_home = Some(cwd.clone());
+        self.input.set_cwd(cwd);
     }
 
     /// 每帧渲染入口。
@@ -426,7 +447,24 @@ impl TerminalView {
         if !has_focus_now && self.had_focus && ui.memory(|m| m.focused().is_none()) {
             ui.memory_mut(|m| m.request_focus(self.focus_id));
         }
-        self.had_focus = has_focus_now;
+        // 终端是一个整体的键盘控件，Tab/方向键/Esc 都应交给 shell 或补全
+        // 状态处理，不能触发 egui 的控件焦点导航。否则远程 shell 执行
+        // Tab 补全后，终端会失去焦点，紧接的 Ctrl+C 可能被 UI 吞掉。
+        let has_terminal_focus = ui.memory(|m| m.has_focus(self.focus_id));
+        if has_terminal_focus {
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    self.focus_id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
+        }
+        self.had_focus = has_terminal_focus;
         // 点击区域覆盖整个面板（min_rect 无子项时为 0x0，会导致点击无法重新聚焦）。
         let response = ui.interact(ui.max_rect(), self.focus_id, egui::Sense::click());
         if response.clicked() {
@@ -650,15 +688,16 @@ impl TerminalView {
         }
     }
 
-    /// 分析写入 PTY 的字节并同步输入模型（本地会话）。
+    /// 分析写入 PTY 的字节并同步输入模型（本地与远程会话）。
     fn track_input_bytes(&mut self, bytes: &[u8]) {
-        if self.session.is_remote() {
-            return;
-        }
         match bytes {
             // 回车：执行命令（解析 cd），清空输入，模型恢复可靠。
             b"\r" | b"\n" => {
-                self.input.execute();
+                if self.session.is_remote() {
+                    self.input.execute_remote(self.remote_home.as_deref());
+                } else {
+                    self.input.execute();
+                }
                 self.candidates.clear();
             }
             // Ctrl+C：重置当前行。
@@ -1461,6 +1500,48 @@ mod tests {
         assert!(
             !last_line.contains("aa"),
             "字符重复写入，最后一行：{last_line:?}，终端内容：\n{text}"
+        );
+    }
+
+    /// Tab 属于终端输入，不应被 egui 当作焦点导航键；否则 SSH 远端补全后
+    /// 终端会短暂失去焦点，紧接着的 Ctrl+C 可能被吞掉。
+    #[test]
+    fn tab补全保持终端焦点() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+            // SSH 标签页的终端后面还有悬浮 SFTP 按钮；它是可聚焦控件，
+            // 正是远端 Tab 被 egui 焦点导航抢走的实际布局。
+            let _ = ui.button("after-terminal");
+        });
+        assert!(wait_text(&view, &mut harness, "kun"), "zsh 未就绪");
+
+        assert_eq!(
+            harness.ctx.memory(|m| m.focused()),
+            Some(egui::Id::new("terminal_view")),
+            "终端初始应持有焦点"
+        );
+        harness.event(egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+
+        assert_eq!(
+            harness.ctx.memory(|m| m.focused()),
+            Some(egui::Id::new("terminal_view")),
+            "Tab 发送给 shell 后终端焦点不应被 egui 转移"
         );
     }
 

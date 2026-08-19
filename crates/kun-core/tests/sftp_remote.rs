@@ -78,7 +78,7 @@ fn sftp_完整操作流程() {
 
     // ============ 1. 连接就绪 ============
     let mut seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
-        matches!(ev, SftpEvent::Ready)
+        matches!(ev, SftpEvent::Ready { .. })
     })
     .expect("SFTP 连接失败");
     if let Some(SftpEvent::Failed(e)) = seen.iter().find(|e| matches!(e, SftpEvent::Failed(_))) {
@@ -129,8 +129,54 @@ fn sftp_完整操作流程() {
         "上传文件应存在且大小正确，实际：{entries:?}"
     );
 
-    // ============ 5. 下载 ============
+    // ============ 5. 失败上传不得删除已有远程文件 ============
+    let missing_local = std::env::temp_dir().join("kun_sftp_missing_upload.txt");
+    std::fs::remove_file(&missing_local).ok();
+    handle.upload(&missing_local, &remote_file);
+    let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
+        matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
+    })
+    .expect("失败上传未返回结果");
+    assert!(
+        seen.iter().any(|ev| matches!(ev, SftpEvent::Error { .. })),
+        "不存在的本地文件应上传失败，实际事件：{seen:?}"
+    );
+    handle.list(&remote_home);
+    let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
+        matches!(ev, SftpEvent::Listed { .. })
+    })
+    .expect("验证失败上传后的目录列表失败");
+    let entries = match seen.last().unwrap() {
+        SftpEvent::Listed { entries, .. } => entries,
+        _ => unreachable!(),
+    };
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.name == "kun_sftp_test_upload.txt" && e.size == 22),
+        "失败上传不得删除已有远程文件，实际：{entries:?}"
+    );
+
+    // ============ 6. 失败下载不得删除已有本地文件 ============
     let local_dl = std::env::temp_dir().join("kun_sftp_test_download.txt");
+    std::fs::write(&local_dl, b"keep-existing-local-file").unwrap();
+    let missing_remote = format!("{remote_home}/kun_sftp_missing_download.txt");
+    handle.download(&missing_remote, &local_dl);
+    let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
+        matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
+    })
+    .expect("失败下载未返回结果");
+    assert!(
+        seen.iter().any(|ev| matches!(ev, SftpEvent::Error { .. })),
+        "不存在的远程文件应下载失败，实际事件：{seen:?}"
+    );
+    assert_eq!(
+        std::fs::read(&local_dl).unwrap(),
+        b"keep-existing-local-file",
+        "失败下载不得删除已有本地文件"
+    );
+
+    // ============ 7. 下载 ============
     handle.download(&remote_file, &local_dl);
     let _ = wait_event(&mut rx, Duration::from_secs(10), |ev| {
         matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
@@ -142,7 +188,7 @@ fn sftp_完整操作流程() {
         "下载内容应与上传一致"
     );
 
-    // ============ 6. 新建目录 + 重命名 ============
+    // ============ 8. 新建目录 + 重命名 ============
     let dir_a = format!("{remote_home}/kun_sftp_test_dir");
     let dir_b = format!("{remote_home}/kun_sftp_test_dir_renamed");
     handle.mkdir(&dir_a);
@@ -156,7 +202,7 @@ fn sftp_完整操作流程() {
     })
     .expect("重命名未完成");
 
-    // ============ 7. 删除（文件 + 目录） ============
+    // ============ 9. 删除（文件 + 目录） ============
     handle.remove(&remote_file, false);
     let _ = wait_event(&mut rx, Duration::from_secs(10), |ev| {
         matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
@@ -168,7 +214,7 @@ fn sftp_完整操作流程() {
     })
     .expect("删除目录未完成");
 
-    // ============ 8. 验证清理干净 ============
+    // ============ 10. 验证清理干净 ============
     handle.list(&remote_home);
     let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
         matches!(ev, SftpEvent::Listed { .. })
@@ -186,4 +232,5 @@ fn sftp_完整操作流程() {
     handle.close();
     std::fs::remove_file(&local_file).ok();
     std::fs::remove_file(&local_dl).ok();
+    std::fs::remove_file(&missing_local).ok();
 }

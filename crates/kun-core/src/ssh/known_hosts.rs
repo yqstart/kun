@@ -55,19 +55,33 @@ pub(crate) fn load_known_hosts(path: &Path) -> KnownHosts {
 }
 
 /// 保存 known_hosts（文件权限 0600：指纹防本地其他用户读取篡改）。
+///
+/// 先写同目录临时文件，再用 rename 原子替换目标；否则进程在写入中途退出
+/// 会留下截断文件，下一次加载会把损坏文件当成空记录并重新信任服务器密钥。
 pub(crate) fn save_known_hosts(path: &Path, known: &KnownHosts) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let content = toml::to_string_pretty(known)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, content)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("known_hosts.toml");
+    let tmp = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
+    let result = (|| {
+        std::fs::write(&tmp, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    Ok(())
+    result
 }
 
 /// 服务器主机密钥验证器（russh client Handler）。

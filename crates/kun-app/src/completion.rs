@@ -97,25 +97,45 @@ impl InputModel {
         }
     }
 
+    /// 覆盖当前工作目录（远程会话由 SFTP 连接建立时提供初始目录）。
+    pub fn set_cwd(&mut self, cwd: PathBuf) {
+        self.cwd = cwd;
+        self.valid = true;
+    }
+
     /// 回车：执行当前命令（解析 `cd` 更新 cwd），清空输入。
     pub fn execute(&mut self) {
-        // 先提取参数（避免 text 借用与可变借用冲突）。
-        // 前缀判定要求 `cd` 后为空或空白开头——`cdfoo` 是另一个命令，
-        // 不能误判为 `cd foo`。
-        let cd_arg = self
-            .text
-            .trim()
-            .strip_prefix("cd")
-            .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
-            .map(|r| r.trim().to_string());
-        if let Some(arg) = cd_arg {
+        if let Some(arg) = self.cd_argument() {
             self.apply_cd(&arg);
         }
         self.text.clear();
         self.valid = true;
     }
 
-    /// 应用 `cd` 参数更新工作目录。
+    /// 回车：在远程会话中按 POSIX 路径规则追踪常用的 `cd` 命令。
+    ///
+    /// 远程目录无法用本地文件系统 `canonicalize`，因此只做词法归一化；
+    /// 未覆盖的 shell 函数、别名或 `cd -` 仍会保留上一次已知目录。
+    pub fn execute_remote(&mut self, home: Option<&Path>) {
+        if let Some(arg) = self.cd_argument() {
+            self.apply_remote_cd(&arg, home);
+        }
+        self.text.clear();
+        self.valid = true;
+    }
+
+    /// 提取当前输入中的 `cd` 参数。
+    fn cd_argument(&self) -> Option<String> {
+        // 前缀判定要求 `cd` 后为空或空白开头——`cdfoo` 是另一个命令，
+        // 不能误判为 `cd foo`。
+        self.text
+            .trim()
+            .strip_prefix("cd")
+            .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+            .map(|r| r.trim().to_string())
+    }
+
+    /// 应用本地 `cd` 参数。
     fn apply_cd(&mut self, arg: &str) {
         let home = std::env::var("HOME").map(PathBuf::from).ok();
         let target = if arg.is_empty() {
@@ -141,6 +161,26 @@ impl InputModel {
         }
     }
 
+    /// 应用远程 `cd` 参数，不访问本地文件系统。
+    fn apply_remote_cd(&mut self, arg: &str, home: Option<&Path>) {
+        if arg == "-" {
+            return;
+        }
+        let target = if arg.is_empty() || arg == "~" {
+            home.unwrap_or(&self.cwd).to_path_buf()
+        } else if let Some(rest) = arg.strip_prefix("~/") {
+            home.unwrap_or(&self.cwd).join(rest)
+        } else {
+            let path = Path::new(arg);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.cwd.join(path)
+            }
+        };
+        self.cwd = normalize_remote_path(&target);
+    }
+
     /// 控制键/编辑序列（箭头、Ctrl+U/W 等）：模型失效，禁用补全。
     pub fn invalidate(&mut self) {
         self.valid = false;
@@ -151,6 +191,25 @@ impl InputModel {
         self.text.clear();
         self.valid = true;
     }
+}
+
+/// 归一化远程 POSIX 路径，至少保证根目录不会被 `..` 越过。
+fn normalize_remote_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+                if normalized.as_os_str().is_empty() {
+                    normalized.push("/");
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::Prefix(_) => {}
+        }
+    }
+    normalized
 }
 
 /// 解析输入文本中最后一个 word（按空白分隔），返回（字节偏移, word）。
@@ -321,6 +380,23 @@ mod tests {
             std::fs::canonicalize("/tmp").unwrap(),
             "cd 带空白参数应生效"
         );
+    }
+
+    #[test]
+    fn 远程cd按路径规则追踪() {
+        let mut m = InputModel::new(PathBuf::from("/srv/app"));
+        let home = PathBuf::from("/home/demo");
+        m.push_text("cd ../logs");
+        m.execute_remote(Some(&home));
+        assert_eq!(m.cwd, PathBuf::from("/srv/logs"));
+
+        m.push_text("cd ~/workspace/./kun");
+        m.execute_remote(Some(&home));
+        assert_eq!(m.cwd, PathBuf::from("/home/demo/workspace/kun"));
+
+        m.push_text("cd ../../../../");
+        m.execute_remote(Some(&home));
+        assert_eq!(m.cwd, PathBuf::from("/"));
     }
 
     #[test]
