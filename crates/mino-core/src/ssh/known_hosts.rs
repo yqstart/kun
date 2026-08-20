@@ -25,19 +25,19 @@ pub struct KnownHosts {
     pub hosts: Vec<KnownHostEntry>,
 }
 
-/// 默认 known_hosts 文件路径：`~/.config/kun/known_hosts.toml`。
+/// 默认 known_hosts 文件路径：`~/.config/mino/known_hosts.toml`。
 ///
-/// 环境变量 `KUN_KNOWN_HOSTS` 可覆盖（集成测试用：指向与测试 sshd
+/// 环境变量 `MINO_KNOWN_HOSTS` 可覆盖（集成测试用：指向与测试 sshd
 /// hostkey 同目录的文件——hostkey 随 /tmp 清理重建时指纹记录一并消失，
 /// 不会因旧指纹不匹配导致测试失败）。
 pub fn default_known_hosts_path() -> PathBuf {
-    std::env::var("KUN_KNOWN_HOSTS")
+    std::env::var("MINO_KNOWN_HOSTS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(home)
                 .join(".config")
-                .join("kun")
+                .join("mino")
                 .join("known_hosts.toml")
         })
 }
@@ -126,7 +126,7 @@ impl HostKeyVerifier {
             Some(entry) => Err(format!(
                 "主机密钥指纹不匹配！\n服务器：{}:{}\n预期指纹：{}\n实际指纹：{}\n\
                  服务器可能已被替换（中间人攻击）。若确认是服务器重装系统，\
-                 请删除 ~/.config/kun/known_hosts.toml 中的对应条目后重试。",
+                 请删除 ~/.config/mino/known_hosts.toml 中的对应条目后重试。",
                 self.host, self.port, entry.fingerprint, fingerprint
             )),
             None => {
@@ -177,7 +177,7 @@ mod tests {
     /// 同一路径（会互相覆盖，曾导致全量测试偶发失败）。
     fn tmp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "kun-known-hosts-test-{}-{name}.toml",
+            "mino-known-hosts-test-{}-{name}.toml",
             std::process::id()
         ))
     }

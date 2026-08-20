@@ -1,12 +1,12 @@
 [package]
-name = "kun-app"
+name = "mino-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "kun 终端工具 GUI 应用"
+description = "Mino 轻量终端与 SFTP GUI 应用"
 
 [dependencies]
-kun-core = { path = "../kun-core" }
+mino-core = { path = "../mino-core" }
 eframe = { workspace = true }
 egui = { workspace = true }
 log = { workspace = true }

@@ -1,4 +1,4 @@
-# ==================== kun 发布（macOS） ====================
+# ==================== Mino 发布（macOS） ====================
 # 触发：推送 v* 标签（如 v0.1.0），或 Actions 页手动 Run workflow。
 # 流程：macOS ARM / Intel 原生构建 → .app + dmg → 上传 GitHub Release。
 # 说明：产物未签名/未公证（可后续配置）；版本号取自 git tag。
@@ -21,7 +21,7 @@ concurrency:
 jobs:
   build:
     name: Build (${{ matrix.name }})
-    # v0.7.0：ARM runner 曾在 UI 测试中挂死 4.5h（手动取消）；限时失败以便重试。
+    # ARM runner 上的 UI 测试可能因图形环境挂起；限时失败以便重试。
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -30,12 +30,12 @@ jobs:
           # macos-latest = Apple Silicon；Intel 用官方 Intel runner，避免交叉编译链问题。
           - name: macOS Apple Silicon
             platform: macos-latest
-            artifact: kun-macos-arm64
+            artifact: mino-macos-arm64
             package: dmg
             arch: arm64
           - name: macOS Intel
             platform: macos-15-intel
-            artifact: kun-macos-x64
+            artifact: mino-macos-x64
             package: dmg
             arch: x64
 
@@ -54,7 +54,7 @@ jobs:
         run: cargo build --release --workspace
 
       # macOS UI 测试（egui_kittest）放在 Intel runner：Apple Silicon runner 上
-      # 曾两次在同一批 UI 测试中挂死数小时（v0.7.0），阻断发版。
+      # UI 测试放在 Intel runner，避免 Apple Silicon 图形环境差异阻断发版。
       # 功能回归仍由 CI（Linux）+ 本矩阵 Intel 覆盖；ARM 只负责原生 arm64 打包。
       - name: Run tests
         if: matrix.arch == 'x64'
@@ -76,8 +76,8 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: |
-            target/release/kun-*.dmg
-            target/release/kun.icns
+            target/release/mino-*.dmg
+            target/release/mino.icns
 
   # ============ 汇总发布到 GitHub Release ============
   publish:
@@ -102,9 +102,9 @@ jobs:
           if [ -z "$NOTES" ]; then
             NOTES="$(bash scripts/release-notes.sh)"
           fi
-          echo "body<<__KUN_NOTES__" >> "$GITHUB_OUTPUT"
+          echo "body<<__MINO_NOTES__" >> "$GITHUB_OUTPUT"
           echo "$NOTES" >> "$GITHUB_OUTPUT"
-          echo "__KUN_NOTES__" >> "$GITHUB_OUTPUT"
+          echo "__MINO_NOTES__" >> "$GITHUB_OUTPUT"
 
       - name: List artifacts
         run: ls -lh dist/
@@ -113,7 +113,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: kun ${{ github.ref_name }}
+          name: Mino ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.body }}
           draft: false
           prerelease: false

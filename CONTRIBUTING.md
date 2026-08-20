@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢关注 kun。欢迎 Issue、讨论与 Pull Request。
+感谢关注 Mino。欢迎 Issue、讨论与 Pull Request。
 
 ## 开发环境
 
@@ -13,7 +13,7 @@
 
 ```bash
 git clone https://github.com/yqstart/kun.git
-cd kun
+cd mino
 cargo run
 ```
 
@@ -27,7 +27,7 @@ cargo test --workspace
 
 ## 贡献方向
 
-kun 核心功能集已收敛，主打**轻量、快速、美观**。
+Mino 核心功能集已收敛，主打**轻量、快速、简洁**。
 
 - **欢迎**：Bug 修复、性能与流畅度优化、交互体验打磨、视觉细节完善、测试补充
 - **慎入**：大功能模块新增（请先开 Issue 讨论）
@@ -59,5 +59,5 @@ kun 核心功能集已收敛，主打**轻量、快速、美观**。
 ## 代码风格
 
 - 注释、文档、提交信息使用中文；标识符（变量 / 函数 / 文件）使用英文
-- 遵循既有模块划分：`kun-core` 为纯引擎（禁止依赖 egui），`kun-app` 为 UI 层
+- 遵循既有模块划分：`mino-core` 为纯引擎（禁止依赖 egui），`mino-app` 为 UI 层
 - 架构约定见 [AGENTS.md](AGENTS.md) 与 [docs/技术架构.md](docs/技术架构.md)

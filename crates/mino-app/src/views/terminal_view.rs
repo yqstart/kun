@@ -5,6 +5,7 @@
 //! Galley 绘制（零扫描、零 layout）。内容未变的帧（PTY 空转、光标闪烁、无输入）仅
 //! 绘制已有 Galley。
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -15,8 +16,8 @@ use alacritty_terminal::term::TermDamage;
 use alacritty_terminal::vte::ansi::{Color as AColor, CursorShape, NamedColor, Rgb};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, Rect, Stroke, TextFormat, Ui, Vec2};
-use kun_core::terminal::keys::{self, Key, Mods};
-use kun_core::terminal::{Session, SessionEvent, TermMode};
+use mino_core::terminal::keys::{self, Key, Mods};
+use mino_core::terminal::{Session, SessionEvent, TermMode};
 
 /// 行缓存：内容 hash 未变时复用已布局文本（Galley），避免每帧重建。
 /// `galley` 与 pixels_per_point 绑定，窗口缩放后需全量失效（见 `show`）。
@@ -53,6 +54,63 @@ struct LineData {
     hash: u64,
     segments: Vec<Segment>,
     backgrounds: Vec<BgRect>,
+}
+
+/// 终端选区中的一个 cell 坐标。
+///
+/// 行使用 alacritty 的网格坐标而不是当前视口行号，因此用户滚动 scrollback
+/// 时，选区仍然绑定在原来的输出内容上。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectionPoint {
+    grid_line: i32,
+    col: usize,
+}
+
+impl Ord for SelectionPoint {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.grid_line
+            .cmp(&other.grid_line)
+            .then_with(|| self.col.cmp(&other.col))
+    }
+}
+
+impl PartialOrd for SelectionPoint {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// 终端鼠标选区。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalSelection {
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+}
+
+impl TerminalSelection {
+    /// 返回当前行应绘制的选区列范围（右端为 exclusive）。
+    fn columns_for_line(self, grid_line: i32, cols: usize) -> Option<(usize, usize)> {
+        let (start, end) = if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        };
+        if grid_line < start.grid_line || grid_line > end.grid_line {
+            return None;
+        }
+        let (from, to) = if start.grid_line == end.grid_line {
+            (start.col, end.col.saturating_add(1))
+        } else if grid_line == start.grid_line {
+            (start.col, cols)
+        } else if grid_line == end.grid_line {
+            (0, end.col.saturating_add(1))
+        } else {
+            (0, cols)
+        };
+        let from = from.min(cols);
+        let to = to.min(cols);
+        (from < to).then_some((from, to))
+    }
 }
 
 /// 终端内容内边距（文本与面板边缘的间距，参照 Terminal.app 观感）。
@@ -102,6 +160,12 @@ pub struct TerminalView {
     last_recompute_text: String,
     /// 会话标题缓存（`SessionEvent::Title` 时更新，避免每帧 Mutex + String clone）。
     cached_title: String,
+    /// 当前终端选区（⌘C / Ctrl+Shift+C 复制）。
+    selection: Option<TerminalSelection>,
+    /// 是否正在进行鼠标拖选。
+    selecting: bool,
+    /// 复制后的短暂反馈 chip 到期时间。
+    copy_flash_until: Option<f64>,
 }
 
 impl TerminalView {
@@ -144,6 +208,9 @@ impl TerminalView {
             recompute_pending: false,
             last_recompute_text: String::new(),
             cached_title,
+            selection: None,
+            selecting: false,
+            copy_flash_until: None,
         }
     }
 
@@ -188,12 +255,40 @@ impl TerminalView {
         // 终端区域背景（当前主题的终端色）。
         // 注意：用 max_rect（布局分配区域）而非 min_rect（已用内容包围盒，
         // 无子项时为 0x0，会导致背景画不出来）。
-        let term_bg = crate::theme::current_theme().term_bg;
+        let theme = crate::theme::current_theme();
+        let term_bg = theme.term_bg;
         let outer = ui.max_rect();
         ui.painter().rect_filled(
             outer,
             0.0,
             Color32::from_rgb(term_bg.r, term_bg.g, term_bg.b),
+        );
+        // 低对比网格与右上角柔光：提供科技感的空间层次，但不干扰终端文本。
+        let grid_step = 32.0;
+        let grid_color = crate::theme::tokens::GRID_LINE;
+        let first_x = outer.left() - outer.left().rem_euclid(grid_step);
+        let first_y = outer.top() - outer.top().rem_euclid(grid_step);
+        for x in (0..=((outer.width() / grid_step).ceil() as usize + 1))
+            .map(|i| first_x + i as f32 * grid_step)
+        {
+            ui.painter().line_segment(
+                [egui::pos2(x, outer.top()), egui::pos2(x, outer.bottom())],
+                egui::Stroke::new(1.0, grid_color),
+            );
+        }
+        for y in (0..=((outer.height() / grid_step).ceil() as usize + 1))
+            .map(|i| first_y + i as f32 * grid_step)
+        {
+            ui.painter().line_segment(
+                [egui::pos2(outer.left(), y), egui::pos2(outer.right(), y)],
+                egui::Stroke::new(1.0, grid_color),
+            );
+        }
+        crate::anim::paint_glow(
+            ui.painter(),
+            egui::pos2(outer.right() - 24.0, outer.top() + 20.0),
+            150.0,
+            theme.accent2.gamma_multiply(0.35),
         );
         // 终端内容区域：背景铺满面板，文本/光标在内边距内绘制。
         let inner = outer.shrink(PADDING);
@@ -203,7 +298,7 @@ impl TerminalView {
         if self.session.pty_thread_finished() {
             log::warn!("PTY 读取线程已退出！输入将无法写入终端。");
         }
-        // 注意：Wakeup 不再在此处二次 request_repaint——kun-core 的
+        // 注意：Wakeup 不再在此处二次 request_repaint——mino-core 的
         // `Listener::send_event` 已在事件到达时直接调过 on_event
         // （app.rs 的 `ctx.request_repaint()`），此处仅处理 PtyWrite 回写
         // 与标题缓存更新。
@@ -374,6 +469,12 @@ impl TerminalView {
         let paint_start = std::time::Instant::now();
         let painter = ui.painter();
         let origin = inner.min;
+        let selection_bg = Color32::from_rgba_unmultiplied(
+            theme.accent.r(),
+            theme.accent.g(),
+            theme.accent.b(),
+            92,
+        );
         for v in 0..self.rows as usize {
             let grid_line = v as i32 - display_offset as i32;
             let Some(cache) = self.rows_cache.get(&grid_line) else {
@@ -386,6 +487,17 @@ impl TerminalView {
                     Vec2::new((bg.end - bg.start) as f32 * cell_width, cell_height),
                 );
                 painter.rect_filled(rect, 0.0, bg.color);
+            }
+            if let Some(selection) = self.selection {
+                if let Some((start, end)) =
+                    selection.columns_for_line(grid_line, self.cols as usize)
+                {
+                    let rect = Rect::from_min_size(
+                        origin + Vec2::new(start as f32 * cell_width, v as f32 * cell_height),
+                        Vec2::new((end - start) as f32 * cell_width, cell_height),
+                    );
+                    painter.rect_filled(rect, 2.0, selection_bg);
+                }
             }
             // 文本（直接绘制缓存的 Galley，Arc clone 零成本；不再 layout_job）。
             let pos = origin + Vec2::new(0.0, v as f32 * cell_height);
@@ -465,10 +577,56 @@ impl TerminalView {
             });
         }
         self.had_focus = has_terminal_focus;
-        // 点击区域覆盖整个面板（min_rect 无子项时为 0x0，会导致点击无法重新聚焦）。
-        let response = ui.interact(ui.max_rect(), self.focus_id, egui::Sense::click());
+        // 点击/拖拽区域覆盖整个面板：终端文字不是 egui Label，必须自己维护
+        // cell 选区，才能实现 Warp/Terminal.app 习惯的拖选后 ⌘C。
+        let surface_rect = ui.max_rect();
+        let response = ui.interact(surface_rect, self.focus_id, egui::Sense::click_and_drag());
         if response.clicked() {
             ui.memory_mut(|m| m.request_focus(self.focus_id));
+            // 单击空白处清除旧选区；拖选会在 drag_started 时重新建立选区。
+            self.selection = None;
+        }
+        if response.drag_started() {
+            let start_pos = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos());
+            if let Some(pos) = start_pos {
+                let point = selection_point_from_screen(
+                    pos,
+                    inner,
+                    cell_width,
+                    cell_height,
+                    display_offset,
+                    self.cols as usize,
+                    self.rows as usize,
+                );
+                self.selection = Some(TerminalSelection {
+                    anchor: point,
+                    focus: point,
+                });
+                self.selecting = true;
+                ui.memory_mut(|m| m.request_focus(self.focus_id));
+            }
+        }
+        if self.selecting && response.dragged() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let point = selection_point_from_screen(
+                    pos,
+                    inner,
+                    cell_width,
+                    cell_height,
+                    display_offset,
+                    self.cols as usize,
+                    self.rows as usize,
+                );
+                if let Some(selection) = &mut self.selection {
+                    selection.focus = point;
+                }
+                ui.ctx().request_repaint();
+            }
+        }
+        if response.drag_stopped() {
+            self.selecting = false;
         }
         if ui.memory(|m| m.has_focus(self.focus_id)) {
             self.handle_input(ui);
@@ -521,8 +679,17 @@ impl TerminalView {
                         if !*pressed {
                             continue;
                         }
-                        // Command 修饰为应用快捷键，不转发给终端。
+                        // Linux/Windows 终端惯用 Ctrl+Shift+C 复制选区；保留
+                        // macOS 的 ⌘C，同时避免把组合键继续送进 shell。
+                        if modifiers.ctrl && modifiers.shift && *key == egui::Key::C {
+                            actions.push(InputAction::CopySelection);
+                            continue;
+                        }
+                        // ⌘C 是终端复制；没有选区时不向 shell 发送任何字符。
                         if modifiers.command {
+                            if *key == egui::Key::C {
+                                actions.push(InputAction::CopySelection);
+                            }
                             continue;
                         }
                         // 补全菜单打开时：Tab 确认、↑/↓ 选择、Esc 关闭（不转发给 shell）。
@@ -604,6 +771,9 @@ impl TerminalView {
                         // 粘贴内容不可逐字节信任（可能含控制序列），模型失效。
                         actions.push(InputAction::Paste);
                     }
+                    egui::Event::Copy => {
+                        actions.push(InputAction::CopySelection);
+                    }
                     egui::Event::MouseWheel {
                         unit,
                         delta,
@@ -652,16 +822,18 @@ impl TerminalView {
 
         // 闭包外统一应用输入动作，同步补全模型。
         for action in actions {
-            self.apply_input_action(action);
+            self.apply_input_action(action, &ctx);
         }
         // 渲染补全浮层（本地会话）。
         if !self.candidates.is_empty() {
+            self.render_completion_ghost(ui);
             self.render_completion_popup(ui);
         }
+        self.render_copy_feedback(ui);
     }
 
     /// 应用一帧内的输入动作（写入 PTY 的字节与拦截的按键）。
-    fn apply_input_action(&mut self, action: InputAction) {
+    fn apply_input_action(&mut self, action: InputAction, ctx: &egui::Context) {
         match action {
             InputAction::Bytes(bytes) => self.track_input_bytes(&bytes),
             InputAction::Text(text) => {
@@ -685,7 +857,27 @@ impl TerminalView {
                 self.candidates.clear();
                 self.candidate_selected = 0;
             }
+            InputAction::CopySelection => self.copy_selection(ctx),
         }
+    }
+
+    /// 将当前终端选区交给 egui 平台层写入系统剪贴板。
+    fn copy_selection(&mut self, ctx: &egui::Context) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let term_arc = self.session.term();
+        let text = {
+            let guard = term_arc.lock();
+            selection_to_text(guard.grid(), selection, self.cols as usize)
+        };
+        if text.is_empty() {
+            return;
+        }
+        ctx.copy_text(text);
+        let now = ctx.input(|i| i.time);
+        self.copy_flash_until = Some(now + 1.2);
+        ctx.request_repaint_after(Duration::from_millis(1200));
     }
 
     /// 分析写入 PTY 的字节并同步输入模型（本地与远程会话）。
@@ -804,12 +996,12 @@ impl TerminalView {
             return;
         };
         let inner = ui.max_rect().shrink(PADDING);
-        let popup_w = 260.0;
-        let row_h = 22.0;
+        let popup_w = 326.0;
+        let row_h = 30.0;
         let rows = self.candidates.len().min(8) as f32;
-        // 估算高度（含行间 item_spacing 与边框/内边距，另加 8px 余量）仅用于
-        // 上下模式判定；实际定位用锚点，与真实渲染高度无关。
-        let popup_h = rows * row_h + (rows - 1.0).max(0.0) * 3.0 + 12.0 + 8.0;
+        // 估算高度与实际 header / footer / row 节奏一致，避免浮层定位和真实
+        // 尺寸不一致时出现遮挡输入行或上下跳动。
+        let popup_h = 42.0 + rows * row_h + 30.0 + 20.0;
         // 锚定：上方空间充足时浮层底边固定在光标行顶上方 4px（实际渲染多高都
         // 向上生长，绝不遮输入行）；不足时顶边固定在光标行底下方 4px。
         let (anchor, offset) = completion_popup_anchor(
@@ -821,16 +1013,41 @@ impl TerminalView {
         );
         egui::Area::new(egui::Id::new("completion_popup"))
             .order(egui::Order::Foreground)
-            // 不拦截鼠标交互（interactable 的 Area 会导致终端焦点被释放）。
-            .interactable(false)
+            // Warp 风格浮层允许鼠标点选；接受后重新把焦点交还终端。
+            .interactable(true)
             .anchor(anchor, offset)
             .show(ui.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(theme.bg_elevated)
-                    .stroke(egui::Stroke::new(1.0, theme.border))
-                    .corner_radius(crate::theme::tokens::RADIUS_SM)
-                    .inner_margin(egui::Margin::symmetric(6, 4))
+                    .fill(theme.bg_panel)
+                    .stroke(egui::Stroke::new(1.0, theme.accent2.gamma_multiply(0.65)))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::symmetric(10, 10))
                     .show(ui, |ui| {
+                        ui.set_width(popup_w - 20.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 7.0;
+                            ui.label(
+                                egui::RichText::new("SUGGESTIONS")
+                                    .monospace()
+                                    .size(9.0)
+                                    .color(theme.accent),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{:02} MATCHES",
+                                            self.candidates.len().min(8)
+                                        ))
+                                        .monospace()
+                                        .size(9.0)
+                                        .color(theme.text_muted),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(8.0);
                         let mut clicked: Option<usize> = None;
                         for (i, c) in self.candidates.iter().enumerate().take(8) {
                             let selected = i == self.candidate_selected;
@@ -843,43 +1060,157 @@ impl TerminalView {
                                     (theme.text_secondary, "·")
                                 }
                             };
-                            let row = ui
-                                .horizontal(|ui| {
-                                    ui.set_min_size(egui::vec2(popup_w, row_h));
-                                    if selected {
-                                        ui.painter().rect_filled(
-                                            ui.max_rect(),
-                                            crate::theme::tokens::RADIUS_ITEM,
-                                            theme.accent_soft,
-                                        );
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(marker).size(11.0).color(if selected {
-                                            theme.text_primary
-                                        } else {
-                                            color
-                                        }),
-                                    );
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        egui::RichText::new(&c.display).size(12.5).color(
-                                            if selected { theme.text_primary } else { color },
-                                        ),
-                                    );
-                                })
-                                .response
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let (row_rect, row) = ui.allocate_exact_size(
+                                egui::vec2(popup_w - 20.0, row_h),
+                                egui::Sense::click(),
+                            );
                             if row.hovered() {
                                 self.candidate_selected = i;
                             }
+                            if selected || row.hovered() {
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    crate::theme::tokens::RADIUS_ITEM,
+                                    if selected {
+                                        theme.accent_soft
+                                    } else {
+                                        theme.bg_elevated.gamma_multiply(0.85)
+                                    },
+                                );
+                            }
+                            if selected {
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(row_rect.left(), row_rect.top()),
+                                        egui::pos2(row_rect.left() + 2.0, row_rect.bottom()),
+                                    ),
+                                    1.0,
+                                    theme.accent,
+                                );
+                            }
+                            let mut row_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(row_rect.shrink2(egui::vec2(10.0, 0.0)))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                            );
+                            row_ui.spacing_mut().item_spacing.x = 9.0;
+                            row_ui.label(
+                                egui::RichText::new(marker).size(12.0).color(if selected {
+                                    theme.text_primary
+                                } else {
+                                    color
+                                }),
+                            );
+                            row_ui.label(
+                                egui::RichText::new(&c.display)
+                                    .size(13.0)
+                                    .color(if selected { theme.text_primary } else { color }),
+                            );
+                            row_ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(match c.kind {
+                                            crate::completion::CandidateKind::Command => "CMD",
+                                            crate::completion::CandidateKind::Dir => "DIR",
+                                            crate::completion::CandidateKind::File => "FILE",
+                                        })
+                                        .monospace()
+                                        .size(8.0)
+                                        .color(theme.text_muted),
+                                    );
+                                },
+                            );
                             if row.clicked() {
                                 clicked = Some(i);
                             }
                         }
+                        ui.add_space(7.0);
+                        ui.painter().line_segment(
+                            [
+                                ui.cursor().left_top(),
+                                egui::pos2(ui.max_rect().right(), ui.cursor().top()),
+                            ],
+                            egui::Stroke::new(1.0, theme.border),
+                        );
+                        ui.add_space(6.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new("↑ ↓ 选择   Tab 补全   Esc 关闭")
+                                    .monospace()
+                                    .size(8.5)
+                                    .color(theme.text_muted),
+                            );
+                        });
                         if let Some(i) = clicked {
                             self.candidate_selected = i;
                             self.accept_completion();
+                            ui.memory_mut(|m| m.request_focus(self.focus_id));
                         }
+                    });
+            });
+    }
+
+    /// 在真实 shell 光标右侧绘制第一候选的幽灵后缀，减少“只弹一个列表”的
+    /// 鸡肋感；Tab 仍然是明确提交，Enter 继续执行 shell 当前命令。
+    fn render_completion_ghost(&self, ui: &Ui) {
+        let Some(cursor_pos) = self.cursor_pos else {
+            return;
+        };
+        let Some(candidate) = self.candidates.first() else {
+            return;
+        };
+        if candidate.kind != crate::completion::CandidateKind::Command {
+            return;
+        }
+        let (_, word) = crate::completion::last_word(&self.input.text);
+        let Some(suffix) = candidate.text.strip_prefix(word) else {
+            return;
+        };
+        if suffix.is_empty() {
+            return;
+        }
+        ui.painter().text(
+            egui::pos2(cursor_pos.x, cursor_pos.y - self.cell_height),
+            egui::Align2::LEFT_TOP,
+            suffix,
+            FontId::monospace(self.font_size),
+            crate::theme::current_theme()
+                .text_muted
+                .gamma_multiply(0.62),
+        );
+    }
+
+    /// 复制成功后的非侵入式反馈，不抢终端焦点。
+    fn render_copy_feedback(&mut self, ui: &Ui) {
+        let Some(until) = self.copy_flash_until else {
+            return;
+        };
+        let now = ui.ctx().input(|i| i.time);
+        if now >= until {
+            self.copy_flash_until = None;
+            return;
+        }
+        ui.ctx()
+            .request_repaint_after(Duration::from_secs_f64((until - now).min(0.2)));
+        let theme = crate::theme::current_theme();
+        egui::Area::new(egui::Id::new("copy_feedback"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme.bg_elevated.gamma_multiply(0.96))
+                    .stroke(egui::Stroke::new(1.0, theme.accent))
+                    .corner_radius(7.0)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("COPIED")
+                                .monospace()
+                                .size(10.0)
+                                .color(theme.accent),
+                        );
                     });
             });
     }
@@ -935,9 +1266,70 @@ enum InputAction {
     SelectDown,
     /// 关闭补全浮层。
     CloseMenu,
+    /// 复制当前终端选区。
+    CopySelection,
 }
 
 // ==================== 辅助函数 ====================
+
+/// 屏幕坐标 → 当前视口对应的网格坐标。
+fn selection_point_from_screen(
+    pos: egui::Pos2,
+    inner: Rect,
+    cell_width: f32,
+    cell_height: f32,
+    display_offset: usize,
+    cols: usize,
+    rows: usize,
+) -> SelectionPoint {
+    let x = (pos.x - inner.left()).clamp(0.0, inner.width().max(0.0));
+    let y = (pos.y - inner.top()).clamp(0.0, inner.height().max(0.0));
+    let col = (x / cell_width.max(1.0)).floor() as usize;
+    let row = (y / cell_height.max(1.0)).floor() as usize;
+    SelectionPoint {
+        grid_line: row.min(rows.saturating_sub(1)) as i32 - display_offset as i32,
+        col: col.min(cols.saturating_sub(1)),
+    }
+}
+
+/// 从网格中提取选区文本，去掉每行末尾用于填充终端宽度的空格。
+fn selection_to_text(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    selection: TerminalSelection,
+    cols: usize,
+) -> String {
+    let (start, end) = if selection.anchor <= selection.focus {
+        (selection.anchor, selection.focus)
+    } else {
+        (selection.focus, selection.anchor)
+    };
+    let mut output = String::new();
+    for grid_line in start.grid_line..=end.grid_line {
+        let Some((from, to)) = selection.columns_for_line(grid_line, cols) else {
+            continue;
+        };
+        let row = &grid[if grid_line >= 0 {
+            alacritty_terminal::index::Line::from(grid_line as usize)
+        } else {
+            alacritty_terminal::index::Line::from(0) - grid_line.unsigned_abs() as usize
+        }];
+        let mut line = String::new();
+        for (col, cell) in row.into_iter().enumerate().take(to).skip(from) {
+            if col >= cols
+                || cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                || cell.flags.contains(Flags::HIDDEN)
+            {
+                continue;
+            }
+            line.push(cell.c);
+        }
+        output.push_str(line.trim_end());
+        if grid_line != end.grid_line {
+            output.push('\n');
+        }
+    }
+    output
+}
 
 /// 锁内构建单个网格行的渲染数据（段 + 背景 + hash）。
 ///
@@ -1282,7 +1674,7 @@ fn map_special_key(key: &egui::Key) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kun_core::terminal::{Session, SessionOptions};
+    use mino_core::terminal::{Session, SessionOptions};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -1368,7 +1760,7 @@ mod tests {
             view_show.borrow_mut().show(ui);
         });
         assert!(
-            wait_text(&view, &mut harness, "kun"),
+            wait_text(&view, &mut harness, "mino"),
             "zsh 未就绪，终端内容：\n{}",
             grid_text(view.borrow().session())
         );
@@ -1414,6 +1806,47 @@ mod tests {
         );
     }
 
+    /// 鼠标拖动终端网格应建立稳定的选区（回归：终端曾只有键盘焦点，
+    /// 任何拖动都不会产生可复制文本）。
+    #[test]
+    fn 鼠标拖选建立终端选区() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
+
+        let start = egui::pos2(12.0, 14.0);
+        let end = egui::pos2(150.0, 14.0);
+        harness.event(egui::Event::PointerMoved(start));
+        harness.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        harness.event(egui::Event::PointerMoved(end));
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+
+        assert!(view.borrow().selection.is_some(), "拖选后应存在终端选区");
+    }
+
     /// 退格键应删除已输入字符（回归测试：曾出现删除键异常）。
     #[test]
     fn 退格键删除输入字符() {
@@ -1432,7 +1865,7 @@ mod tests {
 
         // 等待 zsh 提示符出现。
         assert!(
-            wait_text(&view, &mut harness, "kun"),
+            wait_text(&view, &mut harness, "mino"),
             "zsh 未就绪，终端内容：\n{}",
             grid_text(view.borrow().session())
         );
@@ -1485,7 +1918,7 @@ mod tests {
         let mut harness = egui_kittest::Harness::new_ui(move |ui| {
             view_show.borrow_mut().show(ui);
         });
-        assert!(wait_text(&view, &mut harness, "kun"), "zsh 未就绪");
+        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
 
         send_key(&mut harness, egui::Key::A, Some("a"));
         assert!(
@@ -1522,7 +1955,7 @@ mod tests {
             // 正是远端 Tab 被 egui 焦点导航抢走的实际布局。
             let _ = ui.button("after-terminal");
         });
-        assert!(wait_text(&view, &mut harness, "kun"), "zsh 未就绪");
+        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
 
         assert_eq!(
             harness.ctx.memory(|m| m.focused()),
@@ -1563,7 +1996,7 @@ mod tests {
         let mut harness = egui_kittest::Harness::new_ui(move |ui| {
             view_show.borrow_mut().show(ui);
         });
-        assert!(wait_text(&view, &mut harness, "kun"), "zsh 未就绪");
+        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
 
         // 执行 `seq 40` 输出 40 行，超过 24 行视口，产生 scrollback。
         view.borrow().session().write(b"seq 40\r");
@@ -1620,7 +2053,7 @@ mod tests {
 #[cfg(test)]
 mod deadlock_tests {
     use super::*;
-    use kun_core::terminal::{Session, SessionOptions};
+    use mino_core::terminal::{Session, SessionOptions};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -1668,7 +2101,7 @@ mod deadlock_tests {
 #[cfg(test)]
 mod enter_tests {
     use super::*;
-    use kun_core::terminal::{Session, SessionOptions};
+    use mino_core::terminal::{Session, SessionOptions};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -1725,7 +2158,7 @@ mod enter_tests {
         let mut ready = false;
         while Instant::now() < deadline {
             harness.step();
-            if grid_text(view.borrow().session()).contains("kun") {
+            if grid_text(view.borrow().session()).contains("mino") {
                 ready = true;
                 break;
             }
@@ -1848,7 +2281,7 @@ mod osc_tests {
 #[cfg(test)]
 mod ime_backspace_tests {
     use super::*;
-    use kun_core::terminal::{Session, SessionOptions};
+    use mino_core::terminal::{Session, SessionOptions};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -1919,7 +2352,7 @@ mod ime_backspace_tests {
         let mut ready = false;
         while Instant::now() < deadline {
             harness.step();
-            if grid_text(view.borrow().session()).contains("kun") {
+            if grid_text(view.borrow().session()).contains("mino") {
                 ready = true;
                 break;
             }

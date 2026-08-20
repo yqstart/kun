@@ -3,12 +3,12 @@
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use kun_core::config::{Auth, HostProfile};
-use kun_core::ssh::sftp::{connect_sftp, SftpEvent};
+use mino_core::config::{Auth, HostProfile};
+use mino_core::ssh::sftp::{connect_sftp, SftpEvent};
 
 /// 测试主机（与 ssh_remote.rs 相同的测试 sshd）。
 fn test_profile() -> HostProfile {
-    let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
+    let key_path = std::env::var("MINO_TEST_KEY").unwrap_or_else(|_| {
         format!(
             "{}/.ssh/id_ed25519",
             std::env::var("HOME").unwrap_or_default()
@@ -16,12 +16,12 @@ fn test_profile() -> HostProfile {
     });
     HostProfile {
         name: "SFTP 集成测试".into(),
-        host: std::env::var("KUN_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-        port: std::env::var("KUN_TEST_PORT")
+        host: std::env::var("MINO_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+        port: std::env::var("MINO_TEST_PORT")
             .unwrap_or_else(|_| "2222".into())
             .parse()
             .unwrap(),
-        user: std::env::var("KUN_TEST_USER")
+        user: std::env::var("MINO_TEST_USER")
             .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "root".into())),
         auth: Auth::Key {
             path: key_path.into(),
@@ -52,13 +52,13 @@ fn wait_event(
     Err(format!("等待事件超时，已收到：{seen:?}"))
 }
 
-/// 将测试 sshd 的 known_hosts 记录与 hostkey 放在同一目录（/tmp/kun-test-sshd）：
+/// 将测试 sshd 的 known_hosts 记录与 hostkey 放在同一目录（/tmp/mino-test-sshd）：
 /// hostkey 随 /tmp 清理重建时指纹记录一并消失，避免旧指纹不匹配导致测试失败。
 /// `call_once` 保证进程内只设置一次（测试并行安全）。
 static KNOWN_HOSTS_INIT: std::sync::Once = std::sync::Once::new();
 fn init_test_env() {
     KNOWN_HOSTS_INIT.call_once(|| {
-        std::env::set_var("KUN_KNOWN_HOSTS", "/tmp/kun-test-sshd/known_hosts.toml");
+        std::env::set_var("MINO_KNOWN_HOSTS", "/tmp/mino-test-sshd/known_hosts.toml");
     });
 }
 
@@ -103,9 +103,9 @@ fn sftp_完整操作流程() {
     );
 
     // ============ 3. 上传 ============
-    let local_file = std::env::temp_dir().join("kun_sftp_test_upload.txt");
-    std::fs::write(&local_file, b"kun sftp test content\n").unwrap();
-    let remote_file = format!("{remote_home}/kun_sftp_test_upload.txt");
+    let local_file = std::env::temp_dir().join("mino_sftp_test_upload.txt");
+    std::fs::write(&local_file, b"mino sftp test content\n").unwrap();
+    let remote_file = format!("{remote_home}/mino_sftp_test_upload.txt");
     handle.upload(&local_file, &remote_file);
     let _ = wait_event(&mut rx, Duration::from_secs(10), |ev| {
         matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
@@ -123,14 +123,15 @@ fn sftp_完整操作流程() {
         _ => unreachable!(),
     };
     assert!(
-        entries
-            .iter()
-            .any(|e| e.name == "kun_sftp_test_upload.txt" && e.size == 22),
+        entries.iter().any(|e| {
+            e.name == "mino_sftp_test_upload.txt"
+                && e.size == b"mino sftp test content\n".len() as u64
+        }),
         "上传文件应存在且大小正确，实际：{entries:?}"
     );
 
     // ============ 5. 失败上传不得删除已有远程文件 ============
-    let missing_local = std::env::temp_dir().join("kun_sftp_missing_upload.txt");
+    let missing_local = std::env::temp_dir().join("mino_sftp_missing_upload.txt");
     std::fs::remove_file(&missing_local).ok();
     handle.upload(&missing_local, &remote_file);
     let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
@@ -151,16 +152,17 @@ fn sftp_完整操作流程() {
         _ => unreachable!(),
     };
     assert!(
-        entries
-            .iter()
-            .any(|e| e.name == "kun_sftp_test_upload.txt" && e.size == 22),
+        entries.iter().any(|e| {
+            e.name == "mino_sftp_test_upload.txt"
+                && e.size == b"mino sftp test content\n".len() as u64
+        }),
         "失败上传不得删除已有远程文件，实际：{entries:?}"
     );
 
     // ============ 6. 失败下载不得删除已有本地文件 ============
-    let local_dl = std::env::temp_dir().join("kun_sftp_test_download.txt");
+    let local_dl = std::env::temp_dir().join("mino_sftp_test_download.txt");
     std::fs::write(&local_dl, b"keep-existing-local-file").unwrap();
-    let missing_remote = format!("{remote_home}/kun_sftp_missing_download.txt");
+    let missing_remote = format!("{remote_home}/mino_sftp_missing_download.txt");
     handle.download(&missing_remote, &local_dl);
     let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
         matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
@@ -184,13 +186,13 @@ fn sftp_完整操作流程() {
     .expect("下载未完成");
     assert_eq!(
         std::fs::read_to_string(&local_dl).unwrap(),
-        "kun sftp test content\n",
+        "mino sftp test content\n",
         "下载内容应与上传一致"
     );
 
     // ============ 8. 新建目录 + 重命名 ============
-    let dir_a = format!("{remote_home}/kun_sftp_test_dir");
-    let dir_b = format!("{remote_home}/kun_sftp_test_dir_renamed");
+    let dir_a = format!("{remote_home}/mino_sftp_test_dir");
+    let dir_b = format!("{remote_home}/mino_sftp_test_dir_renamed");
     handle.mkdir(&dir_a);
     let _ = wait_event(&mut rx, Duration::from_secs(10), |ev| {
         matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
@@ -225,7 +227,7 @@ fn sftp_完整操作流程() {
         _ => unreachable!(),
     };
     assert!(
-        !entries.iter().any(|e| e.name.starts_with("kun_sftp_test")),
+        !entries.iter().any(|e| e.name.starts_with("mino_sftp_test")),
         "测试文件应已清理"
     );
 

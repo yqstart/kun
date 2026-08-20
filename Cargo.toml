@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/kun-core", "crates/kun-app"]
+members = ["crates/mino-core", "crates/mino-app"]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 

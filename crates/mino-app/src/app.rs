@@ -1,4 +1,4 @@
-//! kun 应用主体：布局、连接管理与状态。
+//! Mino 应用主体：布局、连接管理与状态。
 //!
 //! 视觉参照 Warp：分层深色背景、品牌紫青渐变、圆角幽灵按钮、
 //! 标签页底部指示条与扫光动效（动效细节见 `crate::anim`）。
@@ -9,16 +9,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
-use kun_core::config::{default_config_path, Auth, HostConfig, HostProfile};
-use kun_core::ssh::sftp::{connect_sftp, SftpEvent, SftpHandle};
-use kun_core::ssh::{connect_remote, ConnectResult};
-use kun_core::terminal::{Session, SessionEvent, SessionOptions};
-use kun_core::updater::{check_for_update, UpdateInfo};
+use mino_core::config::{default_config_path, Auth, HostConfig, HostProfile};
+use mino_core::ssh::sftp::{connect_sftp, SftpEvent, SftpHandle};
+use mino_core::ssh::{connect_remote, ConnectResult};
+use mino_core::terminal::{Session, SessionEvent, SessionOptions};
+use mino_core::updater::{check_for_update, UpdateInfo};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::anim;
 use crate::views::sftp_view::SftpView;
 use crate::views::terminal_view::TerminalView;
+
+/// 应用对外展示名称。
+pub const PRODUCT_NAME: &str = "Mino";
 
 /// 新建连接表单状态。
 struct ConnectForm {
@@ -135,13 +138,15 @@ impl TerminalTab {
 pub type Tab = Box<TerminalTab>;
 
 /// 应用状态。
-pub struct KunApp {
+pub struct MinoApp {
     tabs: Vec<Tab>,
     active_tab: usize,
     /// 连接成功后创建的标签页索引（用于挂载 SFTP）。
     pending_tab: Option<usize>,
     /// 主机行最近一次点击（时间, 行索引），自实现双击检测。
     last_row_click: Option<(f64, usize)>,
+    /// 设置中的当前主机焦点（单击后保持，双击连接）。
+    selected_host: Option<usize>,
     /// 设置弹窗是否打开（`⌘,` 或齿轮按钮切换；Esc/× 关闭）。
     show_settings: bool,
     /// 最近一帧的 egui::Context（`new_local_tab` 等非 UI 闭包内构造时使用）。
@@ -188,7 +193,7 @@ fn local_session_options() -> SessionOptions {
     SessionOptions {
         working_directory: std::env::var("HOME").ok().map(PathBuf::from),
         // TERM 必须显式注入：从 GUI/Finder/Dock 启动的进程继承 `TERM=dumb`，
-        // alacritty 的 `setup_env()` 只在其主应用入口调用，kun 未调用 →
+        // alacritty 的 `setup_env()` 只在其主应用入口调用，mino 未调用 →
         // zsh 的 zle 判定非交互终端，删除回显走「原地空格覆盖」（删不掉+冒空格）、
         // 行编辑/补全/回车行为异常。注入 xterm-256color 恢复完整交互（同 Miro Code 修复）。
         // 注意：勿注入 locale（LANG/LC_ALL），会引发回车不执行（实测回归）。
@@ -287,8 +292,10 @@ fn draw_traffic_lights(ui: &mut egui::Ui) -> (Option<usize>, Option<usize>) {
     (clicked, hovered)
 }
 
-/// 标签栏最右侧齿轮图标（设置入口）。22×22 纯图标按钮，无文字。
-/// 朴素风格：⚙ 符号次要色，hover 变主色 + 白色低透明度圆角底（Tabby 风）。
+/// 标签栏最右侧设置图标。22×22 纯图标按钮，无 unicode 齿轮字形依赖。
+///
+/// 用矢量圆环与八根短齿绘制，跨平台字体不会出现方框，视觉上也更贴近
+/// Mino 的控制台/仪表盘语气。
 /// 包装为 `egui::Button` 以便被 kittest 通过 `Role::Button` 找到。
 /// 点击调用方负责打开设置弹窗。
 fn settings_gear_button(ui: &mut egui::Ui) -> bool {
@@ -313,17 +320,24 @@ fn settings_gear_button(ui: &mut egui::Ui) -> bool {
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18),
             );
         }
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "⚙",
-            egui::FontId::proportional(13.0),
-            if response.hovered() {
-                theme.text_primary
-            } else {
-                theme.text_secondary
-            },
-        );
+        let icon_color = if response.hovered() {
+            theme.accent
+        } else {
+            theme.text_secondary
+        };
+        let center = rect.center();
+        let core = theme.bg_panel;
+        for i in 0..8 {
+            let angle = i as f32 * std::f32::consts::TAU / 8.0;
+            let dir = egui::vec2(angle.cos(), angle.sin());
+            ui.painter().line_segment(
+                [center + dir * 5.2, center + dir * 7.0],
+                egui::Stroke::new(1.5, icon_color),
+            );
+        }
+        ui.painter()
+            .circle_stroke(center, 5.0, egui::Stroke::new(1.5, icon_color));
+        ui.painter().circle_filled(center, 2.0, core);
     }
     response.clicked()
 }
@@ -369,7 +383,7 @@ fn macos_arch() -> &'static str {
 
 /// 下载缓存目录下的 dmg 路径。
 fn temp_dmg_path(file_name: &str) -> PathBuf {
-    std::env::temp_dir().join("kun-update").join(file_name)
+    std::env::temp_dir().join("mino-update").join(file_name)
 }
 
 /// 安装脚本：挂载 dmg → 等待主程序退出 → 替换 .app → 重启。
@@ -397,22 +411,22 @@ install() {
 }
 mkdir -p "$MOUNT"
 hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT" >/dev/null 2>&1 || exit 1
-SRC="$MOUNT/kun.app"
+SRC="$MOUNT/Mino.app"
 [ -d "$SRC" ] || { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; exit 2; }
 i=0
 while [ $i -lt 50 ]; do
-  if ! pgrep -x kun-app >/dev/null 2>&1; then break; fi
+  if ! pgrep -x mino-app >/dev/null 2>&1; then break; fi
   sleep 0.2
   i=$((i+1))
 done
-install "/Applications/kun.app" || install "$HOME/Applications/kun.app" || { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; exit 3; }
+install "/Applications/Mino.app" || install "$HOME/Applications/Mino.app" || { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; exit 3; }
 hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true
 rmdir "$MOUNT" 2>/dev/null || true
 rm -f "$DMG" 2>/dev/null
 open "$FINAL"
 "#;
 
-impl KunApp {
+impl MinoApp {
     /// 创建应用（启动本地终端会话）。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self::new_with_config(cc, default_config_path())
@@ -421,7 +435,7 @@ impl KunApp {
     /// 指定配置文件路径创建应用。
     ///
     /// 测试必须走这里传入隔离路径——曾发生测试直接读写并删除用户真实的
-    /// `~/.config/kun/hosts.toml`（default_config_path），运行一次测试
+    /// `~/.config/mino/hosts.toml`（default_config_path），运行一次测试
     /// 主机列表就丢一次（表现为"更新后主机全部消失"）。
     pub fn new_with_config(cc: &eframe::CreationContext<'_>, config_path: PathBuf) -> Self {
         crate::theme::set_theme(&cc.egui_ctx, 0);
@@ -449,6 +463,7 @@ impl KunApp {
             active_tab: 0,
             pending_tab: None,
             last_row_click: None,
+            selected_host: None,
             show_settings: false,
             last_ctx: cc.egui_ctx.clone(),
             config,
@@ -534,7 +549,7 @@ impl KunApp {
             if delay {
                 std::thread::sleep(Duration::from_secs(3));
             }
-            let result = check_for_update(&current, kun_core::updater::DEFAULT_REPO, &arch);
+            let result = check_for_update(&current, mino_core::updater::DEFAULT_REPO, &arch);
             let _ = tx.send(result);
         });
         self.update_rx = Some(rx);
@@ -582,7 +597,7 @@ impl KunApp {
         let url = info.asset_url.clone();
         let dest = temp_dmg_path(&info.asset_name);
         std::thread::spawn(move || {
-            let result = kun_core::updater::download_asset(&url, &dest, |done, total| {
+            let result = mino_core::updater::download_asset(&url, &dest, |done, total| {
                 let _ = tx.send(DownloadEvent::Progress {
                     downloaded: done,
                     total,
@@ -651,7 +666,7 @@ impl KunApp {
         if let UpdateState::Downloaded { info, .. } = &self.update_state {
             self.update_state = UpdateState::Installing(info.clone());
         }
-        let mount = std::env::temp_dir().join("kun-update").join("mount");
+        let mount = std::env::temp_dir().join("mino-update").join("mount");
         match launch_installer(&dmg_path, &mount) {
             Ok(()) => {
                 self.update_state = UpdateState::Installed;
@@ -767,40 +782,110 @@ impl KunApp {
         }
     }
 
-    /// 设置弹窗：macOS 系统偏好设置风格，分三组（主机 / 外观 / 关于）。
-    /// 内部调用 `host_sidebar` 渲染主机列表；外观组合并主题 ComboBox；
-    /// 关于组展示版本号与手动检查更新按钮。
-    /// 卡片化分组（`bg_elevated` 底 + 边框 + 圆角 + 紧凑内边距）。
+    /// 设置弹窗：Mino 控制台风格的统一外壳。
+    ///
+    /// 不使用 egui 默认标题栏，标题、关闭按钮与内容卡片共用同一个内边距
+    /// 基线，避免出现“系统头部一套边距、弹窗内容另一套边距”的错位。
     fn settings_panel(&mut self, ctx: &egui::Context) {
         let theme = crate::theme::current_theme();
         let mut open = self.show_settings;
-        egui::Window::new("设置")
+        let mut close_requested = false;
+        egui::Window::new("settings_panel")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
-            .default_size([520.0, 540.0])
-            .min_size([460.0, 420.0])
-            // 限制最大尺寸：避免主机行多时被内容撑大（保持固定外观）。
-            .max_size([520.0, 540.0])
+            .default_size([620.0, 560.0])
+            .min_size([520.0, 420.0])
+            .max_size([700.0, 580.0])
             .resizable(true)
             .collapsible(false)
+            .title_bar(false)
             .frame(
                 egui::Frame::new()
                     .fill(theme.bg_app)
-                    .corner_radius(crate::theme::tokens::RADIUS_SM)
+                    .corner_radius(egui::CornerRadius::same(14))
                     .stroke(egui::Stroke::new(1.0, theme.border))
-                    .inner_margin(egui::Margin::same(18)),
+                    .inner_margin(egui::Margin::same(0)),
             )
             .show(ctx, |ui| {
-                // 唯一标题由 `egui::Window::new("设置")` 自带，
-                // 这里不再重复加标题与副标题（之前导致双层标题问题）。
-                ui.add_space(4.0);
+                // ==================== 对齐的自绘头部 ====================
+                let header_h = 78.0;
+                let (header_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), header_h),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    header_rect,
+                    egui::CornerRadius {
+                        nw: 14,
+                        ne: 14,
+                        sw: 0,
+                        se: 0,
+                    },
+                    theme.bg_header,
+                );
+                ui.painter().line_segment(
+                    [header_rect.left_bottom(), header_rect.right_bottom()],
+                    egui::Stroke::new(1.0, theme.border),
+                );
+
+                let mut header = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(header_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                header.add_space(20.0);
+                draw_logo_mark(&mut header, 46.0);
+                header.add_space(12.0);
+                header.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(
+                        egui::RichText::new("WORKSPACE CONTROL")
+                            .monospace()
+                            .size(9.0)
+                            .color(theme.accent),
+                    );
+                    ui.label(
+                        egui::RichText::new("设置")
+                            .strong()
+                            .size(19.0)
+                            .color(theme.text_primary),
+                    );
+                });
+                header.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(16.0);
+                    let close = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("×")
+                                    .size(21.0)
+                                    .color(theme.text_secondary),
+                            )
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE)
+                            .min_size(egui::vec2(30.0, 30.0))
+                            .corner_radius(crate::theme::tokens::RADIUS_ITEM),
+                        )
+                        .on_hover_text("关闭设置（Esc）")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if close.clicked() {
+                        close_requested = true;
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("ESC")
+                            .monospace()
+                            .size(9.0)
+                            .color(theme.text_muted),
+                    );
+                });
+
+                ui.add_space(14.0);
 
                 egui::ScrollArea::vertical()
+                    .id_salt("settings_scroll")
                     .auto_shrink([false, true])
-                    // 弹窗总高 540 - 标题 28 - 内边距 36 - 边距 ≈ 476，
-                    // 留 6px 给三组间距，紧凑但不被主机列表撑大。
-                    .max_height(470.0)
                     .show(ui, |ui| {
+                        ui.set_width(ui.available_width() - 32.0);
                         // ============ 主机管理 ============
                         Self::settings_card(ui, "主机管理", |ui| {
                             self.host_sidebar(ui);
@@ -843,6 +928,13 @@ impl KunApp {
                                         }
                                     });
                             });
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("⌥1 — ⌥3 快速切换主题")
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(theme.text_muted),
+                            );
                         });
                         ui.add_space(10.0);
 
@@ -851,7 +943,7 @@ impl KunApp {
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "kun v{}",
+                                        "{PRODUCT_NAME} v{}",
                                         env!("CARGO_PKG_VERSION")
                                     ))
                                     .size(12.0)
@@ -935,31 +1027,67 @@ impl KunApp {
                         });
                     });
             });
+        if close_requested {
+            open = false;
+        }
         // Esc 关闭 / × 关闭 / 闭包内主动关闭（如双击主机行连接成功）都生效：
         // open 由 egui 回写用户关闭动作，self.show_settings 记录闭包内的主动关闭。
         self.show_settings = open && self.show_settings;
     }
 
-    /// 设置弹窗的卡片化分组容器：`bg_elevated` 底 + 边框 + 圆角 + 紧凑内边距。
-    /// 头部 accent2 颜色小标题 + 内容区。自由函数避免借用 self 与 ctx 冲突。
+    /// 设置弹窗的统一内容卡片：标题、编号、分隔线和内容使用同一条水平基线。
     fn settings_card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
         let theme = crate::theme::current_theme();
         let frame = egui::Frame::new()
-            .fill(theme.bg_elevated)
+            .fill(theme.bg_panel)
             .stroke(egui::Stroke::new(1.0, theme.border))
-            .corner_radius(crate::theme::tokens::RADIUS_SM)
-            .inner_margin(egui::Margin::symmetric(12, 10));
+            .corner_radius(egui::CornerRadius::same(11))
+            .inner_margin(egui::Margin::symmetric(16, 14));
         frame.show(ui, |ui| {
-            ui.set_min_width(ui.available_width() - 4.0);
-            ui.label(
-                egui::RichText::new(title)
-                    .strong()
-                    .size(11.5)
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    egui::RichText::new(title)
+                        .strong()
+                        .size(13.0)
+                        .color(theme.text_primary),
+                );
+                ui.label(
+                    egui::RichText::new(match title {
+                        "主机管理" => "HOSTS / SSH",
+                        "外观" => "APPEARANCE",
+                        _ => "SYSTEM",
+                    })
+                    .monospace()
+                    .size(9.0)
                     .color(theme.accent2),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(match title {
+                            "主机管理" => "01",
+                            "外观" => "02",
+                            _ => "03",
+                        })
+                        .monospace()
+                        .size(10.0)
+                        .color(theme.text_muted),
+                    );
+                });
+            });
+            ui.add_space(9.0);
+            ui.painter().line_segment(
+                [
+                    ui.cursor().left_top(),
+                    egui::pos2(ui.max_rect().right(), ui.cursor().top()),
+                ],
+                egui::Stroke::new(1.0, theme.border),
             );
-            ui.add_space(6.0);
+            ui.add_space(10.0);
             body(ui);
         });
+        ui.add_space(12.0);
     }
 
     /// 标签栏 ">_" 快捷按钮弹出的主机菜单：单击主机行直接发起连接
@@ -1083,150 +1211,209 @@ impl KunApp {
         }
     }
 
-    /// 渲染左侧主机列表。
+    /// 渲染设置里的主机管理区。
+    ///
+    /// 每个主机使用独立的 endpoint 卡片：名称、地址、认证方式和操作按钮
+    /// 有明确层级，点击区域覆盖整行，避免只点到文字才有反应。
     fn host_sidebar(&mut self, ui: &mut egui::Ui) {
         let theme = crate::theme::current_theme();
-        ui.add_space(2.0);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
             ui.label(
-                egui::RichText::new("主机")
+                egui::RichText::new("已保存主机")
                     .strong()
-                    .size(13.0)
+                    .size(12.5)
                     .color(theme.text_primary),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    egui::RichText::new(format!("{} 台", self.config.hosts.len()))
-                        .size(11.0)
+                    egui::RichText::new(format!("{:02} ENDPOINTS", self.config.hosts.len()))
+                        .monospace()
+                        .size(9.0)
                         .color(theme.text_muted),
                 );
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(9.0);
 
-        // 新建连接（主按钮）。
+        // 新建连接：右侧动作按钮与主机卡片共享同一宽度节奏。
         let new_btn = egui::Button::new(
             egui::RichText::new("新建连接")
                 .color(crate::theme::tokens::ACCENT_FG)
-                .size(13.0),
+                .size(12.5),
         )
         .fill(theme.accent)
         .stroke(egui::Stroke::NONE)
-        .corner_radius(crate::theme::tokens::RADIUS_SM);
+        .corner_radius(egui::CornerRadius::same(7));
         if ui
-            .add_sized(egui::vec2(ui.available_width(), 30.0), new_btn)
+            .add_sized(egui::vec2(ui.available_width(), 32.0), new_btn)
             .clicked()
         {
             self.show_new_conn = true;
         }
-        // 按钮与主机列表直接留白分隔。曾在此画发丝线，但 hairline 取
-        // ui.max_rect().top()（卡片内容区顶部）而非当前光标位置，线实际
-        // 出现在"主机管理"标题下方、压在新建连接按钮上方——用户要求去掉。
-        ui.add_space(8.0);
+        ui.add_space(12.0);
 
         if self.config.hosts.is_empty() {
-            ui.add_space(20.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("暂无已保存主机")
-                        .color(theme.text_muted)
-                        .size(12.5),
-                );
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new("⌘N 添加第一台主机")
-                        .size(11.0)
-                        .color(theme.text_muted),
-                );
-            });
+            let (empty_rect, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
+            ui.painter().rect_filled(
+                empty_rect,
+                crate::theme::tokens::RADIUS_ITEM,
+                theme.bg_elevated.gamma_multiply(0.55),
+            );
+            ui.painter().rect_stroke(
+                empty_rect,
+                crate::theme::tokens::RADIUS_ITEM,
+                egui::Stroke::new(1.0, theme.border),
+                egui::StrokeKind::Inside,
+            );
+            let mut empty = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("empty_hosts")
+                    .max_rect(empty_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Center)),
+            );
+            empty.add_space(22.0);
+            empty.label(
+                egui::RichText::new("暂无已保存主机")
+                    .color(theme.text_secondary)
+                    .size(12.5),
+            );
+            empty.add_space(2.0);
+            empty.label(
+                egui::RichText::new("⌘N 添加第一台主机")
+                    .monospace()
+                    .size(10.0)
+                    .color(theme.text_muted),
+            );
         }
 
         let mut remove_idx: Option<usize> = None;
         let mut connect_idx: Option<usize> = None;
-        let mut selected_host: Option<usize> = None;
-        // 行内容可用宽度：面板宽 - 内边距（供文本截断用，避免长名称换行）。
-        let row_avail_w = ui.available_width() - 34.0;
         for (i, host) in self.config.hosts.iter().enumerate() {
             let row_id = egui::Id::new(("host_row", i));
-            // 行内容（头像 + 名称）。
-            let inner = ui
-                .scope_builder(egui::UiBuilder::new().id_salt(row_id), |ui| {
-                    ui.horizontal(|ui| {
-                        let avatar_size = 30.0;
-                        let (avatar_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(avatar_size, avatar_size),
-                            egui::Sense::hover(),
-                        );
-                        anim::paint_rounded_gradient(
-                            ui.painter(),
-                            avatar_rect,
-                            avatar_size * 0.3,
-                            theme.accent,
-                            theme.accent2,
-                        );
-                        let initial = host.name.chars().next().unwrap_or('?');
-                        ui.painter().text(
-                            avatar_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            initial.to_string(),
-                            egui::FontId::proportional(13.0),
-                            egui::Color32::WHITE,
-                        );
-                        ui.add_space(8.0);
-                        // 文本宽度固定，超长截断不换行。
-                        ui.vertical(|ui| {
-                            ui.add_sized(
-                                [row_avail_w, 18.0],
-                                egui::Label::new(
-                                    egui::RichText::new(&host.name)
-                                        .size(13.0)
-                                        .color(theme.text_primary),
-                                )
-                                .truncate(),
-                            );
-                            ui.add_sized(
-                                [row_avail_w, 16.0],
-                                egui::Label::new(
-                                    egui::RichText::new(format!("{}@{}", host.user, host.host))
-                                        .size(11.0)
-                                        .color(theme.text_muted),
-                                )
-                                .truncate(),
-                            );
-                        });
-                    });
-                })
-                .response;
-
-            // 整行点击区（显式 interact：egui 0.36 响应链不可靠）。
-            // 点击区横向扩展到面板可用宽度，保证短名称主机也能整行点击。
-            let row_rect = egui::Rect::from_min_max(
-                inner.rect.min,
-                egui::pos2(ui.max_rect().right() - 4.0, inner.rect.bottom()),
-            );
+            let (row_rect, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 68.0), egui::Sense::hover());
             let row_response = ui
                 .interact(row_rect, row_id, egui::Sense::click())
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
-            // 删除图标（行右缘，最后注册保证可点）。
+
+            let hover = row_response.hovered();
+            let selected = self.selected_host == Some(i);
+            let fill = if selected {
+                theme.accent_soft
+            } else if hover {
+                theme.bg_elevated.gamma_multiply(1.12)
+            } else {
+                theme.bg_elevated.gamma_multiply(0.72)
+            };
+            ui.painter().rect_filled(row_rect, 8.0, fill);
+            ui.painter().rect_stroke(
+                row_rect,
+                8.0,
+                egui::Stroke::new(1.0, if selected { theme.accent } else { theme.border }),
+                egui::StrokeKind::Inside,
+            );
+            if selected || hover {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(row_rect.left(), row_rect.top() + 9.0),
+                        egui::pos2(row_rect.left() + 2.0, row_rect.bottom() - 9.0),
+                    ),
+                    1.0,
+                    if selected {
+                        theme.accent
+                    } else {
+                        theme.accent2
+                    },
+                );
+            }
+
+            let content_rect = row_rect.shrink2(egui::vec2(14.0, 8.0));
+            let mut inner = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(row_id.with("content"))
+                    .max_rect(content_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            inner.spacing_mut().item_spacing.x = 10.0;
+            let avatar_size = 38.0;
+            let (avatar_rect, _) = inner
+                .allocate_exact_size(egui::vec2(avatar_size, avatar_size), egui::Sense::hover());
+            anim::paint_rounded_gradient(
+                inner.painter(),
+                avatar_rect,
+                11.0,
+                theme.accent2,
+                theme.accent,
+            );
+            let initial = host.name.chars().next().unwrap_or('?');
+            inner.painter().text(
+                avatar_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                initial.to_string(),
+                egui::FontId::proportional(15.0),
+                egui::Color32::WHITE,
+            );
+            inner.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.set_max_width((content_rect.width() - avatar_size - 88.0).max(80.0));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&host.name)
+                            .strong()
+                            .size(13.0)
+                            .color(theme.text_primary),
+                    )
+                    .truncate(),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{}@{}:{}", host.user, host.host, host.port))
+                            .monospace()
+                            .size(10.5)
+                            .color(theme.text_secondary),
+                    )
+                    .truncate(),
+                );
+            });
+
+            let auth_label = if matches!(host.auth, Auth::Key { .. }) {
+                "SSH KEY"
+            } else {
+                "PASSWORD"
+            };
+            let auth_frame = egui::Frame::new()
+                .fill(theme.bg_panel)
+                .stroke(egui::Stroke::new(1.0, theme.border))
+                .corner_radius(5.0)
+                .inner_margin(egui::Margin::symmetric(6, 3));
+            auth_frame.show(&mut inner, |ui| {
+                ui.label(
+                    egui::RichText::new(auth_label)
+                        .monospace()
+                        .size(8.5)
+                        .color(theme.accent2),
+                );
+            });
+
+            // 删除按钮最后注册，覆盖整行点击区，避免点击删除时先触发连接。
             let del_rect = egui::Rect::from_min_size(
-                egui::pos2(row_rect.right() - 26.0, row_rect.top() + 3.0),
-                egui::vec2(22.0, 22.0),
+                egui::pos2(row_rect.right() - 34.0, row_rect.center().y - 13.0),
+                egui::vec2(26.0, 26.0),
             );
             let del_resp = ui
                 .interact(del_rect, row_id.with("del"), egui::Sense::click())
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             if del_resp.hovered() {
-                ui.painter().rect_filled(
-                    del_rect,
-                    crate::theme::tokens::RADIUS_ITEM,
-                    theme.danger.gamma_multiply(0.22),
-                );
+                ui.painter()
+                    .rect_filled(del_rect, 6.0, theme.danger.gamma_multiply(0.18));
             }
             ui.painter().text(
                 del_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "🗑",
-                egui::FontId::proportional(13.0),
+                "×",
+                egui::FontId::proportional(18.0),
                 if del_resp.hovered() {
                     theme.danger
                 } else {
@@ -1237,7 +1424,7 @@ impl KunApp {
                 remove_idx = Some(i);
             }
             if row_response.clicked() {
-                selected_host = Some(i);
+                self.selected_host = Some(i);
                 let now = ui.input(|i| i.time);
                 if let Some((t, idx)) = self.last_row_click {
                     if idx == i && now - t < 0.3 {
@@ -1246,40 +1433,7 @@ impl KunApp {
                 }
                 self.last_row_click = Some((now, i));
             }
-
-            // 选中/hover 高亮（动画过渡）。
-            // Tabby 风：hover 白色低透明度叠加，选中用 accent 软底。
-            let hover = row_response.hovered();
-            let selected = selected_host == Some(i);
-            let hover_alpha =
-                anim::smooth_bool(ui.ctx(), row_id.with("hover"), hover, anim::SPEED_FAST);
-            let sel_alpha =
-                anim::smooth_bool(ui.ctx(), row_id.with("sel"), selected, anim::SPEED_FAST);
-            if hover_alpha > 0.01 {
-                ui.painter().rect_filled(
-                    row_rect.expand2(egui::vec2(0.0, 4.0)),
-                    crate::theme::tokens::RADIUS_ITEM,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12)
-                        .gamma_multiply(hover_alpha * 0.8),
-                );
-            }
-            if sel_alpha > 0.01 {
-                ui.painter().rect_filled(
-                    row_rect.expand2(egui::vec2(0.0, 4.0)),
-                    crate::theme::tokens::RADIUS_ITEM,
-                    theme.accent_soft.gamma_multiply(sel_alpha),
-                );
-            }
-            if sel_alpha > 0.01 {
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(row_rect.left() + 1.0, row_rect.top() + 4.0),
-                        egui::pos2(row_rect.left() + 3.0, row_rect.bottom() - 4.0),
-                    ),
-                    1.5,
-                    theme.accent.gamma_multiply(sel_alpha),
-                );
-            }
+            ui.add_space(8.0);
         }
         if let Some(i) = connect_idx {
             let profile = self.config.hosts[i].clone();
@@ -1289,6 +1443,7 @@ impl KunApp {
         }
         if let Some(i) = remove_idx {
             self.config.hosts.remove(i);
+            self.selected_host = None;
             self.save_config();
         }
     }
@@ -1301,28 +1456,67 @@ impl KunApp {
         let mut open = self.show_new_conn;
         let mut to_connect: Option<HostProfile> = None;
         let mut canceled = false;
-        egui::Window::new("新建连接")
+        egui::Window::new("connect_dialog")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
             .resizable(false)
             .collapsible(false)
+            .title_bar(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.bg_app)
+                    .stroke(egui::Stroke::new(1.0, theme.border))
+                    .corner_radius(egui::CornerRadius::same(14))
+                    .inner_margin(egui::Margin::same(18)),
+            )
             .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    draw_logo_mark(ui, 42.0);
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("建立安全连接")
-                            .strong()
-                            .size(18.0)
-                            .color(theme.text_primary),
-                    );
-                    ui.label(
-                        egui::RichText::new("连接到你的远程工作空间")
-                            .size(11.0)
-                            .color(theme.text_muted),
-                    );
+                // 与设置窗口共用同一套头部基线，标题不再依赖 egui 默认 title bar。
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    draw_logo_mark(ui, 38.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(
+                            egui::RichText::new("NEW CONNECTION")
+                                .monospace()
+                                .size(9.0)
+                                .color(theme.accent),
+                        );
+                        ui.label(
+                            egui::RichText::new("新建连接")
+                                .strong()
+                                .size(17.0)
+                                .color(theme.text_primary),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("×")
+                                        .size(20.0)
+                                        .color(theme.text_secondary),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE)
+                                .min_size(egui::vec2(28.0, 28.0))
+                                .corner_radius(crate::theme::tokens::RADIUS_ITEM),
+                            )
+                            .clicked()
+                        {
+                            canceled = true;
+                        }
+                    });
                 });
-                ui.add_space(14.0);
+                ui.add_space(15.0);
+                ui.painter().line_segment(
+                    [
+                        ui.cursor().left_top(),
+                        egui::pos2(ui.max_rect().right(), ui.cursor().top()),
+                    ],
+                    egui::Stroke::new(1.0, theme.border),
+                );
+                ui.add_space(13.0);
                 ui.label(
                     egui::RichText::new("连接身份")
                         .strong()
@@ -1529,6 +1723,8 @@ impl KunApp {
             // macOS traffic lights（隐藏系统按钮后由应用自绘）。
             let (tl, _) = draw_traffic_lights(ui);
             tl_clicked = tl;
+            // 顶部栏保留交通灯与标签页，不再重复显示品牌图标和名称。
+            ui.add_space(12.0);
             let mut switch_to: Option<usize> = None;
             let mut close_idx: Option<usize> = None;
             for (i, tab) in self.tabs.iter().enumerate() {
@@ -1821,7 +2017,7 @@ impl KunApp {
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
                         ui.label(
-                            egui::RichText::new("更新 kun")
+                            egui::RichText::new(format!("更新 {PRODUCT_NAME}"))
                                 .strong()
                                 .size(16.0)
                                 .color(theme.text_primary),
@@ -2066,7 +2262,7 @@ impl KunApp {
                 draw_logo_mark(ui, 48.0);
                 ui.add_space(12.0);
                 ui.label(
-                    egui::RichText::new("kun")
+                    egui::RichText::new(PRODUCT_NAME)
                         .strong()
                         .size(22.0)
                         .color(theme.text_primary),
@@ -2098,11 +2294,14 @@ impl KunApp {
 
 /// 隔离的测试配置路径（每个测试独享一份临时文件）。
 ///
-/// 绝不触碰用户真实的 `~/.config/kun/hosts.toml`——曾发生测试直接
+/// 绝不触碰用户真实的 `~/.config/mino/hosts.toml`——曾发生测试直接
 /// 覆盖并删除用户主机配置（运行一次测试丢一次主机列表）。
 #[cfg(test)]
 pub(crate) fn test_config_path(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("kun-test-config-{tag}-{}.toml", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "mino-test-config-{tag}-{}.toml",
+        std::process::id()
+    ))
 }
 
 /// 新建连接对话框的输入框统一样式：圆角深色底、垂直居中、焦点 accent 边框。
@@ -2143,7 +2342,7 @@ fn form_input(
     ui.add_sized([width, 30.0], edit)
 }
 
-/// 品牌标记：紫金渐变圆底 + 白色粗体 "K" 字（居中）。
+/// 品牌标记：紫青渐变圆角底 + 白色极简终端提示符 `>_`。
 ///
 /// 与应用图标（scripts/make-icon.swift）同构图；hover 时带 accent 辉光。
 fn draw_logo_mark(ui: &mut egui::Ui, size: f32) -> egui::Rect {
@@ -2152,23 +2351,42 @@ fn draw_logo_mark(ui: &mut egui::Ui, size: f32) -> egui::Rect {
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let center = rect.center();
-        let radius = size * 0.40;
-        // 圆底：accent → accent2 垂直渐变。
-        anim::paint_rounded_gradient(
-            painter,
-            egui::Rect::from_center_size(center, egui::vec2(radius * 2.0, radius * 2.0)),
-            radius,
-            theme.accent,
-            theme.accent2,
-        );
+        let tile = egui::Rect::from_center_size(center, egui::vec2(size * 0.80, size * 0.80));
+        let radius = tile.width() * 0.22;
+        // 圆角底：accent → accent2 垂直渐变。
+        anim::paint_rounded_gradient(painter, tile, radius, theme.accent, theme.accent2);
 
-        // K 字：白色粗体，居中。
-        painter.text(
-            center,
-            egui::Align2::CENTER_CENTER,
-            "K",
-            egui::FontId::proportional(size * 0.46),
-            egui::Color32::WHITE,
+        // `>_`：用线条绘制，避免依赖字体字形，在小尺寸下也保持清晰。
+        let stroke = egui::Stroke::new((size * 0.075).max(1.5), egui::Color32::WHITE);
+        let chevron_left = tile.left() + tile.width() * 0.29;
+        let chevron_tip = tile.left() + tile.width() * 0.44;
+        let chevron_half_height = tile.height() * 0.18;
+        painter.line_segment(
+            [
+                egui::pos2(chevron_left, center.y - chevron_half_height),
+                egui::pos2(chevron_tip, center.y),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(chevron_tip, center.y),
+                egui::pos2(chevron_left, center.y + chevron_half_height),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(
+                    tile.left() + tile.width() * 0.54,
+                    center.y + tile.height() * 0.18,
+                ),
+                egui::pos2(
+                    tile.left() + tile.width() * 0.73,
+                    center.y + tile.height() * 0.18,
+                ),
+            ],
+            stroke,
         );
 
         if response.hovered() {
@@ -2270,7 +2488,7 @@ fn fmt_bytes(n: u64) -> String {
 
 /// 写安装脚本并启动（独立进程，应用退出后继续运行）。
 fn launch_installer(dmg: &Path, mount: &Path) -> Result<(), String> {
-    let dir = std::env::temp_dir().join("kun-update");
+    let dir = std::env::temp_dir().join("mino-update");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let script = dir.join("install.sh");
     std::fs::write(&script, INSTALL_SCRIPT).map_err(|e| e.to_string())?;
@@ -2286,7 +2504,7 @@ fn launch_installer(dmg: &Path, mount: &Path) -> Result<(), String> {
     Ok(())
 }
 
-impl eframe::App for KunApp {
+impl eframe::App for MinoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // 缓存 ctx 供非 UI 回调使用（如复制 tab 时构造 Session）。
@@ -2509,7 +2727,7 @@ mod tests {
                     ui.weak("暂无已保存主机");
                 });
             egui::Panel::top("toolbar").show(ui, |ui| {
-                ui.label(egui::RichText::new("kun").strong());
+                ui.label(egui::RichText::new(super::PRODUCT_NAME).strong());
                 let _ = ui.button("本地终端");
             });
             egui::Panel::bottom("status").show(ui, |ui| {
@@ -2524,7 +2742,7 @@ mod tests {
         harness.get_by_label("主机");
         harness.get_by_label("新建连接");
         harness.get_by_label("暂无已保存主机");
-        harness.get_by_label("kun");
+        harness.get_by_label(super::PRODUCT_NAME);
         harness.get_by_label("本地终端");
         harness.get_by_label("状态栏");
         harness.get_by_label("终端区域");
@@ -2631,7 +2849,7 @@ mod app_tests {
         use kittest::Queryable;
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
-            let mut app = KunApp::new(cc);
+            let mut app = MinoApp::new(cc);
             // 构造带 SFTP 会话的标签页（mock 通道，无需测试 sshd）。
             let session = Session::spawn_local(
                 SessionOptions::default(),
@@ -2677,7 +2895,7 @@ mod app_tests {
     fn 输入触发补全浮层() {
         use kittest::Queryable;
 
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
 
         // 输入 "ca"（本地终端，初始即聚焦）。
@@ -2746,7 +2964,7 @@ mod app_tests {
     }
 
     /// 读当前标签页终端可见文本（kittest 断言用）。
-    fn app_grid_text(app: &KunApp) -> String {
+    fn app_grid_text(app: &MinoApp) -> String {
         use alacritty_terminal::term::cell::Flags;
         let tab = app.tabs.get(app.active_tab).expect("无标签页");
         let term_arc = tab.terminal.session().term();
@@ -2783,7 +3001,7 @@ mod app_tests {
     fn 完整应用回车执行命令() {
         use std::time::{Duration, Instant};
 
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
 
         // 等待 zsh 就绪（提示符出现）。用 `~`（home 缩写，zsh 在 home 目录的
@@ -2855,7 +3073,7 @@ mod app_tests {
     fn 点击新建连接不崩溃() {
         use kittest::Queryable;
 
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
         // ⌘, 打开设置弹窗（含"主机管理"分组与"新建连接"按钮）。
         harness.event(egui::Event::Key {
@@ -2904,15 +3122,15 @@ mod app_tests {
 #[cfg(test)]
 mod connect_tests {
     use super::*;
-    use kun_core::config::Auth;
+    use mino_core::config::Auth;
 
-    /// 将测试 sshd 的 known_hosts 记录与 hostkey 放在同一目录（/tmp/kun-test-sshd）：
+    /// 将测试 sshd 的 known_hosts 记录与 hostkey 放在同一目录（/tmp/mino-test-sshd）：
     /// hostkey 随 /tmp 清理重建时指纹记录一并消失，避免旧指纹不匹配导致测试失败。
     /// `call_once` 保证进程内只设置一次（测试并行安全）。
     static KNOWN_HOSTS_INIT: std::sync::Once = std::sync::Once::new();
     fn init_test_env() {
         KNOWN_HOSTS_INIT.call_once(|| {
-            std::env::set_var("KUN_KNOWN_HOSTS", "/tmp/kun-test-sshd/known_hosts.toml");
+            std::env::set_var("MINO_KNOWN_HOSTS", "/tmp/mino-test-sshd/known_hosts.toml");
         });
     }
 
@@ -2927,7 +3145,7 @@ mod connect_tests {
     }
 
     fn test_profile() -> HostProfile {
-        let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
+        let key_path = std::env::var("MINO_TEST_KEY").unwrap_or_else(|_| {
             format!(
                 "{}/.ssh/id_ed25519",
                 std::env::var("HOME").unwrap_or_default()
@@ -2935,12 +3153,12 @@ mod connect_tests {
         });
         HostProfile {
             name: "链路测试".into(),
-            host: std::env::var("KUN_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-            port: std::env::var("KUN_TEST_PORT")
+            host: std::env::var("MINO_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("MINO_TEST_PORT")
                 .unwrap_or_else(|_| "2222".into())
                 .parse()
                 .unwrap(),
-            user: std::env::var("KUN_TEST_USER")
+            user: std::env::var("MINO_TEST_USER")
                 .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "root".into())),
             auth: Auth::Key {
                 path: key_path.into(),
@@ -2968,7 +3186,7 @@ mod connect_tests {
                 return;
             }
         }
-        // 隔离路径：绝不覆盖用户真实的 ~/.config/kun/hosts.toml
+        // 隔离路径：绝不覆盖用户真实的 ~/.config/mino/hosts.toml
         //（曾直接覆盖并删除用户主机列表，运行一次测试丢一次配置）。
         let config_path = test_config_path("connect-e2e");
         let config = HostConfig {
@@ -2978,7 +3196,7 @@ mod connect_tests {
 
         let mut harness = egui_kittest::Harness::builder()
             .with_step_dt(1.0 / 60.0)
-            .build_eframe(|cc| KunApp::new_with_config(cc, config_path.clone()));
+            .build_eframe(|cc| MinoApp::new_with_config(cc, config_path.clone()));
         harness.run_steps(6);
         // 主机行从设置弹窗里取：⌘, 打开设置弹窗。
         harness.event(egui::Event::Key {
@@ -3052,7 +3270,7 @@ mod connect_tests {
 
         let config_path = test_config_path("new-conn-dialog");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
-            KunApp::new_with_config(cc, config_path.clone())
+            MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
 
@@ -3119,7 +3337,7 @@ mod snapshot_tests {
     static KNOWN_HOSTS_INIT: std::sync::Once = std::sync::Once::new();
     fn init_test_env() {
         KNOWN_HOSTS_INIT.call_once(|| {
-            std::env::set_var("KUN_KNOWN_HOSTS", "/tmp/kun-test-sshd/known_hosts.toml");
+            std::env::set_var("MINO_KNOWN_HOSTS", "/tmp/mino-test-sshd/known_hosts.toml");
         });
     }
 
@@ -3137,7 +3355,7 @@ mod snapshot_tests {
     #[test]
     fn 生成连接后样式截图() {
         use kittest::Queryable;
-        use kun_core::config::Auth;
+        use mino_core::config::Auth;
         use std::time::{Duration, Instant};
 
         init_test_env();
@@ -3146,7 +3364,7 @@ mod snapshot_tests {
             return;
         }
 
-        let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
+        let key_path = std::env::var("MINO_TEST_KEY").unwrap_or_else(|_| {
             format!(
                 "{}/.ssh/id_ed25519",
                 std::env::var("HOME").unwrap_or_default()
@@ -3154,12 +3372,12 @@ mod snapshot_tests {
         });
         let profile = HostProfile {
             name: "链路测试".into(),
-            host: std::env::var("KUN_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-            port: std::env::var("KUN_TEST_PORT")
+            host: std::env::var("MINO_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("MINO_TEST_PORT")
                 .unwrap_or_else(|_| "2222".into())
                 .parse()
                 .unwrap(),
-            user: std::env::var("KUN_TEST_USER")
+            user: std::env::var("MINO_TEST_USER")
                 .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "root".into())),
             auth: Auth::Key {
                 path: key_path.into(),
@@ -3180,7 +3398,7 @@ mod snapshot_tests {
 
         let mut harness = egui_kittest::Harness::builder()
             .with_step_dt(1.0 / 60.0)
-            .build_eframe(|cc| KunApp::new_with_config(cc, config_path.clone()));
+            .build_eframe(|cc| MinoApp::new_with_config(cc, config_path.clone()));
         harness.run_steps(6);
         // 主机行从设置弹窗里取：⌘, 打开设置弹窗。
         harness.event(egui::Event::Key {
@@ -3227,7 +3445,7 @@ mod snapshot_tests {
             config.save(&config_path).ok();
             harness = egui_kittest::Harness::builder()
                 .with_step_dt(1.0 / 60.0)
-                .build_eframe(|cc| KunApp::new_with_config(cc, config_path.clone()));
+                .build_eframe(|cc| MinoApp::new_with_config(cc, config_path.clone()));
             harness.run_steps(6);
             // 主机行从设置弹窗里取：⌘, 打开设置弹窗。
             harness.event(egui::Event::Key {
@@ -3287,7 +3505,7 @@ mod snapshot_tests {
         }
 
         let img = harness.render().expect("渲染失败");
-        let out = "/tmp/kun_style_sftp.png";
+        let out = "/tmp/mino_style_sftp.png";
         img.save(out).expect("保存截图失败");
         eprintln!("样式截图已保存：{out}");
     }
@@ -3302,7 +3520,7 @@ mod theme_tests {
     fn 三套主题渲染截图() {
         use kittest::Queryable;
 
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
         // 主题下拉现在在设置弹窗里，先用 ⌘, 打开弹窗。
         harness.event(egui::Event::Key {
@@ -3335,7 +3553,7 @@ mod theme_tests {
                 "主题切换失败"
             );
             let img = harness.render().expect("渲染失败");
-            let out = format!("/tmp/kun_theme_{theme_name}.png");
+            let out = format!("/tmp/mino_theme_{theme_name}.png");
             img.save(&out).expect("保存截图失败");
             eprintln!("已保存：{out}");
         }
@@ -3351,7 +3569,7 @@ mod tab_tests {
     fn 新建本地终端标签页() {
         use kittest::Queryable;
 
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
         assert_eq!(
             harness.query_all_by_label("×").count(),
@@ -3375,7 +3593,7 @@ mod tab_tests {
     fn 快捷键新建与关闭标签页() {
         use kittest::Queryable;
 
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
 
         // 启动时：[本地终端]（设置改弹窗，不再是 tab）→ 1 个 ×。
@@ -3540,7 +3758,7 @@ mod settings_tests {
     /// 设置弹窗默认关闭，tabs 不含设置 tab（设置改弹窗后无 Tab::Settings 概念）。
     #[test]
     fn 设置弹窗默认关闭() {
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
         let app = harness.state();
         assert!(!app.show_settings, "启动时设置弹窗应默认关闭");
@@ -3564,7 +3782,7 @@ mod settings_tests {
     #[test]
     fn 快捷键打开设置() {
         use kittest::Queryable;
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
         assert!(!harness.state().show_settings, "默认关闭");
 
@@ -3602,7 +3820,7 @@ mod settings_tests {
     #[test]
     fn 齿轮存在并能打开设置() {
         use kittest::Queryable;
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| KunApp::new(cc));
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
         // 齿轮是标签栏最右侧的 Button（视口宽 800，齿轮 right > 700）。
         let gear = harness
@@ -3644,7 +3862,7 @@ mod settings_tests {
         config.save(&config_path).expect("写入测试配置失败");
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
-            KunApp::new_with_config(cc, config_path.clone())
+            MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
 
@@ -3681,7 +3899,7 @@ mod settings_tests {
 
         let config_path = test_config_path("ssh-quick-empty");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
-            KunApp::new_with_config(cc, config_path.clone())
+            MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
 
@@ -3721,7 +3939,7 @@ mod settings_tests {
         config.save(&config_path).expect("写入测试配置失败");
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
-            KunApp::new_with_config(cc, config_path.clone())
+            MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
         harness.get_by_label(">_").click();

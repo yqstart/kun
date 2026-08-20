@@ -75,23 +75,32 @@ pub struct Listener {
 
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
-        let mut pending = self.shared.pending.lock().unwrap();
-        match event {
-            Event::Wakeup => pending.push(SessionEvent::Wakeup),
-            Event::Title(title) => {
-                *self.shared.title.lock().unwrap() = title.clone();
-                pending.push(SessionEvent::Title(title));
+        // 只在锁内更新共享状态；UI 回调可能触发事件循环唤醒，不能在
+        // 持有 pending 锁时调用，否则 UI 线程 drain_events 与后台线程
+        // 的回调路径会形成不必要的锁竞争，严重时表现为窗口卡死。
+        let notify = {
+            let mut pending = self.shared.pending.lock().unwrap();
+            match event {
+                Event::Wakeup => pending.push(SessionEvent::Wakeup),
+                Event::Title(title) => {
+                    *self.shared.title.lock().unwrap() = title.clone();
+                    pending.push(SessionEvent::Title(title));
+                }
+                Event::ChildExit(_) => {
+                    *self.shared.exited.lock().unwrap() = true;
+                    pending.push(SessionEvent::ChildExit);
+                }
+                Event::PtyWrite(text) => pending.push(SessionEvent::PtyWrite(text)),
+                Event::Bell => pending.push(SessionEvent::Bell),
+                // 不要用 pending.last() 通知：未处理的 alacritty 事件会
+                // 误重复通知上一次事件，造成无意义的重绘。
+                _ => return,
             }
-            Event::ChildExit(_) => {
-                *self.shared.exited.lock().unwrap() = true;
-                pending.push(SessionEvent::ChildExit);
-            }
-            Event::PtyWrite(text) => pending.push(SessionEvent::PtyWrite(text)),
-            Event::Bell => pending.push(SessionEvent::Bell),
-            _ => {}
-        }
-        if let Some(event) = pending.last() {
-            (self.on_event)(event);
+            pending.last().cloned()
+        };
+
+        if let Some(event) = notify {
+            (self.on_event)(&event);
         }
     }
 }
@@ -372,5 +381,31 @@ impl Drop for Session {
             });
         }
         self.shuttor.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// 回调不能在 pending 锁仍被持有时执行，否则回调路径触及会话事件
+    /// 队列会自我阻塞，最终让 UI 看起来像卡死。
+    #[test]
+    fn 事件回调在释放队列锁后执行() {
+        let shared = Arc::new(Shared::default());
+        let callback_shared = shared.clone();
+        let listener = Listener {
+            shared: shared.clone(),
+            on_event: Arc::new(move |_event| {
+                assert!(
+                    callback_shared.pending.try_lock().is_ok(),
+                    "事件回调执行时不应继续持有 pending 锁"
+                );
+            }),
+        };
+
+        listener.send_event(Event::Wakeup);
+        assert_eq!(shared.pending.lock().unwrap().len(), 1);
     }
 }

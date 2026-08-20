@@ -2855,45 +2855,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kun-app"
-version = "0.7.1"
-dependencies = [
- "accesskit",
- "alacritty_terminal",
- "eframe",
- "egui",
- "egui_kittest",
- "env_logger",
- "image",
- "kittest",
- "kun-core",
- "log",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "raw-window-handle",
- "rfd",
- "tokio",
-]
-
-[[package]]
-name = "kun-core"
-version = "0.7.1"
-dependencies = [
- "alacritty_terminal",
- "env_logger",
- "libc",
- "log",
- "rand 0.10.2",
- "russh",
- "russh-sftp",
- "serde",
- "thiserror 2.0.20",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "ureq",
-]
-
-[[package]]
 name = "kurbo"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3063,6 +3024,45 @@ checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "mino-app"
+version = "0.1.0"
+dependencies = [
+ "accesskit",
+ "alacritty_terminal",
+ "eframe",
+ "egui",
+ "egui_kittest",
+ "env_logger",
+ "image",
+ "kittest",
+ "log",
+ "mino-core",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "raw-window-handle",
+ "rfd",
+ "tokio",
+]
+
+[[package]]
+name = "mino-core"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "env_logger",
+ "libc",
+ "log",
+ "rand 0.10.2",
+ "russh",
+ "russh-sftp",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "ureq",
 ]
 
 [[package]]
