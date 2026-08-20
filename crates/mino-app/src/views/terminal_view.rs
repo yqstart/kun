@@ -763,7 +763,7 @@ impl TerminalView {
                     egui::Event::Paste(text) => {
                         // 括号粘贴模式（bracketed paste）下包装转义序列。
                         let payload = if mode.contains(TermMode::BRACKETED_PASTE) {
-                            format!("\x1b[200~{text}\x1b[201~")
+                            bracketed_paste_payload(text)
                         } else {
                             text.clone()
                         };
@@ -1641,6 +1641,16 @@ fn map_char_key(key: &egui::Key) -> Option<Key> {
     }))
 }
 
+/// 构造括号粘贴载荷。
+///
+/// 粘贴内容属于不可信输入；若保留其中的 ESC，文本内的
+/// `ESC[201~` 可以提前关闭括号粘贴，让后续换行或控制序列脱离编辑缓冲区。
+/// 删除 ESC 后，原始序列会变成普通文本，协议边界只由这里追加的结束标记提供。
+fn bracketed_paste_payload(text: &str) -> String {
+    let sanitized: String = text.chars().filter(|&c| c != '\x1b').collect();
+    format!("\x1b[200~{sanitized}\x1b[201~")
+}
+
 /// egui 键 → 终端特殊键。
 fn map_special_key(key: &egui::Key) -> Option<Key> {
     use egui::Key as E;
@@ -2275,6 +2285,26 @@ mod osc_tests {
             false,
         );
         assert_eq!(resolved_fg, Color32::from_rgb(0x00, 0xff, 0x00));
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+
+    /// 括号粘贴内容中的伪造结束序列不能提前关闭协议边界。
+    #[test]
+    fn 括号粘贴移除内嵌转义字符() {
+        let payload = bracketed_paste_payload("echo safe\x1b[201~\n下一行");
+        assert_eq!(
+            payload, "\x1b[200~echo safe[201~\n下一行\x1b[201~",
+            "内嵌 ESC 应被移除，换行仍保留"
+        );
+        assert_eq!(
+            payload.matches("\x1b[201~").count(),
+            1,
+            "载荷中只能保留由终端生成的结束标记"
+        );
     }
 }
 
