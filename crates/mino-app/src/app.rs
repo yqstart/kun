@@ -101,6 +101,8 @@ struct Toast {
 
 /// 单个终端标签页（本地或远程会话）。
 pub struct TerminalTab {
+    /// 标签稳定身份，不随 Vec 中的插入、删除或移动变化。
+    id: u64,
     label: String,
     terminal: TerminalView,
     sftp: Option<SftpView>,
@@ -109,8 +111,9 @@ pub struct TerminalTab {
 }
 
 impl TerminalTab {
-    fn new(label: String, terminal: TerminalView) -> Self {
+    fn new(id: u64, label: String, terminal: TerminalView) -> Self {
         Self {
+            id,
             label,
             terminal,
             sftp: None,
@@ -129,6 +132,15 @@ impl TerminalTab {
     }
 }
 
+/// 一次 SSH/SFTP 连接的身份与状态。
+struct SftpConnection {
+    connection_id: u64,
+    handle: SftpHandle,
+    rx: UnboundedReceiver<SftpEvent>,
+    host: String,
+    home: Option<String>,
+}
+
 /// 标签页：普通终端（含本地/远程）。设置改为独立弹窗（`show_settings`），
 /// 不再作为 tab。
 ///
@@ -141,8 +153,12 @@ pub type Tab = Box<TerminalTab>;
 pub struct MinoApp {
     tabs: Vec<Tab>,
     active_tab: usize,
-    /// 连接成功后创建的标签页索引（用于挂载 SFTP）。
-    pending_tab: Option<usize>,
+    /// 连接成功后创建的标签稳定身份（用于挂载 SFTP）。
+    pending_tab: Option<u64>,
+    /// 当前等待 SSH 结果的连接身份。
+    pending_connection_id: Option<u64>,
+    /// 标签与连接身份分配器。
+    next_id: u64,
     /// 主机行最近一次点击（时间, 行索引），自实现双击检测。
     last_row_click: Option<(f64, usize)>,
     /// 设置中的当前主机焦点（单击后保持，双击连接）。
@@ -160,19 +176,9 @@ pub struct MinoApp {
     toast: Option<Toast>,
     /// 进行中的 SFTP 连接（句柄 + 事件流 + 主机名——主机名随连接绑定，
     /// 多连接并发时不会串到别的标签页上）。
-    pending_sftp: Option<(
-        SftpHandle,
-        UnboundedReceiver<SftpEvent>,
-        String,
-        Option<String>,
-    )>,
+    pending_sftp: Option<SftpConnection>,
     /// SFTP 已就绪但 SSH 标签尚未创建，等待挂载。
-    ready_sftp: Option<(
-        SftpHandle,
-        UnboundedReceiver<SftpEvent>,
-        String,
-        Option<String>,
-    )>,
+    ready_sftp: Option<SftpConnection>,
     /// SFTP 连接错误（状态栏持久显示，toast 易被忽略）。
     sftp_error: Option<String>,
     update_state: UpdateState,
@@ -462,6 +468,8 @@ impl MinoApp {
             tabs: Vec::new(),
             active_tab: 0,
             pending_tab: None,
+            pending_connection_id: None,
+            next_id: 1,
             last_row_click: None,
             selected_host: None,
             show_settings: false,
@@ -511,7 +519,9 @@ impl MinoApp {
         });
         match Session::spawn_local(local_session_options(), 80, 24, on_event) {
             Ok(session) => {
+                let id = self.allocate_id();
                 let tab = Box::new(TerminalTab::new(
+                    id,
                     "本地终端".into(),
                     TerminalView::new(session),
                 ));
@@ -530,6 +540,18 @@ impl MinoApp {
         if index >= self.tabs.len() {
             return;
         }
+        let tab_id = self.tabs[index].id;
+        if self.pending_tab == Some(tab_id) {
+            self.pending_tab = None;
+            self.close_ready_sftp(tab_id);
+        }
+        if self
+            .pending_sftp
+            .as_ref()
+            .is_some_and(|connection| connection.connection_id == tab_id)
+        {
+            self.close_pending_sftp(tab_id);
+        }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active_tab = 0;
@@ -537,6 +559,39 @@ impl MinoApp {
             self.active_tab = self.tabs.len() - 1;
         } else if self.active_tab > index {
             self.active_tab -= 1;
+        }
+    }
+
+    /// 分配不会随标签列表变化的身份。
+    fn allocate_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        id
+    }
+
+    /// 关闭指定连接的待处理 SFTP 会话。
+    fn close_pending_sftp(&mut self, connection_id: u64) {
+        if self
+            .pending_sftp
+            .as_ref()
+            .is_some_and(|connection| connection.connection_id == connection_id)
+        {
+            if let Some(connection) = self.pending_sftp.take() {
+                connection.handle.close();
+            }
+        }
+    }
+
+    /// 关闭指定连接的已就绪但尚未挂载的 SFTP 会话。
+    fn close_ready_sftp(&mut self, connection_id: u64) {
+        if self
+            .ready_sftp
+            .as_ref()
+            .is_some_and(|connection| connection.connection_id == connection_id)
+        {
+            if let Some(connection) = self.ready_sftp.take() {
+                connection.handle.close();
+            }
         }
     }
 
@@ -698,16 +753,28 @@ impl MinoApp {
             self.pending = None;
             match result {
                 ConnectResult::Connected(session) => {
+                    let connection_id = self
+                        .pending_connection_id
+                        .take()
+                        .unwrap_or_else(|| self.allocate_id());
                     let view = TerminalView::new(session);
-                    self.tabs
-                        .push(Box::new(TerminalTab::new(self.pending_label.clone(), view)));
+                    self.tabs.push(Box::new(TerminalTab::new(
+                        connection_id,
+                        self.pending_label.clone(),
+                        view,
+                    )));
                     self.active_tab = self.tabs.len() - 1;
-                    self.pending_tab = Some(self.active_tab);
+                    self.pending_tab = Some(connection_id);
                     self.mount_ready_sftp();
                     self.show_toast(format!("已连接到 {}", self.pending_label), false);
                     ctx.request_repaint();
                 }
                 ConnectResult::Failed(e) => {
+                    self.pending_connection_id = None;
+                    if let Some(connection) = self.pending_sftp.take() {
+                        connection.handle.close();
+                    }
+                    self.ready_sftp = None;
                     log::error!("连接失败：{e}");
                     self.show_toast(format!("连接失败：{e}"), true);
                     ctx.request_repaint();
@@ -718,6 +785,16 @@ impl MinoApp {
 
     /// 发起远程连接（同时启动 SFTP 连接）。
     fn start_connect(&mut self, ctx: &egui::Context, profile: HostProfile) {
+        if let Some(connection) = self.pending_sftp.take() {
+            connection.handle.close();
+        }
+        if let Some(connection) = self.ready_sftp.take() {
+            connection.handle.close();
+        }
+        self.pending = None;
+        self.pending_tab = None;
+        let connection_id = self.allocate_id();
+        self.pending_connection_id = Some(connection_id);
         let label = profile.name.clone();
         let ctx = ctx.clone();
         let on_event = Arc::new(move |_ev: &SessionEvent| {
@@ -729,22 +806,42 @@ impl MinoApp {
 
         let (_sftp_thread, sftp_handle, sftp_rx) = connect_sftp(&profile);
         // 主机名随本连接绑定，避免与并发连接串台。
-        self.pending_sftp = Some((sftp_handle, sftp_rx, label, None));
+        self.pending_sftp = Some(SftpConnection {
+            connection_id,
+            handle: sftp_handle,
+            rx: sftp_rx,
+            host: label,
+            home: None,
+        });
         self.sftp_error = None;
-        self.ready_sftp = None;
-        self.pending_tab = None;
     }
 
     /// 将已就绪的 SFTP 会话挂载到 SSH 标签页。
     fn mount_ready_sftp(&mut self) {
-        let Some(idx) = self.pending_tab else { return };
-        let Some((handle, rx, host, home)) = self.ready_sftp.take() else {
+        let Some(connection_id) = self.pending_tab else {
             return;
         };
-        if let Some(tab) = self.tabs.get_mut(idx) {
-            let home = home.unwrap_or_else(|| "/".to_string());
+        let Some(connection) = self.ready_sftp.take() else {
+            return;
+        };
+        if connection.connection_id != connection_id {
+            connection.handle.close();
+            return;
+        }
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == connection_id) else {
+            connection.handle.close();
+            self.pending_tab = None;
+            return;
+        };
+        {
+            let home = connection.home.unwrap_or_else(|| "/".to_string());
             tab.terminal.set_remote_current_directory(&home);
-            tab.sftp = Some(SftpView::new_at_path(&host, handle, rx, &home));
+            tab.sftp = Some(SftpView::new_at_path(
+                &connection.host,
+                connection.handle,
+                connection.rx,
+                &home,
+            ));
         }
     }
 
@@ -753,12 +850,12 @@ impl MinoApp {
         let mut ready = false;
         let mut failed: Option<String> = None;
         let mut closed = false;
-        if let Some((_handle, rx, _host, home)) = &mut self.pending_sftp {
-            while let Ok(ev) = rx.try_recv() {
+        if let Some(connection) = &mut self.pending_sftp {
+            while let Ok(ev) = connection.rx.try_recv() {
                 match ev {
                     SftpEvent::Ready { home: path } => {
                         ready = true;
-                        *home = Some(path);
+                        connection.home = Some(path);
                     }
                     SftpEvent::Failed(e) => failed = Some(e),
                     // 连接中途关闭（如被服务器断开）：不能继续等待，
@@ -2858,7 +2955,8 @@ mod app_tests {
                 Arc::new(|_ev: &SessionEvent| {}),
             )
             .expect("创建本地终端失败");
-            let mut tab = TerminalTab::new("测试主机".into(), TerminalView::new(session));
+            let id = app.allocate_id();
+            let mut tab = TerminalTab::new(id, "测试主机".into(), TerminalView::new(session));
             let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
             tab.sftp = Some(SftpView::new(
@@ -2887,6 +2985,39 @@ mod app_tests {
         assert!(
             harness.root().query_all_by_label("..").next().is_none(),
             "再次点击应收起面板"
+        );
+    }
+
+    /// 回归：前面的标签被删除后，延迟到达的 SFTP 结果仍按稳定身份挂载，
+    /// 不能按旧 Vec 下标落到另一标签。
+    #[test]
+    fn sftp按稳定标签身份挂载() {
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            let mut app = MinoApp::new(cc);
+            app.new_local_tab(&cc.egui_ctx);
+            let target_id = app.tabs[1].id;
+            app.tabs.remove(0);
+            app.active_tab = 0;
+
+            let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (command_tx, _command_rx) = tokio::sync::mpsc::unbounded_channel();
+            app.pending_tab = Some(target_id);
+            app.ready_sftp = Some(SftpConnection {
+                connection_id: target_id,
+                handle: SftpHandle::from_raw(command_tx),
+                rx: event_rx,
+                host: "稳定身份主机".into(),
+                home: Some("/home/test".into()),
+            });
+            app.mount_ready_sftp();
+            app
+        });
+        harness.run_steps(6);
+        let tab = &harness.state().tabs[0];
+        assert_eq!(tab.label, "本地终端");
+        assert_eq!(
+            tab.sftp.as_ref().map(SftpView::host_name),
+            Some("稳定身份主机")
         );
     }
 
