@@ -46,12 +46,17 @@ pub fn default_known_hosts_path() -> PathBuf {
 /// 各自读文件会互相覆盖——丢失更新）。
 static KNOWN_HOSTS_LOCK: Mutex<()> = Mutex::new(());
 
-/// 加载 known_hosts；文件不存在或损坏时视为空（首次连接场景）。
-pub(crate) fn load_known_hosts(path: &Path) -> KnownHosts {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|c| toml::from_str(&c).ok())
-        .unwrap_or_default()
+/// 加载 known_hosts；只有文件不存在时才视为空（首次连接场景）。
+pub(crate) fn load_known_hosts(path: &Path) -> std::io::Result<KnownHosts> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(KnownHosts::default())
+        }
+        Err(error) => return Err(error),
+    };
+    toml::from_str(&content)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// 保存 known_hosts（文件权限 0600：指纹防本地其他用户读取篡改）。
@@ -116,7 +121,8 @@ impl HostKeyVerifier {
     fn verify(&self, key: &PublicKey) -> Result<bool, String> {
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
         let _guard = KNOWN_HOSTS_LOCK.lock().unwrap();
-        let mut known = load_known_hosts(&self.save_path);
+        let mut known = load_known_hosts(&self.save_path)
+            .map_err(|e| format!("读取 known_hosts 失败（{}）：{e}", self.save_path.display()))?;
         match known
             .hosts
             .iter()
@@ -135,9 +141,12 @@ impl HostKeyVerifier {
                     port: self.port,
                     fingerprint,
                 });
-                if let Err(e) = save_known_hosts(&self.save_path, &known) {
-                    log::warn!("保存 known_hosts 失败：{e}");
-                }
+                save_known_hosts(&self.save_path, &known).map_err(|e| {
+                    format!(
+                        "保存 known_hosts 失败（{}），已拒绝首次连接：{e}",
+                        self.save_path.display()
+                    )
+                })?;
                 Ok(true)
             }
         }
@@ -215,7 +224,7 @@ mod tests {
         .expect("校验失败");
         assert!(ok, "首次连接应接受");
         assert!(err1.lock().unwrap().is_none());
-        let known = load_known_hosts(&path);
+        let known = load_known_hosts(&path).expect("读取失败");
         assert_eq!(known.hosts.len(), 1, "首次连接应记录指纹");
         assert!(is_duplicate_free(&known));
 
@@ -229,7 +238,11 @@ mod tests {
         .expect("校验失败");
         assert!(ok, "指纹一致应接受");
         assert!(err2.lock().unwrap().is_none());
-        assert_eq!(load_known_hosts(&path).hosts.len(), 1, "不应重复记录");
+        assert_eq!(
+            load_known_hosts(&path).expect("读取失败").hosts.len(),
+            1,
+            "不应重复记录"
+        );
 
         // 第三次不同密钥：拒绝并给出原因。
         let other = russh::keys::PrivateKey::random(
@@ -276,17 +289,66 @@ mod tests {
             ],
         };
         save_known_hosts(&path, &known).expect("保存失败");
-        let loaded = load_known_hosts(&path);
+        let loaded = load_known_hosts(&path).expect("读取失败");
         assert_eq!(loaded, known);
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 文件损坏时视为空（不影响连接，重新走首次信任）。
+    /// 文件损坏时必须返回错误，不能重新走首次信任。
     #[test]
-    fn 损坏文件视为空() {
+    fn 损坏文件拒绝信任() {
         let path = tmp_path("corrupt");
         std::fs::write(&path, "not valid toml {{{").ok();
-        assert!(load_known_hosts(&path).hosts.is_empty());
+        let (verifier, error) = HostKeyVerifier::new("test.example.com".into(), 22, path.clone());
+        let mut verifier = verifier;
+        let keypair = russh::keys::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::ssh_key::Algorithm::Ed25519,
+        )
+        .expect("生成密钥失败");
+        let accepted = block_on(async move {
+            <HostKeyVerifier as client::Handler>::check_server_key(
+                &mut verifier,
+                keypair.public_key(),
+            )
+            .await
+        })
+        .expect("校验失败");
+        assert!(!accepted, "损坏文件不应接受新指纹");
+        assert!(error
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap_or("")
+            .contains("读取 known_hosts 失败"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 读取路径不是普通文件时必须拒绝首次信任。
+    #[test]
+    fn known_hosts读取失败拒绝信任() {
+        let path = std::env::temp_dir().join(format!(
+            "mino-known-hosts-test-{}-directory",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("创建测试目录失败");
+        let (verifier, error) = HostKeyVerifier::new("test.example.com".into(), 22, path.clone());
+        let mut verifier = verifier;
+        let keypair = russh::keys::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::ssh_key::Algorithm::Ed25519,
+        )
+        .expect("生成密钥失败");
+        let accepted = block_on(async move {
+            <HostKeyVerifier as client::Handler>::check_server_key(
+                &mut verifier,
+                keypair.public_key(),
+            )
+            .await
+        })
+        .expect("校验失败");
+        assert!(!accepted, "读取失败不应接受新指纹");
+        assert!(error.lock().unwrap().is_some());
+        let _ = std::fs::remove_dir(&path);
     }
 }
