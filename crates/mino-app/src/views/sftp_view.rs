@@ -1,7 +1,7 @@
 //! SFTP 面板：远程文件浏览、传输进度与文件操作。
 
 use egui::{RichText, Ui};
-use kun_core::ssh::sftp::{RemoteEntry, SftpEvent, SftpHandle};
+use mino_core::ssh::sftp::{RemoteEntry, SftpEvent, SftpHandle};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// 传输任务（进度条显示）。
@@ -1243,23 +1243,23 @@ pub fn join_path(parent: &str, name: &str) -> String {
 mod tests {
     use super::*;
 
-    /// 测试 sshd 配置（与 kun-core 集成测试一致）。
-    fn test_profile() -> kun_core::config::HostProfile {
-        use kun_core::config::Auth;
-        let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
+    /// 测试 sshd 配置（与 mino-core 集成测试一致）。
+    fn test_profile() -> mino_core::config::HostProfile {
+        use mino_core::config::Auth;
+        let key_path = std::env::var("MINO_TEST_KEY").unwrap_or_else(|_| {
             format!(
                 "{}/.ssh/id_ed25519",
                 std::env::var("HOME").unwrap_or_default()
             )
         });
-        kun_core::config::HostProfile {
+        mino_core::config::HostProfile {
             name: "UI 测试".into(),
-            host: std::env::var("KUN_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-            port: std::env::var("KUN_TEST_PORT")
+            host: std::env::var("MINO_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("MINO_TEST_PORT")
                 .unwrap_or_else(|_| "2222".into())
                 .parse()
                 .unwrap(),
-            user: std::env::var("KUN_TEST_USER")
+            user: std::env::var("MINO_TEST_USER")
                 .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "root".into())),
             auth: Auth::Key {
                 path: key_path.into(),
@@ -1271,15 +1271,15 @@ mod tests {
     /// SFTP 面板真实连接并渲染文件列表。
     #[test]
     fn sftp_面板真实连接渲染() {
-        use kun_core::ssh::sftp::connect_sftp;
+        use mino_core::ssh::sftp::connect_sftp;
         use std::time::{Duration, Instant};
 
-        // 测试 sshd 的 known_hosts 与 hostkey 同目录（/tmp/kun-test-sshd），
+        // 测试 sshd 的 known_hosts 与 hostkey 同目录（/tmp/mino-test-sshd），
         // hostkey 重建时指纹记录一并消失，不会旧指纹不匹配导致测试失败。
         // call_once：测试并行运行时不重复设置环境变量。
         static KNOWN_HOSTS_INIT: std::sync::Once = std::sync::Once::new();
         KNOWN_HOSTS_INIT.call_once(|| {
-            std::env::set_var("KUN_KNOWN_HOSTS", "/tmp/kun-test-sshd/known_hosts.toml");
+            std::env::set_var("MINO_KNOWN_HOSTS", "/tmp/mino-test-sshd/known_hosts.toml");
         });
 
         // 测试 sshd 不可达时跳过（CI 无测试 sshd）。
@@ -1294,7 +1294,7 @@ mod tests {
         }
 
         let profile = test_profile();
-        if let kun_core::config::Auth::Key { path, .. } = &profile.auth {
+        if let mino_core::config::Auth::Key { path, .. } = &profile.auth {
             if !path.exists() {
                 eprintln!("跳过：测试私钥不存在");
                 return;
@@ -1493,7 +1493,7 @@ mod tests {
     /// ⌘⇧L 应直接发出当前终端目录的列表请求。
     #[test]
     fn 快捷键定位终端目录() {
-        use kun_core::ssh::sftp::SftpCmd;
+        use mino_core::ssh::sftp::SftpCmd;
 
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1611,7 +1611,7 @@ mod tests {
     #[test]
     fn 单击选中再次单击进入目录() {
         use kittest::Queryable;
-        use kun_core::ssh::sftp::SftpCmd;
+        use mino_core::ssh::sftp::SftpCmd;
 
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (handle_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();

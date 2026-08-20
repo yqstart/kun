@@ -18,7 +18,7 @@
 1. 打开仓库 **Security → Advisories → Report a vulnerability**
 2. 或访问：https://github.com/yqstart/kun/security/advisories/new
 
-若无法使用上述渠道，可通过仓库维护者 GitHub 主页私信，主题注明「kun Security」。
+若无法使用上述渠道，可通过仓库维护者 GitHub 主页私信，主题注明「Mino Security」。
 
 报告请尽量包含：
 
@@ -35,6 +35,6 @@
 
 ## 安全相关现状
 
-- 主机密码明文存储于 `~/.config/kun/hosts.toml`（规划接入系统钥匙串，见 [CHANGELOG](CHANGELOG.md)）
+- 主机密码明文存储于 `~/.config/mino/hosts.toml`（规划接入系统钥匙串，见 [CHANGELOG](CHANGELOG.md)）
 - 主机密钥未校验（未实现 known_hosts），存在中间人攻击面；远程会话默认接受任意服务器密钥
 - 以上为已知限制，修复前请谨慎用于不受信网络环境

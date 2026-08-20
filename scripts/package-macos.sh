@@ -1,14 +1,16 @@
 #!/bin/bash
-# ==================== macOS 打包：生成 .app bundle + dmg ====================
+# ==================== Mino macOS 打包：生成 .app bundle + dmg ====================
 # 用法：scripts/package-macos.sh [版本号] [架构: arm64|x64]
 # 依赖：已执行 cargo build --release；iconset 由 make-icon.swift 生成。
-# dmg 内含 kun.app + Applications 快捷方式（拖拽即安装，与常规 macOS 应用一致）。
+# dmg 内含 Mino.app + Applications 快捷方式（拖拽即安装，与常规 macOS 应用一致）。
 set -e
 
 VERSION="${1:-0.1.0}"
 ARCH="${2:-arm64}"
-BIN="target/release/kun-app"
-APP_NAME="kun"
+BIN="target/release/mino-app"
+APP_NAME="Mino"
+APP_SLUG="mino"
+EXECUTABLE="mino-app"
 APP_DIR="target/release/${APP_NAME}.app"
 
 if [ ! -f "$BIN" ]; then
@@ -17,17 +19,17 @@ if [ ! -f "$BIN" ]; then
 fi
 
 # ==================== 1. 生成图标（iconset → icns） ====================
-ICONSET_DIR="target/release/kun.iconset"
+ICONSET_DIR="target/release/${APP_SLUG}.iconset"
 swift scripts/make-icon.swift target/release > /dev/null
-iconutil -c icns "$ICONSET_DIR" -o target/release/kun.icns
+iconutil -c icns "$ICONSET_DIR" -o "target/release/${APP_SLUG}.icns"
 rm -rf "$ICONSET_DIR"
 echo "图标生成完成"
 
 # ==================== 2. 组装 .app bundle ====================
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
-cp "$BIN" "$APP_DIR/Contents/MacOS/${APP_NAME}-app"
-cp target/release/kun.icns "$APP_DIR/Contents/Resources/kun.icns"
+cp "$BIN" "$APP_DIR/Contents/MacOS/${EXECUTABLE}"
+cp "target/release/${APP_SLUG}.icns" "$APP_DIR/Contents/Resources/${APP_SLUG}.icns"
 
 cat > "$APP_DIR/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -35,19 +37,19 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>kun</string>
+    <string>Mino</string>
     <key>CFBundleDisplayName</key>
-    <string>kun</string>
+    <string>Mino</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.kun.terminal</string>
+    <string>dev.mino.terminal</string>
     <key>CFBundleVersion</key>
     <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>
     <string>${VERSION}</string>
     <key>CFBundleExecutable</key>
-    <string>kun-app</string>
+    <string>${EXECUTABLE}</string>
     <key>CFBundleIconFile</key>
-    <string>kun</string>
+    <string>${APP_SLUG}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -69,7 +71,7 @@ codesign --force --sign - "$APP_DIR" > /dev/null 2>&1 || true
 echo ".app bundle 完成：$APP_DIR"
 
 # ==================== 3. 组装 dmg（含 Applications 快捷方式） ====================
-DMG="target/release/kun-${VERSION}-macos-${ARCH}.dmg"
+DMG="target/release/${APP_SLUG}-${VERSION}-macos-${ARCH}.dmg"
 DMG_STAGE="target/release/dmg-stage"
 rm -rf "$DMG_STAGE"
 mkdir -p "$DMG_STAGE"
@@ -88,7 +90,7 @@ if [ "${CI:-false}" != "true" ]; then
     if hdiutil attach "$DMG" -nobrowse -readwrite -mountpoint "$MOUNT_POINT" -quiet > /dev/null 2>&1; then
         osascript << 'EOF' > /dev/null 2>&1 || true
 tell application "Finder"
-    tell disk "kun"
+    tell disk "Mino"
         open
         set current view of container window to icon view
         set toolbar visible of container window to false
@@ -97,7 +99,7 @@ tell application "Finder"
         set viewOptions to the icon view options of container window
         set arrangement of viewOptions to not arranged
         set icon size of viewOptions to 96
-        set position of item "kun.app" of container window to {130, 170}
+        set position of item "Mino.app" of container window to {130, 170}
         set position of item "Applications" of container window to {410, 170}
         close
         open

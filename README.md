@@ -1,21 +1,21 @@
-# kun
+# Mino
 
-基于 Rust + egui 的轻量级终端与 SFTP 可视化工具。
+Mino 是基于 Rust + egui 的轻量级终端与 SFTP 可视化工具。
 
 **许可证：[MIT](LICENSE)** · 纯开源免费
 
 ## 产品定位
 
-主打**轻量、快速、美观**的终端体验：本地 / 远程（SSH）终端 + 可视化 SFTP 文件管理，交互参照 Termius / WindTerm 的双栏分屏，视觉参照 Warp 的分层深色界面与紫青渐变动效。核心功能集已收敛，后续迭代围绕性能、流畅度与视觉细节持续打磨。
+主打**轻量、快速、简洁**的终端体验：本地 / 远程（SSH）终端 + 可视化 SFTP 文件管理，交互参照 Termius / WindTerm 的双栏分屏，视觉采用低干扰的深色界面与紫青渐变标记。核心功能集已收敛，后续迭代围绕性能、流畅度与视觉细节持续打磨。
 
 ## 功能概览
 
 - **本地终端**：基于 [alacritty_terminal](https://github.com/alacritty/alacritty) 生产级内核（VT 仿真 + PTY），256 色、宽字符、滚动、括号粘贴、闪烁光标
 - **SSH 远程终端**：密码 / 私钥认证（支持口令），xterm-256color PTY
 - **SFTP 可视化**：终端 | SFTP 双栏分屏（可拖拽），目录导航、右键菜单操作、上传 / 下载带进度条、删除 / 重命名 / 新建目录（带确认对话框）
-- **主机管理**：主机配置持久化（`~/.config/kun/hosts.toml`），单击选中、双击连接
+- **主机管理**：主机配置持久化（`~/.config/mino/hosts.toml`），单击选中、双击连接
 - **三套主题**：`深色`（默认）/ `深蓝` / `霓虹`，每套含独立终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）
-- **动效**：渐变 logo、标签选中指示条动画、Toast 滑入淡出、更新状态呼吸灯
+- **品牌**：Mino `>_` 标记、低对比层级、紧凑标签与无持续重绘的轻量动效
 - **快捷键**：⌘N 新建连接、⌘T 新建本地终端、⌘W 关闭标签、⌘1-⌘9 切换标签、⌘, 打开设置、⌥1-⌥3 切换主题
 - **全 Rust 无 C 依赖**：单二进制、启动 < 300ms
 
@@ -40,7 +40,7 @@
 
 ```bash
 cargo build --release
-./target/release/kun-app
+./target/release/mino-app
 ```
 
 开发模式：
@@ -66,12 +66,12 @@ cargo test --workspace
 
 ### macOS 安装
 
-Release 提供的 dmg 内含 `kun.app` 与 **Applications 快捷方式**，与常规 macOS 应用一致：打开 dmg 后把 kun 拖入「应用程序」即可。
+Release 提供的 dmg 内含 `Mino.app` 与 **Applications 快捷方式**，与常规 macOS 应用一致：打开 dmg 后把 Mino 拖入「应用程序」即可。
 
-从 Release 安装后若提示「kun 已损坏，无法打开」，在终端执行：
+从 Release 安装后若提示「Mino 已损坏，无法打开」，在终端执行：
 
 ```bash
-xattr -cr "/Applications/kun.app"
+xattr -cr "/Applications/Mino.app"
 ```
 
 然后右键 → **打开** 即可。原因：产物未经 Apple 公证（开源项目未配置开发者签名）。

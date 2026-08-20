@@ -25,9 +25,9 @@ fn partial_suffix() -> String {
 
 fn partial_remote_path(remote: &str) -> String {
     if remote.is_empty() {
-        format!(".kun-partial-{}", partial_suffix())
+        format!(".mino-partial-{}", partial_suffix())
     } else {
-        format!("{remote}.kun-partial-{}", partial_suffix())
+        format!("{remote}.mino-partial-{}", partial_suffix())
     }
 }
 
@@ -39,7 +39,7 @@ fn partial_local_path(local: &Path) -> PathBuf {
     local
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!(".{name}.kun-partial-{}", partial_suffix()))
+        .join(format!(".{name}.mino-partial-{}", partial_suffix()))
 }
 
 /// 远程文件条目。
@@ -492,9 +492,9 @@ mod tests {
         assert!(partial
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".result.txt.kun-partial-")));
+            .is_some_and(|name| name.starts_with(".result.txt.mino-partial-")));
 
         let remote = partial_remote_path("/srv/result.txt");
-        assert!(remote.starts_with("/srv/result.txt.kun-partial-"));
+        assert!(remote.starts_with("/srv/result.txt.mino-partial-"));
     }
 }

@@ -32,6 +32,15 @@ pub enum CandidateKind {
 /// PATH 可执行文件索引（进程级懒加载缓存，避免每个终端重复扫描）。
 static COMMANDS: OnceLock<Vec<String>> = OnceLock::new();
 
+/// shell 内建命令：Warp 的命令提示不应只认识 PATH 中的可执行文件。
+/// 这些命令在 zsh/bash 中最常用，加入索引后 `cd`、`export`、`history`
+/// 等输入也能得到有效提示。
+const SHELL_BUILTINS: &[&str] = &[
+    "alias", "bg", "cd", "command", "dirs", "echo", "eval", "exec", "export", "fc", "fg",
+    "history", "jobs", "printf", "pwd", "read", "set", "source", "test", "type", "unalias",
+    "unset", "wait", "which",
+];
+
 /// 扫描 PATH 下的可执行文件（纯函数，可测试）。
 fn commands_from_path(path: &str) -> Vec<String> {
     let mut list: Vec<String> = Vec::new();
@@ -57,9 +66,15 @@ fn commands_from_path(path: &str) -> Vec<String> {
 /// 全局命令索引（懒加载）。
 pub fn command_index() -> &'static [String] {
     COMMANDS.get_or_init(|| {
-        std::env::var("PATH")
+        let mut commands = std::env::var("PATH")
             .map(|p| commands_from_path(&p))
             .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        commands.extend(SHELL_BUILTINS.iter().map(|name| (*name).to_string()));
+        commands.sort();
+        commands.dedup();
+        commands
     })
 }
 
@@ -338,8 +353,8 @@ mod tests {
     #[test]
     fn cd解析更新工作目录() {
         let tmp = std::env::temp_dir();
-        // 临时目录结构：<tmp>/kun-cd-test-<pid>/sub
-        let base = tmp.join(format!("kun-cd-test-{}", std::process::id()));
+        // 临时目录结构：<tmp>/mino-cd-test-<pid>/sub
+        let base = tmp.join(format!("mino-cd-test-{}", std::process::id()));
         let sub = base.join("sub");
         std::fs::create_dir_all(&sub).ok();
         let mut m = InputModel::new(tmp.clone());
@@ -390,9 +405,9 @@ mod tests {
         m.execute_remote(Some(&home));
         assert_eq!(m.cwd, PathBuf::from("/srv/logs"));
 
-        m.push_text("cd ~/workspace/./kun");
+        m.push_text("cd ~/workspace/./mino");
         m.execute_remote(Some(&home));
-        assert_eq!(m.cwd, PathBuf::from("/home/demo/workspace/kun"));
+        assert_eq!(m.cwd, PathBuf::from("/home/demo/workspace/mino"));
 
         m.push_text("cd ../../../../");
         m.execute_remote(Some(&home));
@@ -423,7 +438,7 @@ mod tests {
     #[test]
     fn 路径候选含目录后缀() {
         let tmp = std::env::temp_dir();
-        let base = tmp.join(format!("kun-cp-test-{}", std::process::id()));
+        let base = tmp.join(format!("mino-cp-test-{}", std::process::id()));
         std::fs::create_dir_all(base.join("adir")).ok();
         std::fs::write(base.join("afile.txt"), "x").ok();
         let mut m = InputModel::new(base.clone());
@@ -447,19 +462,19 @@ mod tests {
     #[test]
     fn 命令索引可执行过滤() {
         let tmp = std::env::temp_dir();
-        let base = tmp.join(format!("kun-cmd-test-{}", std::process::id()));
+        let base = tmp.join(format!("mino-cmd-test-{}", std::process::id()));
         std::fs::create_dir_all(&base).ok();
         // 可执行文件 + 不可执行文件 + 目录。
-        let exe = base.join("kun-exe");
+        let exe = base.join("mino-exe");
         std::fs::write(&exe, "#!/bin/sh\n").ok();
         let _ = std::process::Command::new("chmod")
             .arg("+x")
             .arg(&exe)
             .status();
-        std::fs::write(base.join("kun-plain"), "x").ok();
-        std::fs::create_dir(base.join("kun-dir")).ok();
+        std::fs::write(base.join("mino-plain"), "x").ok();
+        std::fs::create_dir(base.join("mino-dir")).ok();
         let list = commands_from_path(base.to_str().unwrap());
-        assert_eq!(list, vec!["kun-exe"]);
+        assert_eq!(list, vec!["mino-exe"]);
         std::fs::remove_dir_all(&base).ok();
     }
 }

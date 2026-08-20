@@ -7,7 +7,7 @@
 /// 更新信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateInfo {
-    /// 最新版本号（如 "0.2.0"）。
+    /// 最新版本号（如 "0.1.0"）。
     pub version: String,
     /// 发布页面（GitHub Release）。
     pub url: String,
@@ -15,7 +15,7 @@ pub struct UpdateInfo {
     pub notes: String,
     /// 当前平台的 dmg 直链下载地址。
     pub asset_url: String,
-    /// 资产文件名（如 `kun-0.2.0-macos-arm64.dmg`）。
+    /// 资产文件名（如 `mino-0.1.0-macos-arm64.dmg`）。
     pub asset_name: String,
 }
 
@@ -37,7 +37,7 @@ pub fn check_for_update(
     let agent = make_agent();
     let mut response = agent
         .get(&url)
-        .header("User-Agent", format!("kun/{current_version}"))
+        .header("User-Agent", format!("mino/{current_version}"))
         .header("Accept", "application/atom+xml")
         .call()
         .map_err(|e| format!("请求失败：{e}"))?;
@@ -88,7 +88,7 @@ fn make_agent() -> ureq::Agent {
 
 /// 当前平台资产的 dmg 文件名。
 fn asset_name_for(version: &str, arch: &str) -> String {
-    format!("kun-{version}-macos-{arch}.dmg")
+    format!("mino-{version}-macos-{arch}.dmg")
 }
 
 /// 当前平台资产的下载直链。
@@ -116,7 +116,7 @@ pub fn download_asset(
         let agent = make_agent();
         let mut response = agent
             .get(url)
-            .header("User-Agent", "kun-updater")
+            .header("User-Agent", "mino-updater")
             .call()
             .map_err(|e| format!("下载请求失败：{e}"))?;
         let status = response.status();
@@ -343,10 +343,10 @@ mod tests {
     fn 解析atom首个entry() {
         let feed = "<?xml version=\"1.0\"?>\n\
             <feed xmlns=\"http://www.w3.org/2005/Atom\">\n\
-              <title>Release notes from kun</title>\n\
+              <title>Release notes from mino</title>\n\
               <entry>\n\
                 <link rel=\"alternate\" type=\"text/html\" href=\"https://github.com/yqstart/kun/releases/tag/v0.2.0\"/>\n\
-                <title>kun v0.2.0</title>\n\
+                <title>mino v0.2.0</title>\n\
                 <content type=\"html\">&lt;h2&gt;[0.2.0]&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;新增功能&lt;/li&gt;&lt;/ul&gt;</content>\n\
               </entry>\n\
             </feed>";
@@ -389,11 +389,11 @@ mod tests {
     fn 资产地址按架构构造() {
         assert_eq!(
             asset_name_for("0.2.0", "arm64"),
-            "kun-0.2.0-macos-arm64.dmg"
+            "mino-0.2.0-macos-arm64.dmg"
         );
         assert_eq!(
             asset_url_for("yqstart/kun", "v0.2.0", "0.2.0", "x64"),
-            "https://github.com/yqstart/kun/releases/download/v0.2.0/kun-0.2.0-macos-x64.dmg"
+            "https://github.com/yqstart/kun/releases/download/v0.2.0/mino-0.2.0-macos-x64.dmg"
         );
     }
 

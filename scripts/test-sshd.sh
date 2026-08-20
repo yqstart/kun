@@ -1,19 +1,19 @@
 #!/bin/bash
-# ==================== kun 测试 sshd 管理脚本 ====================
+# ==================== mino 测试 sshd 管理脚本 ====================
 # 用法：
 #   scripts/test-sshd.sh start   启动测试 sshd（127.0.0.1:2222，公钥认证 + sftp）
 #   scripts/test-sshd.sh stop    停止测试 sshd
 #   scripts/test-sshd.sh status  查看状态
 #
-# 说明：用于集成测试（crates/kun-core/tests/），不修改系统配置，
-# 全部文件在 /tmp/kun-test-sshd/ 下，用 ~/.ssh/id_ed25519 公钥认证。
+# 说明：用于集成测试（crates/mino-core/tests/），不修改系统配置，
+# 全部文件在 /tmp/mino-test-sshd/ 下，用 ~/.ssh/id_ed25519 公钥认证。
 
 set -e
 
-SSHD_CONFIG=/tmp/kun-test-sshd/sshd_config
-SSHD_PID=/tmp/kun-test-sshd/sshd.pid
-SSHD_LOG=/tmp/kun-test-sshd/sshd.log
-PORT=${KUN_TEST_PORT:-2222}
+SSHD_CONFIG=/tmp/mino-test-sshd/sshd_config
+SSHD_PID=/tmp/mino-test-sshd/sshd.pid
+SSHD_LOG=/tmp/mino-test-sshd/sshd.log
+PORT=${MINO_TEST_PORT:-2222}
 
 start() {
     if [ -f "$SSHD_PID" ] && kill -0 "$(cat "$SSHD_PID")" 2>/dev/null; then
@@ -21,11 +21,11 @@ start() {
         return 0
     fi
 
-    mkdir -p /tmp/kun-test-sshd
+    mkdir -p /tmp/mino-test-sshd
 
     # 1. 生成测试主机密钥（已存在则跳过）
-    if [ ! -f /tmp/kun-test-sshd/hostkey ]; then
-        ssh-keygen -t ed25519 -f /tmp/kun-test-sshd/hostkey -N "" -q
+    if [ ! -f /tmp/mino-test-sshd/hostkey ]; then
+        ssh-keygen -t ed25519 -f /tmp/mino-test-sshd/hostkey -N "" -q
         echo "已生成测试主机密钥"
     fi
 
@@ -38,15 +38,15 @@ start() {
         echo "错误：未找到 ~/.ssh/id_ed25519.pub 或 ~/.ssh/id_rsa.pub，请先 ssh-keygen 生成密钥" >&2
         exit 1
     fi
-    cp "$PUB_KEY" /tmp/kun-test-sshd/authorized_keys
+    cp "$PUB_KEY" /tmp/mino-test-sshd/authorized_keys
     echo "已授权公钥：$PUB_KEY"
 
     # 3. 写 sshd 配置（公钥认证 + sftp subsystem + 非特权端口）
     cat > "$SSHD_CONFIG" << EOF
 Port $PORT
 ListenAddress 127.0.0.1
-HostKey /tmp/kun-test-sshd/hostkey
-AuthorizedKeysFile /tmp/kun-test-sshd/authorized_keys
+HostKey /tmp/mino-test-sshd/hostkey
+AuthorizedKeysFile /tmp/mino-test-sshd/authorized_keys
 PasswordAuthentication no
 PubkeyAuthentication yes
 PermitRootLogin no

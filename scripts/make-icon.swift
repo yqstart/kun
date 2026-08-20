@@ -1,10 +1,10 @@
 #!/usr/bin/env swift
-// ==================== 生成 kun 应用图标（纯 K 字） ====================
-// 紫金渐变圆角底 + 白色粗体 "K"（居中）；
+// ==================== 生成 Mino 应用图标（极简 >_） ====================
+// 紫青渐变圆角底 + 白色终端提示符 `>_`；
 // 四周留 10% 透明边距——macOS Dock 对占满画布的无边距图标会自动放大显示
 // （视觉"大一圈"），透明边距让 Dock 按标准尺寸渲染。
 //
-// 与应用内动态 logo（app.rs::draw_logo_mark）同构图：圆底 + K。
+// 与应用内动态 logo（app.rs::draw_logo_mark）同构图：圆底 + `>_`。
 // 用法：swift scripts/make-icon.swift <输出目录>
 
 import AppKit
@@ -13,8 +13,8 @@ import Foundation
 
 let outDir = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
-    : "/tmp/kun-iconset"
-let iconsetDir = "\(outDir)/kun.iconset"
+    : "/tmp/mino-iconset"
+let iconsetDir = "\(outDir)/mino.iconset"
 try? FileManager.default.createDirectory(atPath: iconsetDir, withIntermediateDirectories: true)
 
 // 尺寸列表：iconset 要求的 (pointSize, scale)。
@@ -61,20 +61,23 @@ for (point, scale) in sizes {
     let gradient = NSGradient(colors: [topColor, bottomColor])!
     gradient.draw(in: path, angle: -90)
 
-    // K 字：白色粗体，居中。
-    let fontSize = rect.width * 0.46
-    let font = NSFont.boldSystemFont(ofSize: fontSize)
-    let attrs: [NSAttributedString.Key: Any] = [
-        .font: font,
-        .foregroundColor: NSColor.white,
-    ]
-    let kText = NSAttributedString(string: "K", attributes: attrs)
-    let kSize = kText.size()
-    let kPoint = NSPoint(
-        x: rect.midX - kSize.width / 2,
-        y: rect.midY - kSize.height / 2
-    )
-    kText.draw(at: kPoint)
+    // `>_`：用圆头线条绘制，避免依赖字体，缩放后仍保持清晰。
+    let cg = NSGraphicsContext.current!.cgContext
+    let strokeWidth = max(CGFloat(px) * 0.075, 2.0)
+    let chevronLeft = rect.minX + rect.width * 0.29
+    let chevronTip = rect.minX + rect.width * 0.44
+    let chevronHalfHeight = rect.height * 0.18
+    let centerY = rect.midY
+    cg.setStrokeColor(NSColor.white.withAlphaComponent(0.96).cgColor)
+    cg.setLineWidth(strokeWidth)
+    cg.setLineCap(.round)
+    cg.setLineJoin(.round)
+    cg.move(to: CGPoint(x: chevronLeft, y: centerY - chevronHalfHeight))
+    cg.addLine(to: CGPoint(x: chevronTip, y: centerY))
+    cg.addLine(to: CGPoint(x: chevronLeft, y: centerY + chevronHalfHeight))
+    cg.move(to: CGPoint(x: rect.minX + rect.width * 0.54, y: centerY + rect.height * 0.18))
+    cg.addLine(to: CGPoint(x: rect.minX + rect.width * 0.73, y: centerY + rect.height * 0.18))
+    cg.strokePath()
 
     NSGraphicsContext.restoreGraphicsState()
 

@@ -2,19 +2,19 @@
 //!
 //! 运行前需启动测试服务器：
 //! ```bash
-//! /usr/sbin/sshd -f /tmp/kun-test-sshd/sshd_config
+//! /usr/sbin/sshd -f /tmp/mino-test-sshd/sshd_config
 //! ```
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kun_core::config::{Auth, HostProfile};
-use kun_core::ssh::{connect_remote, ConnectResult};
-use kun_core::terminal::{Session, SessionEvent};
+use mino_core::config::{Auth, HostProfile};
+use mino_core::ssh::{connect_remote, ConnectResult};
+use mino_core::terminal::{Session, SessionEvent};
 
 /// 测试主机（环境变量可覆盖，默认本地测试 sshd）。
 fn test_profile() -> HostProfile {
-    let key_path = std::env::var("KUN_TEST_KEY").unwrap_or_else(|_| {
+    let key_path = std::env::var("MINO_TEST_KEY").unwrap_or_else(|_| {
         format!(
             "{}/.ssh/id_ed25519",
             std::env::var("HOME").unwrap_or_default()
@@ -22,12 +22,12 @@ fn test_profile() -> HostProfile {
     });
     HostProfile {
         name: "集成测试".into(),
-        host: std::env::var("KUN_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-        port: std::env::var("KUN_TEST_PORT")
+        host: std::env::var("MINO_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+        port: std::env::var("MINO_TEST_PORT")
             .unwrap_or_else(|_| "2222".into())
             .parse()
             .unwrap(),
-        user: std::env::var("KUN_TEST_USER").unwrap_or_else(|_| whoami()),
+        user: std::env::var("MINO_TEST_USER").unwrap_or_else(|_| whoami()),
         auth: Auth::Key {
             path: key_path.into(),
             passphrase: None,
@@ -82,13 +82,13 @@ fn wait_for_text(session: &Session, needle: &str, timeout: Duration) -> bool {
     false
 }
 
-/// 将测试 sshd 的 known_hosts 记录与 hostkey 放在同一目录（/tmp/kun-test-sshd）：
+/// 将测试 sshd 的 known_hosts 记录与 hostkey 放在同一目录（/tmp/mino-test-sshd）：
 /// hostkey 随 /tmp 清理重建时指纹记录一并消失，避免旧指纹不匹配导致测试失败。
 /// `call_once` 保证进程内只设置一次（测试并行安全）。
 static KNOWN_HOSTS_INIT: std::sync::Once = std::sync::Once::new();
 fn init_test_env() {
     KNOWN_HOSTS_INIT.call_once(|| {
-        std::env::set_var("KUN_KNOWN_HOSTS", "/tmp/kun-test-sshd/known_hosts.toml");
+        std::env::set_var("MINO_KNOWN_HOSTS", "/tmp/mino-test-sshd/known_hosts.toml");
     });
 }
 
@@ -121,9 +121,9 @@ fn 远程终端_连接_执行命令_收到输出() {
     };
 
     // 发送命令并等待输出回显。
-    session.write(b"echo KUN_SSH_OK\n");
+    session.write(b"echo MINO_SSH_OK\n");
     assert!(
-        wait_for_text(&session, "KUN_SSH_OK", Duration::from_secs(10)),
+        wait_for_text(&session, "MINO_SSH_OK", Duration::from_secs(10)),
         "未收到命令回显，终端内容：\n{}",
         grid_text(&session)
     );

@@ -1,9 +1,9 @@
 [package]
-name = "kun-core"
+name = "mino-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "kun 终端与 SFTP 引擎"
+description = "Mino 终端与 SFTP 引擎"
 
 [dependencies]
 alacritty_terminal = { workspace = true }

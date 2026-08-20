@@ -80,12 +80,12 @@ impl HostConfig {
     }
 }
 
-/// 默认配置文件路径：`~/.config/kun/hosts.toml`。
+/// 默认配置文件路径：`~/.config/mino/hosts.toml`。
 pub fn default_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home)
         .join(".config")
-        .join("kun")
+        .join("mino")
         .join("hosts.toml")
 }
 

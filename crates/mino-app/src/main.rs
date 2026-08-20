@@ -1,4 +1,4 @@
-//! kun 应用入口。
+//! Mino 应用入口。
 
 pub mod anim;
 mod app;
@@ -8,7 +8,7 @@ pub mod perf;
 pub mod theme;
 pub mod views;
 
-use app::KunApp;
+use app::{MinoApp, PRODUCT_NAME};
 use eframe::egui;
 
 /// 加载等宽主字体与中文 fallback（macOS 系统字体）。
@@ -57,14 +57,14 @@ fn setup_fonts(ctx: &egui::Context) {
     for path in mono_candidates {
         if let Ok(bytes) = std::fs::read(path) {
             fonts.font_data.insert(
-                "kun_mono".to_owned(),
+                "mino_mono".to_owned(),
                 std::sync::Arc::new(FontData::from_owned(bytes)),
             );
             fonts
                 .families
                 .get_mut(&FontFamily::Monospace)
                 .unwrap()
-                .insert(0, "kun_mono".to_owned());
+                .insert(0, "mino_mono".to_owned());
             loaded_mono = true;
             log::info!("加载等宽字体：{path}");
             break;
@@ -90,14 +90,14 @@ fn setup_fonts(ctx: &egui::Context) {
     for path in symbol_candidates {
         if let Ok(bytes) = std::fs::read(path) {
             fonts.font_data.insert(
-                "kun_mono_sym".to_owned(),
+                "mino_mono_sym".to_owned(),
                 std::sync::Arc::new(FontData::from_owned(bytes)),
             );
             fonts
                 .families
                 .get_mut(&FontFamily::Monospace)
                 .unwrap()
-                .push("kun_mono_sym".to_owned());
+                .push("mino_mono_sym".to_owned());
             log::info!("加载等宽符号 fallback 字体：{path}");
             break;
         }
@@ -107,7 +107,7 @@ fn setup_fonts(ctx: &egui::Context) {
     for path in cjk_candidates {
         if let Ok(bytes) = std::fs::read(path) {
             fonts.font_data.insert(
-                "kun_cjk".to_owned(),
+                "mino_cjk".to_owned(),
                 std::sync::Arc::new(FontData::from_owned(bytes)),
             );
             for family in [FontFamily::Proportional, FontFamily::Monospace] {
@@ -115,7 +115,7 @@ fn setup_fonts(ctx: &egui::Context) {
                     .families
                     .get_mut(&family)
                     .unwrap()
-                    .push("kun_cjk".to_owned());
+                    .push("mino_cjk".to_owned());
             }
             log::info!("加载中文 fallback 字体：{path}");
             break;
@@ -152,7 +152,7 @@ fn main() -> eframe::Result {
 
     // ==================== 崩溃日志捕获 ====================
     // panic 信息写入文件，便于排查闪退问题（闪退时 stderr 不可见）。
-    let panic_log = std::env::temp_dir().join("kun-panic.log");
+    let panic_log = std::env::temp_dir().join("mino-panic.log");
     std::panic::set_hook(Box::new(move |info| {
         let location = info
             .location()
@@ -160,20 +160,23 @@ fn main() -> eframe::Result {
             .unwrap_or_else(|| "未知位置".into());
         let backtrace = std::backtrace::Backtrace::force_capture();
         let msg = format!(
-            "=== kun 崩溃时间：{} ===\n位置：{location}\n信息：{info}\n堆栈：\n{backtrace}\n",
+            "=== {PRODUCT_NAME} 崩溃时间：{} ===\n位置：{location}\n信息：{info}\n堆栈：\n{backtrace}\n",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs().to_string())
                 .unwrap_or_else(|_| "未知".into())
         );
         let _ = std::fs::write(&panic_log, &msg);
-        eprintln!("kun 发生崩溃，详情已写入 {}", panic_log.display());
+        eprintln!(
+            "{PRODUCT_NAME} 发生崩溃，详情已写入 {}",
+            panic_log.display()
+        );
     }));
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([960.0, 640.0])
         .with_min_inner_size([400.0, 300.0])
-        .with_title("kun")
+        .with_title(PRODUCT_NAME)
         // 保留 macOS 的 Titled 窗口样式，避免无边框窗口退出时触发 AppKit 的
         // NSTouchBarFinderObservation 崩溃；标题栏本身仍做成透明并与内容重叠，
         // 外观继续由应用自绘。
@@ -188,17 +191,27 @@ fn main() -> eframe::Result {
     }
     let native_options = eframe::NativeOptions {
         viewport,
+        // macOS 15/26 在退出阶段保存 NSWindow 的位置和尺寸时，可能触发
+        // AppKit 的 NSTouchBarFinderObservation 重复移除观察者，最终以
+        // SIGABRT 退出。mino 没有依赖 eframe 的窗口位置持久化，关闭它可
+        // 避开这条系统崩溃路径；应用自己的终端/主机配置仍正常保存。
+        persist_window: false,
+        // mino 是单窗口常驻应用，不需要在窗口关闭后把控制权交还给调用方。
+        // eframe 0.36 的默认值会走 macOS run_app_on_demand；该路径在
+        // 长时间按需重绘、后台 PTY 事件与无标题栏窗口组合下可能出现事件
+        // 不再驱动 UI 的假死。使用常规 run_app 保持 AppKit 事件循环持续运行。
+        run_and_return: false,
         ..Default::default()
     };
 
     eframe::run_native(
-        "kun",
+        PRODUCT_NAME,
         native_options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
             // 应用窗口圆角与透明背景（非 macOS/测试环境静默跳过）。
             native::apply_rounded_window(cc);
-            Ok(Box::new(KunApp::new(cc)))
+            Ok(Box::new(MinoApp::new(cc)))
         }),
     )
 }
@@ -227,22 +240,22 @@ mod font_tests {
             .get(&FontFamily::Monospace)
             .expect("Monospace 族缺失");
         assert!(
-            mono.iter().any(|f| f == "kun_mono"),
-            "Monospace 族应包含主等宽字体 kun_mono，实际：{mono:?}"
+            mono.iter().any(|f| f == "mino_mono"),
+            "Monospace 族应包含主等宽字体 mino_mono，实际：{mono:?}"
         );
         // Menlo 符号 fallback 仅 macOS 加载（SF Mono 缺 ➜/❯ 等字形）；
         // Linux/Windows 使用自带等宽字体，不适用该断言。
         #[cfg(target_os = "macos")]
         {
             assert!(
-                mono.iter().any(|f| f == "kun_mono_sym"),
-                "Monospace 族应包含 kun_mono_sym，实际：{mono:?}"
+                mono.iter().any(|f| f == "mino_mono_sym"),
+                "Monospace 族应包含 mino_mono_sym，实际：{mono:?}"
             );
             // 符号 fallback 必须排在中文 fallback 之前（缺字形时优先命中等宽符号）。
-            let pos_sym = mono.iter().position(|f| f == "kun_mono_sym");
-            let pos_cjk = mono.iter().position(|f| f == "kun_cjk");
+            let pos_sym = mono.iter().position(|f| f == "mino_mono_sym");
+            let pos_cjk = mono.iter().position(|f| f == "mino_cjk");
             if let (Some(s), Some(c)) = (pos_sym, pos_cjk) {
-                assert!(s < c, "kun_mono_sym 应排在 kun_cjk 之前，实际：{mono:?}");
+                assert!(s < c, "mino_mono_sym 应排在 mino_cjk 之前，实际：{mono:?}");
             }
         }
     }
