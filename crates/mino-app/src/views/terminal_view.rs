@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use alacritty_terminal::grid::Scroll;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Flags, LineLength};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::TermDamage;
 use alacritty_terminal::vte::ansi::{Color as AColor, CursorShape, NamedColor, Rgb};
@@ -1310,7 +1310,7 @@ fn selection_point_from_screen(
     }
 }
 
-/// 从网格中提取选区文本，去掉每行末尾用于填充终端宽度的空格。
+/// 从网格中提取选区文本，遵循 alacritty 的软换行、宽字符和组合字符语义。
 fn selection_to_text(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     selection: TerminalSelection,
@@ -1323,7 +1323,7 @@ fn selection_to_text(
     };
     let mut output = String::new();
     for grid_line in start.grid_line..=end.grid_line {
-        let Some((from, to)) = selection.columns_for_line(grid_line, cols) else {
+        let Some((mut from, to)) = selection.columns_for_line(grid_line, cols) else {
             continue;
         };
         let row = &grid[if grid_line >= 0 {
@@ -1331,18 +1331,40 @@ fn selection_to_text(
         } else {
             alacritty_terminal::index::Line::from(0) - grid_line.unsigned_abs() as usize
         }];
+        if from < to
+            && row[alacritty_terminal::index::Column(from)]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+            && from > 0
+        {
+            // 选中宽字符的第二个 cell 时，把主字符一并纳入复制。
+            from -= 1;
+        }
+        let line_length = row.line_length().0.min(to);
         let mut line = String::new();
-        for (col, cell) in row.into_iter().enumerate().take(to).skip(from) {
-            if col >= cols
-                || cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                || cell.flags.contains(Flags::HIDDEN)
+        for col in from..line_length {
+            let cell = &row[alacritty_terminal::index::Column(col)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
             {
                 continue;
             }
-            line.push(cell.c);
+            if cell.flags.contains(Flags::HIDDEN) {
+                line.push(' ');
+            } else {
+                line.push(cell.c);
+                if let Some(zero_width) = cell.zerowidth() {
+                    line.extend(zero_width.iter().copied());
+                }
+            }
         }
-        output.push_str(line.trim_end());
-        if grid_line != end.grid_line {
+        output.push_str(&line);
+        if grid_line != end.grid_line
+            && !row[alacritty_terminal::index::Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        {
             output.push('\n');
         }
     }
@@ -1376,30 +1398,6 @@ fn build_line_data(
     }];
 
     for (col, cell) in row.into_iter().enumerate().take(cols) {
-        // 占位格只参与背景合并，不进入文本。
-        let is_spacer =
-            cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN);
-        if is_spacer {
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && !cell.flags.contains(Flags::HIDDEN) {
-                // 宽字符占位格继承前一格的背景，合并背景段。
-                let bg = resolve_color(cell.bg, colors, default_bg, false);
-                push_background(&mut backgrounds, col, bg, default_bg_egui);
-                mix_cell_hash(
-                    &mut hash,
-                    cell.c,
-                    CellStyle {
-                        fg: resolve_color(cell.fg, colors, default_fg, false),
-                        bg,
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                        strikeout: false,
-                    },
-                );
-            }
-            continue;
-        }
-
         // 解析颜色（含粗体 → 亮色映射）。
         let mut fg = resolve_color(
             cell.fg,
@@ -1425,10 +1423,42 @@ fn build_line_data(
         // 背景段合并（默认背景不绘制）。
         push_background(&mut backgrounds, col, bg, default_bg_egui);
 
+        let leading_spacer = cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER);
+        let wide_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+        if wide_spacer && !leading_spacer {
+            // 普通宽字符占位格由前一个宽字符的 glyph 提供视觉宽度，
+            // 不再追加文本，但必须进入哈希以跟踪其背景/属性变化。
+            mix_cell_hash(
+                &mut hash,
+                cell.c,
+                CellStyle {
+                    fg,
+                    bg,
+                    bold,
+                    italic,
+                    underline,
+                    strikeout,
+                },
+                cell.zerowidth(),
+            );
+            continue;
+        }
+
         // 文本段合并。
+        let text = if cell.flags.contains(Flags::HIDDEN) || leading_spacer {
+            ' '
+        } else {
+            cell.c
+        };
+        let zero_width = if cell.flags.contains(Flags::HIDDEN) || leading_spacer {
+            None
+        } else {
+            cell.zerowidth()
+        };
         push_or_merge(
             &mut segments,
-            cell.c,
+            text,
+            zero_width,
             CellStyle {
                 fg,
                 bg,
@@ -1549,7 +1579,13 @@ impl CellStyle {
 }
 
 /// 合并或追加一个 cell 到段列表（相同样式则追加字符）。
-fn push_or_merge(segments: &mut Vec<Segment>, c: char, style: CellStyle, hash: &mut u64) {
+fn push_or_merge(
+    segments: &mut Vec<Segment>,
+    c: char,
+    zero_width: Option<&[char]>,
+    style: CellStyle,
+    hash: &mut u64,
+) {
     if let Some(last) = segments.last_mut() {
         if last.fg == style.fg
             && last.bold == style.bold
@@ -1558,7 +1594,10 @@ fn push_or_merge(segments: &mut Vec<Segment>, c: char, style: CellStyle, hash: &
             && last.strikeout == style.strikeout
         {
             last.text.push(c);
-            mix_cell_hash(hash, c, style);
+            if let Some(zero_width) = zero_width {
+                last.text.extend(zero_width.iter().copied());
+            }
+            mix_cell_hash(hash, c, style, zero_width);
             return;
         }
     }
@@ -1570,13 +1609,23 @@ fn push_or_merge(segments: &mut Vec<Segment>, c: char, style: CellStyle, hash: &
         underline: style.underline,
         strikeout: style.strikeout,
     });
-    mix_cell_hash(hash, c, style);
+    if let Some(zero_width) = zero_width {
+        if let Some(last) = segments.last_mut() {
+            last.text.extend(zero_width.iter().copied());
+        }
+    }
+    mix_cell_hash(hash, c, style, zero_width);
 }
 
 /// 将影响行绘制的 cell 属性加入缓存指纹。
-fn mix_cell_hash(hash: &mut u64, c: char, style: CellStyle) {
+fn mix_cell_hash(hash: &mut u64, c: char, style: CellStyle, zero_width: Option<&[char]>) {
     *hash = hash.wrapping_mul(131).wrapping_add(style.key());
     *hash = hash.wrapping_mul(131).wrapping_add(c as u64);
+    if let Some(zero_width) = zero_width {
+        for c in zero_width {
+            *hash = hash.wrapping_mul(131).wrapping_add(*c as u64);
+        }
+    }
 }
 
 /// 样式 → 哈希键。
@@ -2363,6 +2412,103 @@ mod background_tests {
         let first = style_key(fg, Color32::BLACK, false, false, false, false);
         let second = style_key(fg, Color32::from_rgb(1, 2, 3), false, false, false, false);
         assert_ne!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod cell_semantics_tests {
+    use super::*;
+    use alacritty_terminal::grid::Grid;
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::term::cell::Cell;
+
+    fn selection(start: (i32, usize), end: (i32, usize)) -> TerminalSelection {
+        TerminalSelection {
+            anchor: SelectionPoint {
+                grid_line: start.0,
+                col: start.1,
+            },
+            focus: SelectionPoint {
+                grid_line: end.0,
+                col: end.1,
+            },
+        }
+    }
+
+    #[test]
+    fn 组合字符随主字符渲染和复制() {
+        let mut grid = Grid::<Cell>::new(2, 6, 0);
+        grid[Line(0)][Column(0)].c = 'e';
+        grid[Line(0)][Column(0)].push_zerowidth('\u{301}');
+        grid[Line(0)][Column(1)].c = 'x';
+
+        let text = selection_to_text(&grid, selection((0, 0), (0, 1)), 6);
+        assert_eq!(text, "e\u{301}x");
+    }
+
+    #[test]
+    fn 隐藏字符保留等宽空白() {
+        let mut grid = Grid::<Cell>::new(2, 6, 0);
+        grid[Line(0)][Column(0)].c = 'a';
+        grid[Line(0)][Column(1)].c = 'x';
+        grid[Line(0)][Column(1)].flags.insert(Flags::HIDDEN);
+        grid[Line(0)][Column(2)].c = 'b';
+
+        let text = selection_to_text(&grid, selection((0, 0), (0, 2)), 6);
+        assert_eq!(text, "a b");
+    }
+
+    #[test]
+    fn 软换行不插入额外换行符() {
+        let mut grid = Grid::<Cell>::new(2, 4, 0);
+        for (column, c) in "abcd".chars().enumerate() {
+            grid[Line(0)][Column(column)].c = c;
+        }
+        grid[Line(0)][Column(3)].flags.insert(Flags::WRAPLINE);
+        grid[Line(1)][Column(0)].c = 'e';
+
+        let text = selection_to_text(&grid, selection((0, 0), (1, 0)), 4);
+        assert_eq!(text, "abcde");
+    }
+
+    #[test]
+    fn 局部选择保留有意义的尾随空格() {
+        let mut grid = Grid::<Cell>::new(2, 6, 0);
+        grid[Line(0)][Column(0)].c = 'a';
+        grid[Line(0)][Column(1)].c = ' ';
+        grid[Line(0)][Column(2)].c = 'b';
+
+        let text = selection_to_text(&grid, selection((0, 0), (0, 1)), 6);
+        assert_eq!(text, "a ");
+    }
+
+    #[test]
+    fn 渲染器保留隐藏与跨行宽字符列位() {
+        let theme = crate::theme::current_theme();
+        let mut grid = Grid::<Cell>::new(1, 4, 0);
+        grid[Line(0)][Column(0)].c = 'a';
+        grid[Line(0)][Column(1)].c = 'x';
+        grid[Line(0)][Column(1)].flags.insert(Flags::HIDDEN);
+        grid[Line(0)][Column(2)].c = 'b';
+        grid[Line(0)][Column(3)]
+            .flags
+            .insert(Flags::LEADING_WIDE_CHAR_SPACER);
+
+        let data = build_line_data(
+            &grid,
+            0,
+            4,
+            &Colors::default(),
+            theme.term_fg,
+            theme.term_bg,
+            to_egui(theme.term_bg),
+        );
+        let text: String = data
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect();
+        assert_eq!(text, "a b ");
     }
 }
 
