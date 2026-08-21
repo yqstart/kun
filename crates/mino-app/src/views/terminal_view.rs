@@ -1373,25 +1373,19 @@ fn build_line_data(
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && !cell.flags.contains(Flags::HIDDEN) {
                 // 宽字符占位格继承前一格的背景，合并背景段。
                 let bg = resolve_color(cell.bg, colors, default_bg, false);
-                if bg != default_bg_egui {
-                    if let Some(last) = backgrounds.last_mut() {
-                        if last.color == bg {
-                            last.end = col + 1;
-                        } else {
-                            backgrounds.push(BgRect {
-                                start: col,
-                                end: col + 1,
-                                color: bg,
-                            });
-                        }
-                    } else {
-                        backgrounds.push(BgRect {
-                            start: col,
-                            end: col + 1,
-                            color: bg,
-                        });
-                    }
-                }
+                push_background(&mut backgrounds, col, bg, default_bg_egui);
+                mix_cell_hash(
+                    &mut hash,
+                    cell.c,
+                    CellStyle {
+                        fg: resolve_color(cell.fg, colors, default_fg, false),
+                        bg,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                        strikeout: false,
+                    },
+                );
             }
             continue;
         }
@@ -1419,25 +1413,7 @@ fn build_line_data(
         }
 
         // 背景段合并（默认背景不绘制）。
-        if bg != default_bg_egui {
-            if let Some(last) = backgrounds.last_mut() {
-                if last.color == bg {
-                    last.end = col + 1;
-                } else {
-                    backgrounds.push(BgRect {
-                        start: col,
-                        end: col + 1,
-                        color: bg,
-                    });
-                }
-            } else {
-                backgrounds.push(BgRect {
-                    start: col,
-                    end: col + 1,
-                    color: bg,
-                });
-            }
-        }
+        push_background(&mut backgrounds, col, bg, default_bg_egui);
 
         // 文本段合并。
         push_or_merge(
@@ -1445,6 +1421,7 @@ fn build_line_data(
             cell.c,
             CellStyle {
                 fg,
+                bg,
                 bold,
                 italic,
                 underline,
@@ -1459,6 +1436,24 @@ fn build_line_data(
         segments,
         backgrounds,
     }
+}
+
+/// 追加一个背景 cell；只有颜色相同且列号紧邻时才允许合并。
+fn push_background(backgrounds: &mut Vec<BgRect>, col: usize, color: Color32, default_bg: Color32) {
+    if color == default_bg {
+        return;
+    }
+    if let Some(last) = backgrounds.last_mut() {
+        if last.color == color && last.end == col {
+            last.end = col + 1;
+            return;
+        }
+    }
+    backgrounds.push(BgRect {
+        start: col,
+        end: col + 1,
+        color,
+    });
 }
 
 /// 解析终端颜色为 egui 颜色（Catppuccin 调色板 + xterm 256 色表）。
@@ -1521,6 +1516,7 @@ fn to_egui(rgb: Rgb) -> Color32 {
 #[derive(Clone, Copy)]
 struct CellStyle {
     fg: Color32,
+    bg: Color32,
     bold: bool,
     italic: bool,
     underline: bool,
@@ -1532,6 +1528,9 @@ impl CellStyle {
         u64::from(self.fg.r())
             ^ (u64::from(self.fg.g()) << 8)
             ^ (u64::from(self.fg.b()) << 16)
+            ^ (u64::from(self.bg.r()) << 32)
+            ^ (u64::from(self.bg.g()) << 40)
+            ^ (u64::from(self.bg.b()) << 48)
             ^ (u64::from(self.bold) << 24)
             ^ (u64::from(self.italic) << 25)
             ^ (u64::from(self.underline) << 26)
@@ -1549,8 +1548,7 @@ fn push_or_merge(segments: &mut Vec<Segment>, c: char, style: CellStyle, hash: &
             && last.strikeout == style.strikeout
         {
             last.text.push(c);
-            *hash = hash.wrapping_mul(131).wrapping_add(style.key());
-            *hash = hash.wrapping_mul(131).wrapping_add(c as u64);
+            mix_cell_hash(hash, c, style);
             return;
         }
     }
@@ -1562,15 +1560,28 @@ fn push_or_merge(segments: &mut Vec<Segment>, c: char, style: CellStyle, hash: &
         underline: style.underline,
         strikeout: style.strikeout,
     });
+    mix_cell_hash(hash, c, style);
+}
+
+/// 将影响行绘制的 cell 属性加入缓存指纹。
+fn mix_cell_hash(hash: &mut u64, c: char, style: CellStyle) {
     *hash = hash.wrapping_mul(131).wrapping_add(style.key());
     *hash = hash.wrapping_mul(131).wrapping_add(c as u64);
 }
 
 /// 样式 → 哈希键。
 #[allow(dead_code)]
-fn style_key(fg: Color32, bold: bool, italic: bool, underline: bool, strikeout: bool) -> u64 {
+fn style_key(
+    fg: Color32,
+    bg: Color32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+) -> u64 {
     CellStyle {
         fg,
+        bg,
         bold,
         italic,
         underline,
@@ -2313,6 +2324,35 @@ mod paste_tests {
             1,
             "载荷中只能保留由终端生成的结束标记"
         );
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+
+    /// 同色背景被默认背景隔开时不能跨越中间列合并。
+    #[test]
+    fn 背景段只合并相邻列() {
+        let default = Color32::BLACK;
+        let accent = Color32::from_rgb(10, 20, 30);
+        let mut backgrounds = Vec::new();
+        push_background(&mut backgrounds, 0, accent, default);
+        push_background(&mut backgrounds, 1, default, default);
+        push_background(&mut backgrounds, 2, accent, default);
+
+        assert_eq!(backgrounds.len(), 2);
+        assert_eq!((backgrounds[0].start, backgrounds[0].end), (0, 1));
+        assert_eq!((backgrounds[1].start, backgrounds[1].end), (2, 3));
+    }
+
+    /// 显式背景变化必须使行缓存指纹变化，即使文本和前景完全相同。
+    #[test]
+    fn 背景色参与行指纹() {
+        let fg = Color32::WHITE;
+        let first = style_key(fg, Color32::BLACK, false, false, false, false);
+        let second = style_key(fg, Color32::from_rgb(1, 2, 3), false, false, false, false);
+        assert_ne!(first, second);
     }
 }
 
