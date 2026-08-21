@@ -12,7 +12,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use mino_core::config::{default_config_path, Auth, HostConfig, HostProfile};
+use mino_core::config::{Auth, HostConfig, HostProfile};
 use mino_core::ssh::sftp::{connect_sftp, SftpEvent, SftpHandle};
 use mino_core::ssh::{connect_remote, ConnectResult};
 use mino_core::terminal::{Session, SessionEvent, SessionOptions};
@@ -470,7 +470,14 @@ write_result "success"
 impl MinoApp {
     /// 创建应用（启动本地终端会话）。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        Self::new_with_config(cc, default_config_path())
+        #[cfg(test)]
+        {
+            return Self::new_with_config_inner(cc, test_config_path("default"), false);
+        }
+        #[cfg(not(test))]
+        {
+            Self::new_with_config(cc, mino_core::config::default_config_path())
+        }
     }
 
     /// 指定配置文件路径创建应用。
@@ -479,6 +486,15 @@ impl MinoApp {
     /// `~/.config/mino/hosts.toml`（default_config_path），运行一次测试
     /// 主机列表就丢一次（表现为"更新后主机全部消失"）。
     pub fn new_with_config(cc: &eframe::CreationContext<'_>, config_path: PathBuf) -> Self {
+        Self::new_with_config_inner(cc, config_path, cfg!(not(test)))
+    }
+
+    /// 构造应用的内部实现；测试构建关闭自动更新，避免网络与后台线程污染 UI 测试。
+    fn new_with_config_inner(
+        cc: &eframe::CreationContext<'_>,
+        config_path: PathBuf,
+        auto_update: bool,
+    ) -> Self {
         crate::theme::set_theme(&cc.egui_ctx, 0);
         let ctx = cc.egui_ctx.clone();
 
@@ -562,7 +578,9 @@ impl MinoApp {
         if let Some(message) = load_message {
             app.show_toast(message, true);
         }
-        app.start_update_check(true, &ctx);
+        if auto_update {
+            app.start_update_check(true, &ctx);
+        }
         // 初始一个本地终端 tab；设置改弹窗（`show_settings`）。
         app.new_local_tab(&ctx);
         app
@@ -2577,9 +2595,11 @@ impl MinoApp {
 /// 覆盖并删除用户主机配置（运行一次测试丢一次主机列表）。
 #[cfg(test)]
 pub(crate) fn test_config_path(tag: &str) -> PathBuf {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "mino-test-config-{tag}-{}.toml",
-        std::process::id()
+        "mino-test-config-{tag}-{}-{sequence}.toml",
+        std::process::id(),
     ))
 }
 
@@ -4138,6 +4158,23 @@ mod settings_tests {
                 .is_none(),
             "设置弹窗未打开时不应渲染主机管理"
         );
+    }
+
+    #[test]
+    fn 测试构造器隔离配置并关闭自动更新() {
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
+        harness.run_steps(2);
+        let app = harness.state();
+        assert!(matches!(app.update_state, UpdateState::Idle));
+        assert_eq!(
+            app.config_path.parent(),
+            Some(std::env::temp_dir().as_path())
+        );
+        assert!(app
+            .config_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("mino-test-config-default-")));
     }
 
     /// ⌘, 快捷键切换设置弹窗（macOS 标准"应用偏好设置"）。
