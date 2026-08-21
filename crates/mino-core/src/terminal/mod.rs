@@ -60,6 +60,22 @@ pub enum SessionEvent {
 /// 事件回调：后台有数据时由监听器线程调用（用于触发 UI 重绘）。
 pub type EventHandler = Arc<dyn Fn(&SessionEvent) + Send + Sync>;
 
+/// 只向仍由当前进程持有的子进程发送信号。
+///
+/// 不能仅凭保存下来的裸 PID 调用 kill：shell 退出并被回收后，PID 可能
+/// 已被系统分配给别的进程。waitpid 的 WNOHANG 结果同时确认子进程身份，
+/// 失败或已退出时保持安静，不触碰可能复用该 PID 的进程。
+#[cfg(unix)]
+fn signal_child_if_running(pid: i32, signal: i32) {
+    let mut status = 0;
+    let state = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if state == 0 {
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
 /// 会话共享状态（监听器与 UI 线程共同访问）。
 #[derive(Default)]
 pub(crate) struct Shared {
@@ -296,9 +312,7 @@ impl Session {
             Err(err) => {
                 // pty 随错误路径析构，先杀 shell 避免其 wait 阻塞。
                 #[cfg(unix)]
-                unsafe {
-                    libc::kill(child_pid, libc::SIGKILL);
-                }
+                signal_child_if_running(child_pid, libc::SIGKILL);
                 return Err(err);
             }
         };
@@ -396,13 +410,14 @@ impl Drop for Session {
         #[cfg(unix)]
         if let Some(pid) = self.child_pid {
             // 先给 shell 优雅退出机会（SIGHUP 让它保存状态正常退出）。
-            unsafe { libc::kill(pid, libc::SIGHUP) };
+            signal_child_if_running(pid, libc::SIGHUP);
             // 兜底：shell 偶发不响应 SIGHUP，而 alacritty Pty 析构的
             // `wait()` 会随之永久阻塞（关闭标签页时 UI 线程卡死），
-            // 延时 SIGKILL 保证其必然退出（shell 已退时 kill 无害）。
+            // 延时 SIGKILL 保证其必然退出；发送前重新确认子进程身份，
+            // 防止 shell 退出后 PID 被其它进程复用。
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(300));
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+                signal_child_if_running(pid, libc::SIGKILL);
             });
         }
         self.shuttor.shutdown();
