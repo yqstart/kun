@@ -34,7 +34,7 @@ pub fn check_for_update(
     // 走 releases.atom（HTML feed）而非 REST API：API 未认证限流（60 次/小时/IP）
     // 极容易被共享出口 IP 耗尽导致检查永远失败；feed 不受该限流影响。
     let url = format!("https://github.com/{repo}/releases.atom");
-    let agent = make_agent();
+    let agent = make_check_agent();
     let mut response = agent
         .get(&url)
         .header("User-Agent", format!("mino/{current_version}"))
@@ -76,11 +76,28 @@ pub fn check_for_update(
     }
 }
 
-/// 统一的 ureq Agent 配置。
-fn make_agent() -> ureq::Agent {
+/// 更新检查使用的 ureq Agent：整个 feed 请求 30 秒内完成。
+fn make_check_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         // 手动处理 4xx/5xx，否则 ureq 默认把状态码转成 Err，404 等分支不可达。
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+}
+
+/// 资产下载使用的 ureq Agent。
+///
+/// 下载不设置全局超时，避免大体积 DMG 在 30 秒后被误判失败；各阶段和
+/// 单次读取仍有上限，网络完全无响应时可以及时结束。
+fn make_download_agent() -> ureq::Agent {
+    let connect_timeout = std::time::Duration::from_secs(30);
+    ureq::Agent::config_builder()
+        .timeout_resolve(Some(connect_timeout))
+        .timeout_connect(Some(connect_timeout))
+        .timeout_recv_response(Some(connect_timeout))
+        .timeout_recv_body(Some(connect_timeout))
+        // 手动处理 4xx/5xx，保留下载错误中的 HTTP 状态码。
         .http_status_as_error(false)
         .build()
         .new_agent()
@@ -131,7 +148,7 @@ pub fn download_asset_with_cancel(
         if cancelled.load(Ordering::Relaxed) {
             return Err("下载已取消".into());
         }
-        let agent = make_agent();
+        let agent = make_download_agent();
         let mut response = agent
             .get(url)
             .header("User-Agent", "mino-updater")
