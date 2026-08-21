@@ -3922,10 +3922,12 @@ mod theme_tests {
                 .query_by_role(accesskit::Role::ComboBox)
                 .expect("主题下拉不存在");
             combo.click();
-            for _ in 0..2 {
+            for _ in 0..3 {
                 harness.step();
             }
-            harness.get_by_label(theme_name).click();
+            harness
+                .get_by_role_and_label(accesskit::Role::Button, theme_name)
+                .click();
             for _ in 0..3 {
                 harness.step();
             }
