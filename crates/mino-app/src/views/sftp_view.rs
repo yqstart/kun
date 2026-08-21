@@ -2,7 +2,7 @@
 
 use egui::{RichText, Ui};
 use mino_core::ssh::sftp::{RemoteEntry, SftpEvent, SftpHandle};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 /// 传输任务（进度条显示）。
 #[derive(Clone)]
@@ -56,7 +56,7 @@ pub struct SftpView {
     /// 主机名称（显示用）。
     host_name: String,
     handle: SftpHandle,
-    rx: UnboundedReceiver<SftpEvent>,
+    rx: Receiver<SftpEvent>,
     /// 当前远程路径。
     current_path: String,
     /// 当前目录条目。
@@ -81,7 +81,7 @@ pub struct SftpView {
 
 impl SftpView {
     /// 创建 SFTP 面板（连接就绪后）。
-    pub fn new(host_name: &str, handle: SftpHandle, rx: UnboundedReceiver<SftpEvent>) -> Self {
+    pub fn new(host_name: &str, handle: SftpHandle, rx: Receiver<SftpEvent>) -> Self {
         Self::new_at_path(host_name, handle, rx, "/")
     }
 
@@ -89,7 +89,7 @@ impl SftpView {
     pub fn new_at_path(
         host_name: &str,
         handle: SftpHandle,
-        rx: UnboundedReceiver<SftpEvent>,
+        rx: Receiver<SftpEvent>,
         initial_path: &str,
     ) -> Self {
         let initial_path = if initial_path.is_empty() {
@@ -1334,7 +1334,7 @@ mod tests {
         use kittest::Queryable;
 
         // 直接构造带条目的面板（不依赖网络）。
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
         let mut view = SftpView {
@@ -1397,7 +1397,7 @@ mod tests {
     fn shift多选右键批量菜单() {
         use kittest::Queryable;
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
         let mut view = SftpView {
@@ -1458,7 +1458,7 @@ mod tests {
     fn 上传进度独立区域() {
         use kittest::Queryable;
 
-        let (event_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
         let mut view = SftpView {
@@ -1477,7 +1477,7 @@ mod tests {
             cell_width: 0.0,
         };
         event_tx
-            .send(SftpEvent::Progress {
+            .try_send(SftpEvent::Progress {
                 label: "上传 demo.bin".into(),
                 done: 512,
                 total: 1024,
@@ -1495,7 +1495,7 @@ mod tests {
     fn 快捷键定位终端目录() {
         use mino_core::ssh::sftp::SftpCmd;
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
         let mut view = SftpView {
@@ -1539,7 +1539,7 @@ mod tests {
     fn 空白处右键新建文件夹菜单() {
         use kittest::Queryable;
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
         let mut view = SftpView {
@@ -1571,7 +1571,7 @@ mod tests {
     fn sftp面板窄宽不截断() {
         use kittest::Queryable;
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
         let mut view = SftpView {
@@ -1613,7 +1613,7 @@ mod tests {
         use kittest::Queryable;
         use mino_core::ssh::sftp::SftpCmd;
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
         let mut view = SftpView {
@@ -1699,7 +1699,7 @@ mod tests {
     fn 文件列表列对齐() {
         use kittest::Queryable;
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
         let mut view = SftpView {

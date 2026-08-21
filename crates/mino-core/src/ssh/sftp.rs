@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
 use crate::config::HostProfile;
 use crate::ssh::{connect_verified, ssh_config};
@@ -161,12 +161,9 @@ impl SftpHandle {
 /// 返回（线程句柄, 操作句柄, 事件接收端）。
 pub fn connect_sftp(
     profile: &HostProfile,
-) -> (
-    std::thread::JoinHandle<()>,
-    SftpHandle,
-    UnboundedReceiver<SftpEvent>,
-) {
-    let (ev_tx, ev_rx) = mpsc::unbounded_channel::<SftpEvent>();
+) -> (std::thread::JoinHandle<()>, SftpHandle, Receiver<SftpEvent>) {
+    // 事件流有界，避免非活动标签在大文件传输时无限积压进度事件。
+    let (ev_tx, ev_rx) = mpsc::channel::<SftpEvent>(128);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SftpCmd>();
     let profile = profile.clone();
     let handle = std::thread::spawn(move || {
@@ -184,7 +181,7 @@ pub fn connect_sftp(
 async fn sftp_main(
     profile: HostProfile,
     mut cmd_rx: UnboundedReceiver<SftpCmd>,
-    ev_tx: UnboundedSender<SftpEvent>,
+    ev_tx: Sender<SftpEvent>,
 ) {
     // ==================== 1. 连接与认证（含主机密钥 TOFU 校验） ====================
     log::info!("sftp_main 启动：{}:{}", profile.host, profile.port);
@@ -192,10 +189,12 @@ async fn sftp_main(
     let mut handle = match connect_verified(config, &profile).await {
         Ok(h) => h,
         Err(e) => {
-            let _ = ev_tx.send(SftpEvent::Failed(format!(
-                "连接 {}:{} 失败：{e}",
-                profile.host, profile.port
-            )));
+            let _ = ev_tx
+                .send(SftpEvent::Failed(format!(
+                    "连接 {}:{} 失败：{e}",
+                    profile.host, profile.port
+                )))
+                .await;
             return;
         }
     };
@@ -204,12 +203,14 @@ async fn sftp_main(
     let authed = match crate::ssh::authenticate(&mut handle, &profile).await {
         Ok(ok) => ok,
         Err(e) => {
-            let _ = ev_tx.send(SftpEvent::Failed(e));
+            let _ = ev_tx.send(SftpEvent::Failed(e)).await;
             return;
         }
     };
     if !authed {
-        let _ = ev_tx.send(SftpEvent::Failed("认证失败：用户名或密码/密钥错误".into()));
+        let _ = ev_tx
+            .send(SftpEvent::Failed("认证失败：用户名或密码/密钥错误".into()))
+            .await;
         return;
     }
 
@@ -217,18 +218,24 @@ async fn sftp_main(
     let channel = match handle.channel_open_session().await {
         Ok(c) => c,
         Err(e) => {
-            let _ = ev_tx.send(SftpEvent::Failed(format!("打开会话失败：{e}")));
+            let _ = ev_tx
+                .send(SftpEvent::Failed(format!("打开会话失败：{e}")))
+                .await;
             return;
         }
     };
     if let Err(e) = channel.request_subsystem(true, "sftp").await {
-        let _ = ev_tx.send(SftpEvent::Failed(format!("启动 SFTP 子系统失败：{e}")));
+        let _ = ev_tx
+            .send(SftpEvent::Failed(format!("启动 SFTP 子系统失败：{e}")))
+            .await;
         return;
     }
     let sftp = match SftpSession::new(channel.into_stream()).await {
         Ok(s) => s,
         Err(e) => {
-            let _ = ev_tx.send(SftpEvent::Failed(format!("初始化 SFTP 失败：{e}")));
+            let _ = ev_tx
+                .send(SftpEvent::Failed(format!("初始化 SFTP 失败：{e}")))
+                .await;
             return;
         }
     };
@@ -238,7 +245,7 @@ async fn sftp_main(
         .canonicalize(".")
         .await
         .unwrap_or_else(|_| "/".to_string());
-    let _ = ev_tx.send(SftpEvent::Ready { home });
+    let _ = ev_tx.send(SftpEvent::Ready { home }).await;
 
     // ==================== 3. 操作循环 ====================
     while let Some(cmd) = cmd_rx.recv().await {
@@ -247,13 +254,15 @@ async fn sftp_main(
                 let result = list_dir(&sftp, &path).await;
                 match result {
                     Ok(entries) => {
-                        let _ = ev_tx.send(SftpEvent::Listed { path, entries });
+                        let _ = ev_tx.send(SftpEvent::Listed { path, entries }).await;
                     }
                     Err(e) => {
-                        let _ = ev_tx.send(SftpEvent::Error {
-                            label: "列出目录".into(),
-                            message: e,
-                        });
+                        let _ = ev_tx
+                            .send(SftpEvent::Error {
+                                label: "列出目录".into(),
+                                message: e,
+                            })
+                            .await;
                     }
                 }
             }
@@ -267,10 +276,10 @@ async fn sftp_main(
                 );
                 match upload_file(&sftp, &local, &remote, &label, &ev_tx).await {
                     Ok(()) => {
-                        let _ = ev_tx.send(SftpEvent::Done { label });
+                        let _ = ev_tx.send(SftpEvent::Done { label }).await;
                     }
                     Err(e) => {
-                        let _ = ev_tx.send(SftpEvent::Error { label, message: e });
+                        let _ = ev_tx.send(SftpEvent::Error { label, message: e }).await;
                     }
                 }
             }
@@ -284,10 +293,10 @@ async fn sftp_main(
                 );
                 match download_file(&sftp, &remote, &local, &label, &ev_tx).await {
                     Ok(()) => {
-                        let _ = ev_tx.send(SftpEvent::Done { label });
+                        let _ = ev_tx.send(SftpEvent::Done { label }).await;
                     }
                     Err(e) => {
-                        let _ = ev_tx.send(SftpEvent::Error { label, message: e });
+                        let _ = ev_tx.send(SftpEvent::Error { label, message: e }).await;
                     }
                 }
             }
@@ -306,13 +315,15 @@ async fn sftp_main(
                 };
                 match result {
                     Ok(()) => {
-                        let _ = ev_tx.send(SftpEvent::Done { label });
+                        let _ = ev_tx.send(SftpEvent::Done { label }).await;
                     }
                     Err(e) => {
-                        let _ = ev_tx.send(SftpEvent::Error {
-                            label,
-                            message: e.to_string(),
-                        });
+                        let _ = ev_tx
+                            .send(SftpEvent::Error {
+                                label,
+                                message: e.to_string(),
+                            })
+                            .await;
                     }
                 }
             }
@@ -320,13 +331,15 @@ async fn sftp_main(
                 let label = format!("重命名 {}", from);
                 match sftp.rename(&from, &to).await {
                     Ok(()) => {
-                        let _ = ev_tx.send(SftpEvent::Done { label });
+                        let _ = ev_tx.send(SftpEvent::Done { label }).await;
                     }
                     Err(e) => {
-                        let _ = ev_tx.send(SftpEvent::Error {
-                            label,
-                            message: e.to_string(),
-                        });
+                        let _ = ev_tx
+                            .send(SftpEvent::Error {
+                                label,
+                                message: e.to_string(),
+                            })
+                            .await;
                     }
                 }
             }
@@ -334,20 +347,22 @@ async fn sftp_main(
                 let label = format!("新建目录 {}", path);
                 match sftp.create_dir(&path).await {
                     Ok(()) => {
-                        let _ = ev_tx.send(SftpEvent::Done { label });
+                        let _ = ev_tx.send(SftpEvent::Done { label }).await;
                     }
                     Err(e) => {
-                        let _ = ev_tx.send(SftpEvent::Error {
-                            label,
-                            message: e.to_string(),
-                        });
+                        let _ = ev_tx
+                            .send(SftpEvent::Error {
+                                label,
+                                message: e.to_string(),
+                            })
+                            .await;
                     }
                 }
             }
             SftpCmd::Shutdown => break,
         }
     }
-    let _ = ev_tx.send(SftpEvent::Closed);
+    let _ = ev_tx.send(SftpEvent::Closed).await;
 }
 
 /// 列出远程目录。
@@ -378,7 +393,7 @@ async fn upload_file(
     local: &Path,
     remote: &str,
     label: &str,
-    ev_tx: &UnboundedSender<SftpEvent>,
+    ev_tx: &Sender<SftpEvent>,
 ) -> Result<(), String> {
     let partial = partial_remote_path(remote);
     let result = async {
@@ -404,7 +419,8 @@ async fn upload_file(
                 .await
                 .map_err(|e| e.to_string())?;
             done += n as u64;
-            let _ = ev_tx.send(SftpEvent::Progress {
+            // 进度是可丢弃的最新状态；有界队列满时不阻塞传输线程。
+            let _ = ev_tx.try_send(SftpEvent::Progress {
                 label: label.to_string(),
                 done,
                 total,
@@ -430,7 +446,7 @@ async fn download_file(
     remote: &str,
     local: &Path,
     label: &str,
-    ev_tx: &UnboundedSender<SftpEvent>,
+    ev_tx: &Sender<SftpEvent>,
 ) -> Result<(), String> {
     let partial = partial_local_path(local);
     let result = async {
@@ -459,7 +475,7 @@ async fn download_file(
                 .await
                 .map_err(|e| e.to_string())?;
             done += n as u64;
-            let _ = ev_tx.send(SftpEvent::Progress {
+            let _ = ev_tx.try_send(SftpEvent::Progress {
                 label: label.to_string(),
                 done,
                 total,

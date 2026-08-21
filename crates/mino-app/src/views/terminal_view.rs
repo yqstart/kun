@@ -247,6 +247,20 @@ impl TerminalView {
         self.input.set_cwd(cwd);
     }
 
+    /// 轮询后台事件但不渲染终端。
+    ///
+    /// 应用层会对所有存活标签调用它，避免非活动标签长期不消费事件；
+    /// 当前活动标签随后进入 `show` 时会再次轮询但不会重复处理。
+    pub fn drain_background_events(&mut self) {
+        for event in self.session.drain_events() {
+            match event {
+                SessionEvent::PtyWrite(text) => self.session.write(text.as_bytes()),
+                SessionEvent::Title(title) => self.cached_title = title,
+                _ => {}
+            }
+        }
+    }
+
     /// 每帧渲染入口。
     pub fn show(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
@@ -302,13 +316,7 @@ impl TerminalView {
         // `Listener::send_event` 已在事件到达时直接调过 on_event
         // （app.rs 的 `ctx.request_repaint()`），此处仅处理 PtyWrite 回写
         // 与标题缓存更新。
-        for event in self.session.drain_events() {
-            match event {
-                SessionEvent::PtyWrite(text) => self.session.write(text.as_bytes()),
-                SessionEvent::Title(title) => self.cached_title = title,
-                _ => {}
-            }
-        }
+        self.drain_background_events();
 
         // 补全去抖：挂起的重算到点后执行（需请求一帧重绘驱动）。
         if self.recompute_pending {

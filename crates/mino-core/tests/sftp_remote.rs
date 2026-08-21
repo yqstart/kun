@@ -1,7 +1,7 @@
 //! SFTP 集成测试：连接本地测试 sshd，验证列表/上传/下载/删除/重命名/新建目录。
 
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 use mino_core::config::{Auth, HostProfile};
 use mino_core::ssh::sftp::{connect_sftp, SftpEvent};
@@ -32,7 +32,7 @@ fn test_profile() -> HostProfile {
 
 /// 等待特定事件出现（返回收到的所有事件）。
 fn wait_event(
-    rx: &mut UnboundedReceiver<SftpEvent>,
+    rx: &mut Receiver<SftpEvent>,
     timeout: Duration,
     predicate: impl Fn(&SftpEvent) -> bool,
 ) -> Result<Vec<SftpEvent>, String> {

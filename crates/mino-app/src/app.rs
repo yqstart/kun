@@ -14,7 +14,7 @@ use mino_core::ssh::sftp::{connect_sftp, SftpEvent, SftpHandle};
 use mino_core::ssh::{connect_remote, ConnectResult};
 use mino_core::terminal::{Session, SessionEvent, SessionOptions};
 use mino_core::updater::{check_for_update, UpdateInfo};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 use crate::anim;
 use crate::views::sftp_view::SftpView;
@@ -136,7 +136,7 @@ impl TerminalTab {
 struct SftpConnection {
     connection_id: u64,
     handle: SftpHandle,
-    rx: UnboundedReceiver<SftpEvent>,
+    rx: Receiver<SftpEvent>,
     host: String,
     home: Option<String>,
 }
@@ -2660,6 +2660,19 @@ impl eframe::App for MinoApp {
         }
 
         // ==================== 处理异步结果 ====================
+        // 所有标签都轮询后台状态，非活动标签不会积压终端写回或 SFTP 事件。
+        for tab in &mut self.tabs {
+            tab.terminal.drain_background_events();
+        }
+        let mut sftp_event_received = false;
+        for tab in &mut self.tabs {
+            if let Some(sftp) = &mut tab.sftp {
+                sftp_event_received |= sftp.poll_events();
+            }
+        }
+        if sftp_event_received {
+            ctx.request_repaint();
+        }
         self.poll_connection(&ctx);
         self.poll_sftp();
         self.poll_update();
@@ -2957,7 +2970,7 @@ mod app_tests {
             .expect("创建本地终端失败");
             let id = app.allocate_id();
             let mut tab = TerminalTab::new(id, "测试主机".into(), TerminalView::new(session));
-            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_tx, rx) = tokio::sync::mpsc::channel(128);
             let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
             tab.sftp = Some(SftpView::new(
                 "测试主机",
@@ -2999,7 +3012,7 @@ mod app_tests {
             app.tabs.remove(0);
             app.active_tab = 0;
 
-            let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_event_tx, event_rx) = tokio::sync::mpsc::channel(128);
             let (command_tx, _command_rx) = tokio::sync::mpsc::unbounded_channel();
             app.pending_tab = Some(target_id);
             app.ready_sftp = Some(SftpConnection {

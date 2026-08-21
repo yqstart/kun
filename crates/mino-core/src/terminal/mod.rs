@@ -8,6 +8,7 @@ pub mod keys;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -65,6 +66,8 @@ pub(crate) struct Shared {
     pub(crate) title: Mutex<String>,
     pub(crate) exited: Mutex<bool>,
     pub(crate) pending: Mutex<Vec<SessionEvent>>,
+    /// Wakeup 只表示“终端有新内容”，多个通知可合并成一次。
+    pub(crate) wakeup: AtomicBool,
 }
 
 /// alacritty 事件监听器：把事件记录到共享状态并通知回调。
@@ -75,23 +78,43 @@ pub struct Listener {
 
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
+        if matches!(event, Event::Wakeup) {
+            if !self.shared.wakeup.swap(true, Ordering::AcqRel) {
+                (self.on_event)(&SessionEvent::Wakeup);
+            }
+            return;
+        }
         // 只在锁内更新共享状态；UI 回调可能触发事件循环唤醒，不能在
         // 持有 pending 锁时调用，否则 UI 线程 drain_events 与后台线程
         // 的回调路径会形成不必要的锁竞争，严重时表现为窗口卡死。
         let notify = {
             let mut pending = self.shared.pending.lock().unwrap();
+            // 非 Wakeup 事件需要保留顺序，但后台标签页可能长时间不可见；
+            // 设置上限，避免标题/写回等异常事件无限增长耗尽内存。
+            const MAX_PENDING_EVENTS: usize = 256;
             match event {
-                Event::Wakeup => pending.push(SessionEvent::Wakeup),
                 Event::Title(title) => {
                     *self.shared.title.lock().unwrap() = title.clone();
-                    pending.push(SessionEvent::Title(title));
+                    if pending.len() < MAX_PENDING_EVENTS {
+                        pending.push(SessionEvent::Title(title));
+                    }
                 }
                 Event::ChildExit(_) => {
                     *self.shared.exited.lock().unwrap() = true;
-                    pending.push(SessionEvent::ChildExit);
+                    if pending.len() < MAX_PENDING_EVENTS {
+                        pending.push(SessionEvent::ChildExit);
+                    }
                 }
-                Event::PtyWrite(text) => pending.push(SessionEvent::PtyWrite(text)),
-                Event::Bell => pending.push(SessionEvent::Bell),
+                Event::PtyWrite(text) => {
+                    if pending.len() < MAX_PENDING_EVENTS {
+                        pending.push(SessionEvent::PtyWrite(text));
+                    }
+                }
+                Event::Bell => {
+                    if pending.len() < MAX_PENDING_EVENTS {
+                        pending.push(SessionEvent::Bell);
+                    }
+                }
                 // 不要用 pending.last() 通知：未处理的 alacritty 事件会
                 // 误重复通知上一次事件，造成无意义的重绘。
                 _ => return,
@@ -346,7 +369,9 @@ impl Session {
     /// 取出所有待处理事件（UI 每帧轮询）。
     pub fn drain_events(&self) -> Vec<SessionEvent> {
         let mut pending = self.shared.pending.lock().unwrap();
-        std::mem::take(&mut *pending)
+        let events = std::mem::take(&mut *pending);
+        self.shared.wakeup.store(false, Ordering::Release);
+        events
     }
 
     /// 当前窗口标题。
@@ -406,6 +431,54 @@ mod tests {
         };
 
         listener.send_event(Event::Wakeup);
-        assert_eq!(shared.pending.lock().unwrap().len(), 1);
+        assert!(shared.wakeup.load(Ordering::Acquire));
+        assert!(shared.pending.lock().unwrap().is_empty());
+    }
+
+    /// 高频输出只需触发一次唤醒回调，不能按输出块无限追加 Wakeup 事件。
+    #[test]
+    fn 高频唤醒事件合并() {
+        let shared = Arc::new(Shared::default());
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count_clone = callback_count.clone();
+        let listener = Listener {
+            shared: shared.clone(),
+            on_event: Arc::new(move |_event| {
+                callback_count_clone.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+
+        for _ in 0..10_000 {
+            listener.send_event(Event::Wakeup);
+        }
+        assert_eq!(callback_count.load(Ordering::Relaxed), 1);
+        assert!(shared.pending.lock().unwrap().is_empty());
+        assert_eq!(shared.wakeup.load(Ordering::Acquire), true);
+
+        let events = {
+            let pending = shared.pending.lock().unwrap();
+            pending.len()
+        };
+        assert_eq!(events, 0);
+        let _ = Session {
+            term: Arc::new(FairMutex::new(Term::new(
+                term::Config::default(),
+                &TermSize { rows: 1, cols: 1 },
+                Listener {
+                    shared: shared.clone(),
+                    on_event: Arc::new(|_| {}),
+                },
+            ))),
+            shared: shared.clone(),
+            writer: Writer::new(|_| {}),
+            resizer: Resizer::new(|_, _| {}),
+            shuttor: Shuttor::new(|| {}),
+            is_remote: false,
+            pty_thread: None,
+            #[cfg(unix)]
+            child_pid: None,
+        }
+        .drain_events();
+        assert!(!shared.wakeup.load(Ordering::Acquire));
     }
 }
