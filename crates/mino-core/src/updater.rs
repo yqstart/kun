@@ -108,11 +108,29 @@ fn asset_url_for(repo: &str, tag: &str, version: &str, arch: &str) -> String {
 pub fn download_asset(
     url: &str,
     dest: &std::path::Path,
+    on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<(), String> {
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    download_asset_with_cancel(url, dest, &cancelled, on_progress)
+}
+
+/// 可取消地下载资产。
+///
+/// 取消标记由调用方持有并设置；下载线程会在请求和每个数据块之间检查，
+/// 取消或其它错误都会清理目标文件，避免半成品被后续安装流程误用。
+pub fn download_asset_with_cancel(
+    url: &str,
+    dest: &std::path::Path,
+    cancelled: &std::sync::atomic::AtomicBool,
     mut on_progress: impl FnMut(u64, Option<u64>),
 ) -> Result<(), String> {
     use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
 
     let result = (|| -> Result<(), String> {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("下载已取消".into());
+        }
         let agent = make_agent();
         let mut response = agent
             .get(url)
@@ -139,11 +157,17 @@ pub fn download_asset(
         let mut downloaded: u64 = 0;
         on_progress(0, total);
         loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("下载已取消".into());
+            }
             let n = reader
                 .read(&mut buf)
                 .map_err(|e| format!("下载中断：{e}"))?;
             if n == 0 {
                 break;
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("下载已取消".into());
             }
             file.write_all(&buf[..n])
                 .map_err(|e| format!("写入文件失败：{e}"))?;
@@ -395,6 +419,26 @@ mod tests {
             asset_url_for("yqstart/kun", "v0.2.0", "0.2.0", "x64"),
             "https://github.com/yqstart/kun/releases/download/v0.2.0/mino-0.2.0-macos-x64.dmg"
         );
+    }
+
+    #[test]
+    fn 下载开始前取消不会发起请求或留下文件() {
+        use std::sync::atomic::AtomicBool;
+
+        let dest = std::env::temp_dir().join(format!(
+            "mino-updater-cancel-test-{}.dmg",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dest);
+        let cancelled = AtomicBool::new(true);
+        let result = download_asset_with_cancel(
+            "http://127.0.0.1:1/never-requested",
+            &dest,
+            &cancelled,
+            |_, _| {},
+        );
+        assert_eq!(result, Err("下载已取消".into()));
+        assert!(!dest.exists());
     }
 
     #[test]

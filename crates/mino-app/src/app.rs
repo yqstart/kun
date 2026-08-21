@@ -5,7 +5,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use eframe::egui;
@@ -184,6 +187,12 @@ pub struct MinoApp {
     update_state: UpdateState,
     update_rx: Option<std::sync::mpsc::Receiver<Result<Option<UpdateInfo>, String>>>,
     download_rx: Option<std::sync::mpsc::Receiver<DownloadEvent>>,
+    /// 当前下载的取消标记；取消动作会通知后台线程停止读取并清理临时文件。
+    download_cancel: Option<Arc<AtomicBool>>,
+    /// 当前下载的独立临时路径，用于取消时立即清理。
+    download_path: Option<PathBuf>,
+    /// 下载路径序号，避免重试与旧线程共享同一文件。
+    download_sequence: u64,
     /// 本次检查是否为用户手动触发（决定是否弹提示）。
     manual_update: bool,
     /// 安装脚本已启动，到该时间点关闭应用重启。
@@ -388,8 +397,10 @@ fn macos_arch() -> &'static str {
 }
 
 /// 下载缓存目录下的 dmg 路径。
-fn temp_dmg_path(file_name: &str) -> PathBuf {
-    std::env::temp_dir().join("mino-update").join(file_name)
+fn temp_dmg_path(file_name: &str, sequence: u64) -> PathBuf {
+    std::env::temp_dir()
+        .join("mino-update")
+        .join(format!("{file_name}.{sequence}.part"))
 }
 
 /// 安装脚本：挂载 dmg → 等待主程序退出 → 替换 .app → 重启。
@@ -487,6 +498,9 @@ impl MinoApp {
             update_state: UpdateState::Idle,
             update_rx: None,
             download_rx: None,
+            download_cancel: None,
+            download_path: None,
+            download_sequence: 0,
             manual_update: false,
             restart_at: None,
             show_perf_hud: false,
@@ -648,19 +662,34 @@ impl MinoApp {
 
     /// 开始下载更新资产。
     fn start_download(&mut self, info: UpdateInfo) {
+        self.cancel_download();
         let (tx, rx) = std::sync::mpsc::channel();
         let url = info.asset_url.clone();
-        let dest = temp_dmg_path(&info.asset_name);
+        let sequence = self.download_sequence;
+        self.download_sequence = self.download_sequence.wrapping_add(1);
+        let dest = temp_dmg_path(&info.asset_name, sequence);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_cancel = cancel.clone();
+        let thread_dest = dest.clone();
         std::thread::spawn(move || {
-            let result = mino_core::updater::download_asset(&url, &dest, |done, total| {
-                let _ = tx.send(DownloadEvent::Progress {
-                    downloaded: done,
-                    total,
-                });
-            });
+            let result = mino_core::updater::download_asset_with_cancel(
+                &url,
+                &thread_dest,
+                &thread_cancel,
+                |done, total| {
+                    let _ = tx.send(DownloadEvent::Progress {
+                        downloaded: done,
+                        total,
+                    });
+                },
+            );
+            if thread_cancel.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&thread_dest);
+                return;
+            }
             match result {
                 Ok(()) => {
-                    let _ = tx.send(DownloadEvent::Done(dest));
+                    let _ = tx.send(DownloadEvent::Done(thread_dest));
                 }
                 Err(e) => {
                     let _ = tx.send(DownloadEvent::Error(e));
@@ -668,6 +697,8 @@ impl MinoApp {
             }
         });
         self.download_rx = Some(rx);
+        self.download_cancel = Some(cancel);
+        self.download_path = Some(dest);
         self.update_state = UpdateState::Downloading(DownloadState {
             info,
             downloaded: 0,
@@ -702,6 +733,8 @@ impl MinoApp {
                 }
                 DownloadEvent::Done(path) => {
                     self.download_rx = None;
+                    self.download_cancel = None;
+                    self.download_path = None;
                     self.update_state = UpdateState::Downloaded {
                         info,
                         dmg_path: path,
@@ -709,10 +742,23 @@ impl MinoApp {
                 }
                 DownloadEvent::Error(e) => {
                     self.download_rx = None;
+                    self.download_cancel = None;
+                    self.download_path = None;
                     self.update_state = UpdateState::Error(e);
                 }
             }
         }
+    }
+
+    /// 取消下载并清理当前临时文件。
+    fn cancel_download(&mut self) {
+        if let Some(cancel) = self.download_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(path) = self.download_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.download_rx = None;
     }
 
     /// 启动安装脚本并安排重启。
@@ -2268,7 +2314,7 @@ impl MinoApp {
             Some(UpdateAction::Dismiss) => self.update_state = UpdateState::Idle,
             Some(UpdateAction::StartDownload(info)) => self.start_download(info),
             Some(UpdateAction::CancelDownload) => {
-                self.download_rx = None;
+                self.cancel_download();
                 self.update_state = UpdateState::Idle;
             }
             Some(UpdateAction::Install { dmg_path }) => self.install_update(ctx, dmg_path),
