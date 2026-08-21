@@ -908,7 +908,9 @@ impl MinoApp {
                     if let Some(connection) = self.pending_sftp.take() {
                         connection.handle.close();
                     }
-                    self.ready_sftp = None;
+                    if let Some(connection) = self.ready_sftp.take() {
+                        connection.handle.close();
+                    }
                     log::error!("连接失败：{e}");
                     self.show_toast(format!("连接失败：{e}"), true);
                     ctx.request_repaint();
@@ -999,14 +1001,18 @@ impl MinoApp {
                 }
             }
         }
-        if ready {
+        let err = failed.or(closed.then(|| "连接中断".to_string()));
+        if err.is_none() && ready {
             self.ready_sftp = self.pending_sftp.take();
             self.mount_ready_sftp();
         }
-        let err = failed.or(closed.then(|| "连接中断".to_string()));
         if let Some(e) = err {
-            self.pending_sftp = None;
-            self.ready_sftp = None;
+            if let Some(connection) = self.pending_sftp.take() {
+                connection.handle.close();
+            }
+            if let Some(connection) = self.ready_sftp.take() {
+                connection.handle.close();
+            }
             // 状态栏持久显示（toast 一闪而过容易忽略）。
             self.sftp_error = Some(format!("SFTP 连接失败：{e}"));
             self.show_toast(self.sftp_error.clone().unwrap(), true);
@@ -3175,6 +3181,33 @@ mod app_tests {
             tab.sftp.as_ref().map(SftpView::host_name),
             Some("稳定身份主机")
         );
+    }
+
+    #[test]
+    fn ssh失败关闭已就绪的sftp连接() {
+        let _harness = egui_kittest::Harness::new_eframe(|cc| {
+            let mut app = MinoApp::new(cc);
+            let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel();
+            result_tx
+                .send(ConnectResult::Failed("SSH 失败".into()))
+                .unwrap();
+            app.pending = Some(result_rx);
+
+            let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+            app.ready_sftp = Some(SftpConnection {
+                connection_id: 42,
+                handle: SftpHandle::from_raw(command_tx),
+                rx: tokio::sync::mpsc::channel(128).1,
+                host: "待关闭主机".into(),
+                home: None,
+            });
+            app.poll_connection(&cc.egui_ctx);
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(mino_core::ssh::sftp::SftpCmd::Shutdown)
+            ));
+            app
+        });
     }
 
     /// 本地终端输入命令前缀 → 补全浮层出现；Esc 关闭；Tab 确认补全。
