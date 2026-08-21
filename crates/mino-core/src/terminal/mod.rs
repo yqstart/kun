@@ -468,7 +468,7 @@ mod tests {
         }
         assert_eq!(callback_count.load(Ordering::Relaxed), 1);
         assert!(shared.pending.lock().unwrap().is_empty());
-        assert_eq!(shared.wakeup.load(Ordering::Acquire), true);
+        assert!(shared.wakeup.load(Ordering::Acquire));
 
         let events = {
             let pending = shared.pending.lock().unwrap();

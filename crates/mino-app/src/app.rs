@@ -472,7 +472,7 @@ impl MinoApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         #[cfg(test)]
         {
-            return Self::new_with_config_inner(cc, test_config_path("default"), false);
+            Self::new_with_config_inner(cc, test_config_path("default"), false)
         }
         #[cfg(not(test))]
         {
