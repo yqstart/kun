@@ -62,10 +62,31 @@ fn init_test_env() {
     });
 }
 
+/// 测试 sshd 未启动时跳过集成测试，避免把环境缺失误报为产品回归。
+fn sshd_available(profile: &HostProfile) -> bool {
+    use std::net::ToSocketAddrs;
+
+    (profile.host.as_str(), profile.port)
+        .to_socket_addrs()
+        .map(|addresses| {
+            addresses.into_iter().any(|address| {
+                std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok()
+            })
+        })
+        .unwrap_or(false)
+}
+
 #[test]
 fn sftp_完整操作流程() {
     init_test_env();
     let profile = test_profile();
+    if !sshd_available(&profile) {
+        eprintln!(
+            "跳过：测试 sshd 未监听 {}:{}（scripts/test-sshd.sh start）",
+            profile.host, profile.port
+        );
+        return;
+    }
     if let Auth::Key { path, .. } = &profile.auth {
         if !path.exists() {
             eprintln!("跳过：测试私钥不存在");
