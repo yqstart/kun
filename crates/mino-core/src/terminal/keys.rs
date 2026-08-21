@@ -42,12 +42,34 @@ impl Mods {
     }
 }
 
+fn has_xterm_mods(mods: Mods) -> bool {
+    mods.shift || mods.alt || mods.ctrl
+}
+
 /// 带修饰键的 CSI 序列：`\x1b[1;{mods}{letter}`。
 fn csi_with_mods(letter: u8, mods: Mods) -> Vec<u8> {
-    if mods.shift || mods.alt || mods.ctrl {
+    if has_xterm_mods(mods) {
         format!("\x1b[1;{}{}", mods.csi_modifier(), letter as char).into_bytes()
     } else {
         format!("\x1b[{}", letter as char).into_bytes()
+    }
+}
+
+/// 带修饰键的数字参数 CSI 序列：`\x1b[{code};{mods}~`。
+fn csi_tilde_with_mods(code: u8, mods: Mods) -> Vec<u8> {
+    if has_xterm_mods(mods) {
+        format!("\x1b[{};{}~", code, mods.csi_modifier()).into_bytes()
+    } else {
+        format!("\x1b[{}~", code).into_bytes()
+    }
+}
+
+/// 应用光标模式下，无修饰键使用 SS3；有修饰键切换为 xterm CSI 形式。
+fn app_cursor_key(letter: u8, mods: Mods) -> Vec<u8> {
+    if has_xterm_mods(mods) {
+        csi_with_mods(letter, mods)
+    } else {
+        format!("\x1bO{}", letter as char).into_bytes()
     }
 }
 
@@ -118,7 +140,7 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
         Key::Up => {
             let app = mode.contains(TermMode::APP_CURSOR);
             Some(if app {
-                b"\x1bOA".to_vec()
+                app_cursor_key(b'A', mods)
             } else {
                 csi_with_mods(b'A', mods)
             })
@@ -126,7 +148,7 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
         Key::Down => {
             let app = mode.contains(TermMode::APP_CURSOR);
             Some(if app {
-                b"\x1bOB".to_vec()
+                app_cursor_key(b'B', mods)
             } else {
                 csi_with_mods(b'B', mods)
             })
@@ -134,7 +156,7 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
         Key::Right => {
             let app = mode.contains(TermMode::APP_CURSOR);
             Some(if app {
-                b"\x1bOC".to_vec()
+                app_cursor_key(b'C', mods)
             } else {
                 csi_with_mods(b'C', mods)
             })
@@ -142,7 +164,7 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
         Key::Left => {
             let app = mode.contains(TermMode::APP_CURSOR);
             Some(if app {
-                b"\x1bOD".to_vec()
+                app_cursor_key(b'D', mods)
             } else {
                 csi_with_mods(b'D', mods)
             })
@@ -150,7 +172,7 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
         Key::Home => {
             let app = mode.contains(TermMode::APP_CURSOR);
             Some(if app {
-                b"\x1bOH".to_vec()
+                app_cursor_key(b'H', mods)
             } else {
                 csi_with_mods(b'H', mods)
             })
@@ -158,47 +180,47 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
         Key::End => {
             let app = mode.contains(TermMode::APP_CURSOR);
             Some(if app {
-                b"\x1bOF".to_vec()
+                app_cursor_key(b'F', mods)
             } else {
                 csi_with_mods(b'F', mods)
             })
         }
         Key::PageUp => {
-            if mods.shift {
+            if mods.shift && !mods.alt && !mods.ctrl {
                 // Shift+PageUp 保留给窗口滚动，不发送。
                 None
             } else {
-                Some(b"\x1b[5~".to_vec())
+                Some(csi_tilde_with_mods(5, mods))
             }
         }
         Key::PageDown => {
-            if mods.shift {
+            if mods.shift && !mods.alt && !mods.ctrl {
                 None
             } else {
-                Some(b"\x1b[6~".to_vec())
+                Some(csi_tilde_with_mods(6, mods))
             }
         }
-        Key::Insert => Some(b"\x1b[2~".to_vec()),
-        Key::Delete => Some(b"\x1b[3~".to_vec()),
+        Key::Insert => Some(csi_tilde_with_mods(2, mods)),
+        Key::Delete => Some(csi_tilde_with_mods(3, mods)),
         // 功能键：F1-F4 用 SS3，F5-F12 用 CSI；带修饰键时用 CSI 修饰形式。
         // 修饰形式末尾字母按 xterm 规范随键递增（P/Q/R/S = F1-F4）——
         // 曾固定发 'P'，导致 F2-F4 带修饰键时被终端识别为 F1。
         Key::F(n) => Some(match n {
-            1..=4 if mods.shift || mods.alt || mods.ctrl => {
+            1..=4 if has_xterm_mods(mods) => {
                 format!("\x1b[1;{}{}", mods.csi_modifier(), (b'P' + (n - 1)) as char).into_bytes()
             }
             1 => b"\x1bOP".to_vec(),
             2 => b"\x1bOQ".to_vec(),
             3 => b"\x1bOR".to_vec(),
             4 => b"\x1bOS".to_vec(),
-            5 => b"\x1b[15~".to_vec(),
-            6 => b"\x1b[17~".to_vec(),
-            7 => b"\x1b[18~".to_vec(),
-            8 => b"\x1b[19~".to_vec(),
-            9 => b"\x1b[20~".to_vec(),
-            10 => b"\x1b[21~".to_vec(),
-            11 => b"\x1b[23~".to_vec(),
-            12 => b"\x1b[24~".to_vec(),
+            5 => csi_tilde_with_mods(15, mods),
+            6 => csi_tilde_with_mods(17, mods),
+            7 => csi_tilde_with_mods(18, mods),
+            8 => csi_tilde_with_mods(19, mods),
+            9 => csi_tilde_with_mods(20, mods),
+            10 => csi_tilde_with_mods(21, mods),
+            11 => csi_tilde_with_mods(23, mods),
+            12 => csi_tilde_with_mods(24, mods),
             _ => b"".to_vec(),
         }),
     }
@@ -275,6 +297,27 @@ mod tests {
     }
 
     #[test]
+    fn 应用光标模式保留方向键修饰符() {
+        let shift = Mods {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(Key::Up, shift, TermMode::APP_CURSOR).unwrap(),
+            b"\x1b[1;2A"
+        );
+
+        let ctrl = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(Key::Home, ctrl, TermMode::APP_CURSOR).unwrap(),
+            b"\x1b[1;5H"
+        );
+    }
+
+    #[test]
     #[allow(non_snake_case)]
     fn shift_tab_reverse() {
         let mods = Mods {
@@ -336,5 +379,51 @@ mod tests {
             encode_key(Key::F(4), ctrl, TermMode::NONE).unwrap(),
             b"\x1b[1;5S"
         );
+
+        assert_eq!(
+            encode_key(Key::F(5), shift, TermMode::NONE).unwrap(),
+            b"\x1b[15;2~"
+        );
+        assert_eq!(
+            encode_key(Key::F(12), ctrl, TermMode::NONE).unwrap(),
+            b"\x1b[24;5~"
+        );
+    }
+
+    #[test]
+    fn 编辑与翻页键带修饰键按xterm规范编码() {
+        let alt = Mods {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(Key::Insert, alt, TermMode::NONE).unwrap(),
+            b"\x1b[2;3~"
+        );
+        assert_eq!(
+            encode_key(Key::PageUp, alt, TermMode::NONE).unwrap(),
+            b"\x1b[5;3~"
+        );
+        assert_eq!(
+            encode_key(
+                Key::Delete,
+                Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                TermMode::NONE
+            )
+            .unwrap(),
+            b"\x1b[3;5~"
+        );
+        assert!(encode_key(
+            Key::PageDown,
+            Mods {
+                shift: true,
+                ..Default::default()
+            },
+            TermMode::NONE
+        )
+        .is_none());
     }
 }
