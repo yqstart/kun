@@ -172,6 +172,8 @@ pub struct MinoApp {
     last_ctx: egui::Context,
     config: HostConfig,
     config_path: PathBuf,
+    /// 原配置无法读取且备份也失败时，禁止用空配置覆盖原文件。
+    config_write_blocked: bool,
     show_new_conn: bool,
     form: ConnectForm,
     pending: Option<UnboundedReceiver<ConnectResult>>,
@@ -482,18 +484,43 @@ impl MinoApp {
 
         // 加载失败不能静默按空配置启动：文件存在但解析失败时先备份原文，
         // 避免后续保存把用户主机列表覆盖掉。
-        let (config, load_error) = match HostConfig::load(&config_path) {
-            Ok(c) => (c, false),
+        let (config, load_message, config_write_blocked) = match HostConfig::load(&config_path) {
+            Ok(c) => (c, None, false),
             Err(e) => {
                 let existed = config_path.exists();
-                if existed {
+                if !existed && e.kind() == std::io::ErrorKind::NotFound {
+                    (HostConfig::default(), None, false)
+                } else if existed {
                     let bak = config_path.with_extension("toml.bak");
-                    if let Err(be) = std::fs::copy(&config_path, &bak) {
-                        log::error!("备份主机配置到 {bak:?} 失败：{be}");
+                    match std::fs::copy(&config_path, &bak) {
+                        Ok(_) => {
+                            log::error!("主机配置加载失败（原文已备份为 {bak:?}）：{e}");
+                            (
+                                HostConfig::default(),
+                                Some(format!("主机配置读取失败，原文已备份为 {}", bak.display())),
+                                false,
+                            )
+                        }
+                        Err(be) => {
+                            log::error!("备份主机配置到 {bak:?} 失败：{be}");
+                            log::error!("主机配置加载失败，已禁止覆盖原文件：{e}");
+                            (
+                                HostConfig::default(),
+                                Some(format!(
+                                    "主机配置读取失败且备份失败，已禁止覆盖原文件：{be}"
+                                )),
+                                true,
+                            )
+                        }
                     }
-                    log::error!("主机配置加载失败（原文已备份为 {bak:?}）：{e}");
+                } else {
+                    log::error!("主机配置加载失败，已禁止覆盖原文件：{e}");
+                    (
+                        HostConfig::default(),
+                        Some(format!("主机配置读取失败，已禁止覆盖原文件：{e}")),
+                        true,
+                    )
                 }
-                (HostConfig::default(), existed)
             }
         };
 
@@ -509,6 +536,7 @@ impl MinoApp {
             last_ctx: cc.egui_ctx.clone(),
             config,
             config_path,
+            config_write_blocked,
             show_new_conn: false,
             form: ConnectForm::default(),
             pending: None,
@@ -531,8 +559,8 @@ impl MinoApp {
             perf: crate::perf::PerfStats::new(),
         };
         // 启动时自动检查更新（后台线程，延迟 3 秒，静默）。
-        if load_error {
-            app.show_toast("主机配置读取失败，原文已备份为 hosts.toml.bak", true);
+        if let Some(message) = load_message {
+            app.show_toast(message, true);
         }
         app.start_update_check(true, &ctx);
         // 初始一个本地终端 tab；设置改弹窗（`show_settings`）。
@@ -868,10 +896,19 @@ impl MinoApp {
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 
-    /// 保存主机配置到磁盘。
-    fn save_config(&self) {
-        if let Err(e) = self.config.save(&self.config_path) {
-            log::warn!("保存主机配置失败：{e}");
+    /// 保存主机配置到磁盘，并把失败反馈给用户。
+    fn save_config(&mut self) -> bool {
+        if self.config_write_blocked {
+            self.show_toast("主机配置保存已阻止：原文件未能备份", true);
+            return false;
+        }
+        match self.config.save(&self.config_path) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("保存主机配置失败：{e}");
+                self.show_toast(format!("保存主机配置失败：{e}"), true);
+                false
+            }
         }
     }
 
@@ -1679,9 +1716,11 @@ impl MinoApp {
             self.start_connect(ui.ctx(), profile);
         }
         if let Some(i) = remove_idx {
-            self.config.hosts.remove(i);
+            let removed = self.config.hosts.remove(i);
             self.selected_host = None;
-            self.save_config();
+            if !self.save_config() {
+                self.config.hosts.insert(i, removed);
+            }
         }
     }
 
@@ -1927,7 +1966,10 @@ impl MinoApp {
             });
         if let Some(profile) = to_connect {
             self.config.hosts.push(profile.clone());
-            self.save_config();
+            let saved = self.save_config();
+            if !saved {
+                self.config.hosts.pop();
+            }
             self.show_new_conn = false;
             self.show_settings = false;
             self.form.name_focused = false;
