@@ -15,10 +15,31 @@ SSHD_PID=/tmp/mino-test-sshd/sshd.pid
 SSHD_LOG=/tmp/mino-test-sshd/sshd.log
 PORT=${MINO_TEST_PORT:-2222}
 
+process_command() {
+    ps -p "$1" -o command= 2>/dev/null | sed 's/^[[:space:]]*//'
+}
+
+is_test_sshd_pid() {
+    local pid="$1"
+    local command
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    command="$(process_command "$pid")"
+    [ -n "$command" ] && printf '%s\n' "$command" | grep -Fq -- "$SSHD_CONFIG"
+}
+
 start() {
-    if [ -f "$SSHD_PID" ] && kill -0 "$(cat "$SSHD_PID")" 2>/dev/null; then
-        echo "测试 sshd 已在运行（PID $(cat "$SSHD_PID")）"
-        return 0
+    if [ -f "$SSHD_PID" ]; then
+        pid="$(cat "$SSHD_PID" 2>/dev/null || true)"
+        if kill -0 "$pid" 2>/dev/null; then
+            if is_test_sshd_pid "$pid"; then
+                echo "测试 sshd 已在运行（PID $pid）"
+                return 0
+            fi
+            echo "警告：pidfile 指向非测试 sshd 进程，已移除过期 pidfile（PID $pid）" >&2
+        fi
+        rm -f "$SSHD_PID"
     fi
 
     mkdir -p /tmp/mino-test-sshd
@@ -72,23 +93,50 @@ EOF
 }
 
 stop() {
-    if [ -f "$SSHD_PID" ]; then
-        kill "$(cat "$SSHD_PID")" 2>/dev/null || true
-        rm -f "$SSHD_PID"
-        echo "测试 sshd 已停止"
-    else
+    if [ ! -f "$SSHD_PID" ]; then
         echo "测试 sshd 未在运行"
+        return 0
     fi
-    # 清理残留的测试会话
-    pkill -f "sshd-session:.*@ttys" 2>/dev/null || true
+
+    pid="$(cat "$SSHD_PID" 2>/dev/null || true)"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$SSHD_PID"
+        echo "测试 sshd 未在运行"
+        return 0
+    fi
+    if ! is_test_sshd_pid "$pid"; then
+        echo "错误：pidfile 指向非测试 sshd 进程，拒绝停止（PID $pid）" >&2
+        rm -f "$SSHD_PID"
+        return 1
+    fi
+
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    # 只有进程仍匹配本测试配置时才允许强制终止，避免 PID 复用误杀。
+    if kill -0 "$pid" 2>/dev/null && is_test_sshd_pid "$pid"; then
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$SSHD_PID"
+    echo "测试 sshd 已停止"
 }
 
 status() {
-    if [ -f "$SSHD_PID" ] && kill -0 "$(cat "$SSHD_PID")" 2>/dev/null; then
-        printf "运行中（PID %s，端口 %s）\n" "$(cat "$SSHD_PID")" "$PORT"
-    else
+    if [ ! -f "$SSHD_PID" ]; then
         echo "未运行"
+        return 0
     fi
+    pid="$(cat "$SSHD_PID" 2>/dev/null || true)"
+    if kill -0 "$pid" 2>/dev/null && is_test_sshd_pid "$pid"; then
+        printf "运行中（PID %s，端口 %s）\n" "$pid" "$PORT"
+        return 0
+    fi
+    echo "未运行（pidfile 过期或不是测试 sshd）"
+    return 1
 }
 
 case "${1:-}" in
