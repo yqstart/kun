@@ -200,15 +200,24 @@ pub struct Theme {
     pub term_palette: [Rgb; 16],
 }
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 static CURRENT_THEME: AtomicUsize = AtomicUsize::new(0);
+static THEME_REVISION: AtomicU64 = AtomicU64::new(0);
 
 pub fn current_theme() -> &'static Theme {
     &THEMES[CURRENT_THEME.load(Ordering::Relaxed)]
 }
 
+/// 当前主题修订号；主题改变时递增，供终端等缓存消费者失效。
+pub fn theme_revision() -> u64 {
+    THEME_REVISION.load(Ordering::Acquire)
+}
+
 pub fn set_theme(ctx: &Context, index: usize) {
-    CURRENT_THEME.store(index.min(THEMES.len() - 1), Ordering::Relaxed);
+    let index = index.min(THEMES.len() - 1);
+    if CURRENT_THEME.swap(index, Ordering::AcqRel) != index {
+        THEME_REVISION.fetch_add(1, Ordering::AcqRel);
+    }
     apply_theme(ctx, current_theme());
 }
 

@@ -129,6 +129,8 @@ pub struct TerminalView {
     rows: u16,
     /// 上次渲染时的 pixels_per_point（Galley 与其绑定，变化需全量失效）。
     last_ppp: f32,
+    /// 上次渲染时的主题修订号（主题切换后 Galley/背景均需失效）。
+    last_theme_revision: u64,
     focus_id: egui::Id,
     initialized: bool,
     last_mode: TermMode,
@@ -191,6 +193,7 @@ impl TerminalView {
             cols: 80,
             rows: 24,
             last_ppp: 0.0,
+            last_theme_revision: crate::theme::theme_revision(),
             focus_id: egui::Id::new("terminal_view"),
             initialized: false,
             last_mode: TermMode::NONE,
@@ -265,6 +268,13 @@ impl TerminalView {
     pub fn show(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let term_arc = self.session.term();
+
+        // 主题会改变默认前景、基本色和终端背景；旧 Galley 与背景段不能跨主题复用。
+        let theme_revision = crate::theme::theme_revision();
+        if self.last_theme_revision != theme_revision {
+            self.rows_cache.clear();
+            self.last_theme_revision = theme_revision;
+        }
 
         // 终端区域背景（当前主题的终端色）。
         // 注意：用 max_rect（布局分配区域）而非 min_rect（已用内容包围盒，
