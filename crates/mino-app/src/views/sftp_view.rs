@@ -7,6 +7,7 @@ use tokio::sync::mpsc::Receiver;
 /// 传输任务（进度条显示）。
 #[derive(Clone)]
 struct Transfer {
+    id: u64,
     label: String,
     done: u64,
     total: u64,
@@ -179,11 +180,9 @@ impl SftpView {
     }
 
     /// 记录一项传输，先于后台事件进入队列，保证上传区域立即出现。
-    fn begin_transfer(&mut self, label: String, total: u64) {
-        if self.transfers.iter().any(|item| item.label == label) {
-            return;
-        }
+    fn begin_transfer(&mut self, id: u64, label: String, total: u64) {
         self.transfers.push(Transfer {
+            id,
             label,
             done: 0,
             total,
@@ -209,12 +208,18 @@ impl SftpView {
                     }
                     self.loading = false;
                 }
-                SftpEvent::Progress { label, done, total } => {
-                    if let Some(t) = self.transfers.iter_mut().find(|t| t.label == label) {
+                SftpEvent::Progress {
+                    id,
+                    label,
+                    done,
+                    total,
+                } => {
+                    if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
                         t.done = done;
                         t.total = total;
                     } else {
                         self.transfers.push(Transfer {
+                            id,
                             label,
                             done,
                             total,
@@ -223,25 +228,39 @@ impl SftpView {
                         });
                     }
                 }
-                SftpEvent::Done { label } => {
-                    if let Some(t) = self.transfers.iter_mut().find(|t| t.label == label) {
-                        t.finished = true;
-                    } else {
-                        self.transfers.push(Transfer {
-                            label,
-                            done: 1,
-                            total: 1,
-                            finished: true,
-                            failed: false,
-                        });
+                SftpEvent::Done { id, label } => {
+                    if let Some(id) = id {
+                        if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
+                            t.finished = true;
+                        } else {
+                            self.transfers.push(Transfer {
+                                id,
+                                label,
+                                done: 1,
+                                total: 1,
+                                finished: true,
+                                failed: false,
+                            });
+                        }
                     }
                     // 操作完成后刷新目录。
                     self.handle.list(&self.current_path);
                 }
-                SftpEvent::Error { label, message } => {
+                SftpEvent::Error { id, label, message } => {
                     self.error = Some(format!("{label}：{message}"));
-                    if let Some(t) = self.transfers.iter_mut().find(|t| t.label == label) {
-                        t.failed = true;
+                    if let Some(id) = id {
+                        if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
+                            t.failed = true;
+                        } else {
+                            self.transfers.push(Transfer {
+                                id,
+                                label,
+                                done: 0,
+                                total: 0,
+                                finished: false,
+                                failed: true,
+                            });
+                        }
                     }
                     self.loading = false;
                 }
@@ -960,9 +979,9 @@ impl SftpView {
                 .unwrap_or_else(|| "file".to_string());
             let label = format!("上传 {name}");
             let total = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-            self.begin_transfer(label, total);
             let remote = self.join(&name);
-            self.handle.upload(&path, &remote);
+            let id = self.handle.upload(&path, &remote);
+            self.begin_transfer(id, label, total);
         }
     }
 
@@ -991,8 +1010,8 @@ impl SftpView {
             let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() else {
                 return;
             };
-            self.begin_transfer(format!("下载 {name}"), *size);
-            self.handle.download(&self.join(name), &path);
+            let id = self.handle.download(&self.join(name), &path);
+            self.begin_transfer(id, format!("下载 {name}"), *size);
             return;
         }
 
@@ -1000,8 +1019,8 @@ impl SftpView {
             return;
         };
         for (name, size) in files {
-            self.begin_transfer(format!("下载 {name}"), size);
-            self.handle.download(&self.join(&name), &folder.join(&name));
+            let id = self.handle.download(&self.join(&name), &folder.join(&name));
+            self.begin_transfer(id, format!("下载 {name}"), size);
         }
     }
 
@@ -1478,6 +1497,7 @@ mod tests {
         };
         event_tx
             .try_send(SftpEvent::Progress {
+                id: 1,
                 label: "上传 demo.bin".into(),
                 done: 512,
                 total: 1024,
@@ -1488,6 +1508,57 @@ mod tests {
         harness.run_steps(2);
         harness.get_by_label("上传进度");
         harness.get_by_label("上传 demo.bin");
+    }
+
+    #[test]
+    fn 相同文件名传输按标识隔离状态() {
+        let (event_tx, rx) = tokio::sync::mpsc::channel(128);
+        let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut view = SftpView::new("测试主机", SftpHandle::from_raw(handle_tx), rx);
+        event_tx
+            .try_send(SftpEvent::Progress {
+                id: 1,
+                label: "上传 same.bin".into(),
+                done: 10,
+                total: 100,
+            })
+            .unwrap();
+        event_tx
+            .try_send(SftpEvent::Progress {
+                id: 2,
+                label: "上传 same.bin".into(),
+                done: 20,
+                total: 200,
+            })
+            .unwrap();
+        event_tx
+            .try_send(SftpEvent::Done {
+                id: Some(1),
+                label: "上传 same.bin".into(),
+            })
+            .unwrap();
+        event_tx
+            .try_send(SftpEvent::Error {
+                id: Some(2),
+                label: "上传 same.bin".into(),
+                message: "失败".into(),
+            })
+            .unwrap();
+
+        assert!(view.poll_events());
+        assert_eq!(view.transfers.len(), 2);
+        let first = view
+            .transfers
+            .iter()
+            .find(|transfer| transfer.id == 1)
+            .unwrap();
+        assert!(first.finished && !first.failed && first.done == 10);
+        let second = view
+            .transfers
+            .iter()
+            .find(|transfer| transfer.id == 2)
+            .unwrap();
+        assert!(!second.finished && second.failed && second.done == 20);
     }
 
     /// ⌘⇧L 应直接发出当前终端目录的列表请求。
