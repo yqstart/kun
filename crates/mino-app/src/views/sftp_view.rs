@@ -60,6 +60,11 @@ pub struct SftpView {
     rx: Receiver<SftpEvent>,
     /// 当前远程路径。
     current_path: String,
+    /// SFTP 会话的初始目录，用于解析 `~` 和相对路径。
+    ///
+    /// SSH 终端和 SFTP 子系统可能由服务端映射到不同的当前目录；
+    /// 保留 SFTP 自己的 home，避免把终端侧的显示路径直接当成 SFTP 路径。
+    sftp_home: String,
     /// 当前目录条目。
     entries: Vec<RemoteEntry>,
     /// 选中条目（按当前目录顺序保存，支持 Shift/Cmd(Ctrl) 多选）。
@@ -78,6 +83,9 @@ pub struct SftpView {
     closed: bool,
     /// 等宽字符宽缓存（'0' 字符，数字等宽字体的真实字宽；字体启动时加载后不变）。
     cell_width: f32,
+    /// 上一次主键点击，用于可靠识别同一行的双击。
+    /// 不使用 egui 的全局 click_count，避免点击其它控件后计数污染。
+    last_primary_click: Option<(String, f64)>,
 }
 
 impl SftpView {
@@ -98,11 +106,13 @@ impl SftpView {
         } else {
             initial_path
         };
+        let initial_path = normalize_remote_path(initial_path);
         let view = Self {
             host_name: host_name.to_string(),
             handle,
             rx,
-            current_path: initial_path.to_string(),
+            current_path: initial_path.clone(),
+            sftp_home: initial_path.clone(),
             entries: Vec::new(),
             selected: Vec::new(),
             selection_anchor: None,
@@ -112,9 +122,10 @@ impl SftpView {
             error: None,
             closed: false,
             cell_width: 0.0,
+            last_primary_click: None,
         };
         // 初始列出 SFTP 会话的目录（通常与远程终端登录目录一致）。
-        view.handle.list(initial_path);
+        view.handle.list(&initial_path);
         view
     }
 
@@ -125,12 +136,63 @@ impl SftpView {
 
     /// 请求列出目录并清理已失效的选择状态。
     fn navigate_to(&mut self, path: &str) {
-        let path = if path.is_empty() { "/" } else { path };
-        self.handle.list(path);
+        let path = self.resolve_path(path);
+        self.current_path = path.clone();
+        self.handle.list(&path);
         self.loading = true;
         self.error = None;
+        // 切换目录期间不要继续绘制上一个目录的条目；旧条目会让地址栏、
+        // 加载提示和文件列表在两个异步帧之间上下跳动。
+        self.entries.clear();
         self.selected.clear();
         self.selection_anchor = None;
+        self.last_primary_click = None;
+    }
+
+    /// 将终端侧传来的路径转换成 SFTP 使用的规范 POSIX 路径。
+    ///
+    /// 终端目录来自输入模型，可能是 `~`、相对路径或包含 `.`/`..`；
+    /// SFTP 请求应始终使用绝对、归一化后的路径，否则某些服务端会把
+    /// 这类路径报成重复的 `No such file` 错误。
+    fn resolve_path(&self, path: &str) -> String {
+        let path = path.trim();
+        let path = if path == "~" {
+            self.sftp_home.as_str()
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            return normalize_remote_path(&format!("{}/{rest}", self.sftp_home));
+        } else if path.is_empty() {
+            "/"
+        } else {
+            path
+        };
+        if path.starts_with('/') {
+            normalize_remote_path(path)
+        } else {
+            normalize_remote_path(&format!("{}/{path}", self.current_path))
+        }
+    }
+
+    /// 判断同一行在短时间内的连续两次主键点击是否构成双击。
+    fn register_primary_click(
+        &mut self,
+        key: String,
+        modifiers: egui::Modifiers,
+        now: f64,
+    ) -> bool {
+        let plain_click = !modifiers.shift && !modifiers.command && !modifiers.ctrl;
+        let double_clicked = plain_click
+            && self
+                .last_primary_click
+                .as_ref()
+                .is_some_and(|(last_key, last_time)| {
+                    last_key == &key && now >= *last_time && now - *last_time <= 0.45
+                });
+        self.last_primary_click = if plain_click && !double_clicked {
+            Some((key, now))
+        } else {
+            None
+        };
+        double_clicked
     }
 
     /// 按文件管理器习惯更新选择：普通点击单选，Shift 选择范围，
@@ -199,8 +261,14 @@ impl SftpView {
             any = true;
             match event {
                 SftpEvent::Listed { path, entries } => {
-                    self.current_path = path;
+                    let path = normalize_remote_path(&path);
+                    // 列表是异步返回的。用户快速切换目录时，旧请求的结果
+                    // 不能覆盖当前页面，否则文件内容会先跳回旧目录再跳回来。
+                    if path != self.current_path {
+                        continue;
+                    }
                     self.entries = entries;
+                    self.error = None;
                     self.selected
                         .retain(|name| self.entries.iter().any(|entry| entry.name == *name));
                     if self.selected.is_empty() {
@@ -244,9 +312,22 @@ impl SftpView {
                         }
                     }
                     // 操作完成后刷新目录。
-                    self.handle.list(&self.current_path);
+                    let path = self.current_path.clone();
+                    self.handle.list(&path);
+                    self.loading = true;
                 }
-                SftpEvent::Error { id, label, message } => {
+                SftpEvent::Error {
+                    id,
+                    label,
+                    message,
+                    path,
+                } => {
+                    if path
+                        .as_deref()
+                        .is_some_and(|path| normalize_remote_path(path) != self.current_path)
+                    {
+                        continue;
+                    }
                     self.error = Some(format!("{label}：{message}"));
                     if let Some(id) = id {
                         if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
@@ -391,9 +472,16 @@ impl SftpView {
             // 整行点击区：显式 ui.interact + 稳定 Id，且必须在列内容
             // 之后注册（后注册 widget 在顶层；见条目行注释）。
             let response = ui.interact(row_rect, row_id, egui::Sense::click());
-            if response.clicked() {
+            if response.secondary_clicked() {
+                self.last_primary_click = None;
+            } else if response.clicked() {
                 let parent = Self::parent_of(&self.current_path);
-                *open_dir = Some(parent);
+                let modifiers = response.ctx.input(|input| input.modifiers);
+                let now = response.ctx.input(|input| input.time);
+                if self.register_primary_click(format!("{}\0..", self.current_path), modifiers, now)
+                {
+                    *open_dir = Some(parent);
+                }
             }
             let parent = Self::parent_of(&self.current_path);
             response.context_menu(|ui| {
@@ -418,9 +506,7 @@ impl SftpView {
         } else {
             entry.name.clone()
         };
-        // 整行点击区：单击选中，再次单击已选中的目录进入下级目录
-        //（不用 double_clicked——egui 多击计数会被无关点击污染，
-        // 双击时灵时不灵）。
+        // 整行点击区：单击选中，双击目录进入下级目录。
         // 选中：accent 软底 + 左侧 accent 竖条；hover：白色低透明度
         // 叠加（Tabby 风，先画背景，列内容绘制在其上）。
         if selected {
@@ -513,19 +599,16 @@ impl SftpView {
         let response = ui.interact(row_rect, row_id, egui::Sense::click());
         let modifiers = response.ctx.input(|input| input.modifiers);
         if response.secondary_clicked() {
+            self.last_primary_click = None;
             self.update_secondary_selection(idx, &entry.name, modifiers);
         } else if response.clicked() {
-            let was_only_selected = self.selected.len() == 1
-                && self
-                    .selected
-                    .first()
-                    .is_some_and(|name| name == &entry.name);
-            if entry.is_dir
-                && was_only_selected
-                && !modifiers.shift
-                && !modifiers.command
-                && !modifiers.ctrl
-            {
+            let now = response.ctx.input(|input| input.time);
+            let double_clicked = self.register_primary_click(
+                format!("{}\0{}", self.current_path, entry.name),
+                modifiers,
+                now,
+            );
+            if entry.is_dir && double_clicked {
                 *open_dir = Some(self.join(&entry.name));
             } else {
                 self.update_selection(idx, &entry.name, modifiers);
@@ -780,15 +863,26 @@ impl SftpView {
             );
         });
 
-        // 加载中 / 空目录提示（滚动区外，随面板固定）。
+        // 加载提示占用固定高度：加载完成后只清空内容，不让文件列表整体
+        // 因提示行的出现/消失而上下跳动。
+        let loading_h = 20.0;
+        let (loading_rect, _) =
+            ui.allocate_exact_size(egui::vec2(table_width, loading_h), egui::Sense::hover());
         if self.loading {
-            ui.horizontal(|ui| {
-                // 静态指示点（不滚动动画）：egui `Spinner` 每帧 request_repaint
-                // 强制 60fps 全帧重绘（含终端全量扫描），静态点零重绘。
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 3.2, theme.accent2);
-                ui.label(RichText::new("加载中…").size(12.0).color(theme.text_muted));
-            });
+            let mut loading_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(loading_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            // 静态指示点（不滚动动画）：egui `Spinner` 每帧 request_repaint
+            // 强制 60fps 全帧重绘（含终端全量扫描），静态点零重绘。
+            let (dot, _) =
+                loading_ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+            loading_ui
+                .painter()
+                .circle_filled(dot.center(), 3.2, theme.accent2);
+            loading_ui.add_space(6.0);
+            loading_ui.label(RichText::new("加载中…").size(12.0).color(theme.text_muted));
         } else if self.entries.is_empty() {
             ui.add_space(14.0);
             ui.vertical_centered(|ui| {
@@ -913,6 +1007,7 @@ impl SftpView {
                 let path = self.current_path.clone();
                 self.handle.list(&path);
                 self.loading = true;
+                self.error = None;
             }
             ContextAction::Upload => self.upload_dialog(),
             ContextAction::Download(names) => self.download_selected(&names),
@@ -1249,6 +1344,34 @@ pub fn parent_of(path: &str) -> String {
     SftpView::parent_of(path)
 }
 
+/// 归一化远程 POSIX 路径。
+fn normalize_remote_path(path: &str) -> String {
+    let path = path.trim();
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+
+    if absolute {
+        if parts.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", parts.join("/"))
+        }
+    } else if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
 /// 路径拼接（供测试使用）。
 pub fn join_path(parent: &str, name: &str) -> String {
     if parent.ends_with('/') {
@@ -1361,6 +1484,7 @@ mod tests {
             handle,
             rx,
             current_path: "/".into(),
+            sftp_home: "/".into(),
             entries: vec![
                 RemoteEntry {
                     name: "Desktop".into(),
@@ -1385,6 +1509,7 @@ mod tests {
             error: None,
             closed: false,
             cell_width: 0.0,
+            last_primary_click: None,
         };
 
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
@@ -1424,6 +1549,7 @@ mod tests {
             handle,
             rx,
             current_path: "/".into(),
+            sftp_home: "/".into(),
             entries: vec![
                 RemoteEntry {
                     name: "a.txt".into(),
@@ -1455,6 +1581,7 @@ mod tests {
             error: None,
             closed: false,
             cell_width: 0.0,
+            last_primary_click: None,
         };
         let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
         harness.run();
@@ -1485,6 +1612,7 @@ mod tests {
             handle,
             rx,
             current_path: "/home/test".into(),
+            sftp_home: "/home/test".into(),
             entries: Vec::new(),
             selected: vec![],
             selection_anchor: None,
@@ -1494,6 +1622,7 @@ mod tests {
             error: None,
             closed: false,
             cell_width: 0.0,
+            last_primary_click: None,
         };
         event_tx
             .try_send(SftpEvent::Progress {
@@ -1542,6 +1671,7 @@ mod tests {
                 id: Some(2),
                 label: "上传 same.bin".into(),
                 message: "失败".into(),
+                path: None,
             })
             .unwrap();
 
@@ -1574,6 +1704,7 @@ mod tests {
             handle,
             rx,
             current_path: "/".into(),
+            sftp_home: "/".into(),
             entries: Vec::new(),
             selected: vec![],
             selection_anchor: None,
@@ -1583,6 +1714,7 @@ mod tests {
             error: None,
             closed: false,
             cell_width: 0.0,
+            last_primary_click: None,
         };
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
             view.show_with_terminal_cwd(ui, Some("/srv/project"));
@@ -1618,6 +1750,7 @@ mod tests {
             handle,
             rx,
             current_path: "/".into(),
+            sftp_home: "/".into(),
             entries: Vec::new(),
             selected: vec![],
             selection_anchor: None,
@@ -1627,6 +1760,7 @@ mod tests {
             error: None,
             closed: false,
             cell_width: 0.0,
+            last_primary_click: None,
         };
         let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
         harness.run_steps(2);
@@ -1650,6 +1784,7 @@ mod tests {
             handle,
             rx,
             current_path: "/very/long/remote/path/that/overflows/".into(),
+            sftp_home: "/very/long/remote/path/that/overflows/".into(),
             entries: Vec::new(),
             selected: vec![],
             selection_anchor: None,
@@ -1659,6 +1794,7 @@ mod tests {
             error: None,
             closed: false,
             cell_width: 0.0,
+            last_primary_click: None,
         };
 
         // 模拟 340 宽面板（app.rs sftp_frame 左右内边距各 12；默认宽为
@@ -1676,15 +1812,15 @@ mod tests {
         harness.get_by_label("..");
     }
 
-    /// 单击选中，再次单击已选中的目录进入下级目录（发 List 命令）。
-    /// 回归：曾用 response.double_clicked()，egui 多击计数被无关点击
-    /// 污染导致"点击文件夹进不去"。
+    /// 单击选中，双击目录进入下级目录（发 List 命令）。
+    /// 回归：点击目录不应在单击时导航，也不能依赖会被其它控件污染的
+    /// egui 全局 click_count。
     #[test]
     fn 单击选中再次单击进入目录() {
         use kittest::Queryable;
         use mino_core::ssh::sftp::SftpCmd;
 
-        let (_tx, rx) = tokio::sync::mpsc::channel(128);
+        let (event_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
         let mut view = SftpView {
@@ -1692,6 +1828,7 @@ mod tests {
             handle,
             rx,
             current_path: "/".into(),
+            sftp_home: "/".into(),
             entries: vec![
                 RemoteEntry {
                     name: "workspace".into(),
@@ -1716,23 +1853,25 @@ mod tests {
             error: None,
             closed: false,
             cell_width: 0.0,
+            last_primary_click: None,
         };
 
-        let mut harness = egui_kittest::Harness::new_ui(|ui| {
-            view.show(ui);
-        });
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(0.1)
+            .build_ui(|ui| {
+                view.show(ui);
+            });
         harness.run();
 
         // 第一次单击：只选中，不进入目录。
         harness.get_by_label("workspace/").click();
-        harness.run();
+        harness.run_steps(1);
         assert!(
             cmd_rx.try_recv().is_err(),
             "第一次单击只应选中，不应发出进入目录命令"
         );
 
-        // 再次单击同一目录 → 进入下级目录。进入后 loading=true 出现
-        // spinner 持续重绘，harness.run() 会超 max_steps，用显式步进。
+        // 第二次连续单击同一目录 → 进入下级目录。
         harness.get_by_label("workspace/").click();
         harness.run_steps(6);
         let cmd = cmd_rx.try_recv().expect("再次单击应发出进入目录命令");
@@ -1741,15 +1880,72 @@ mod tests {
             "进入的路径应为 /workspace，收到 {cmd:?}"
         );
 
+        event_tx
+            .try_send(SftpEvent::Listed {
+                path: "/workspace".into(),
+                entries: vec![RemoteEntry {
+                    name: "notes.txt".into(),
+                    is_dir: false,
+                    size: 12,
+                    modified: None,
+                    permissions: 0,
+                }],
+            })
+            .unwrap();
+        harness.run_steps(2);
+
         // 文件不受影响：单击两次也只是选中，不导航。
-        //（进入目录后 loading 一直为 true，全程用显式步进。）
         harness.get_by_label("notes.txt").click();
-        harness.run_steps(6);
+        harness.run_steps(1);
         harness.get_by_label("notes.txt").click();
-        harness.run_steps(6);
+        harness.run_steps(1);
         assert!(
             cmd_rx.try_recv().is_err(),
             "文件不应发出任何命令（无目录可进）"
+        );
+    }
+
+    #[test]
+    fn 双击上级目录回退() {
+        use kittest::Queryable;
+        use mino_core::ssh::sftp::SftpCmd;
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(128);
+        let (handle_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_raw(handle_tx);
+        let mut view = SftpView {
+            host_name: "测试主机".into(),
+            handle,
+            rx,
+            current_path: "/workspace/logs".into(),
+            sftp_home: "/workspace/logs".into(),
+            entries: Vec::new(),
+            selected: vec![],
+            selection_anchor: None,
+            loading: false,
+            transfers: Vec::new(),
+            dialog: None,
+            error: None,
+            closed: false,
+            cell_width: 0.0,
+            last_primary_click: None,
+        };
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(0.1)
+            .build_ui(|ui| view.show(ui));
+        harness.run();
+
+        harness.get_by_label("..").click();
+        harness.run_steps(1);
+        assert!(cmd_rx.try_recv().is_err(), "单击 .. 不应回退目录");
+
+        harness.get_by_label("..").click();
+        harness.run_steps(4);
+        let cmd = cmd_rx.try_recv().expect("双击 .. 应发出回退请求");
+        assert!(
+            matches!(&cmd, SftpCmd::List { path } if path == "/workspace"),
+            "回退路径应为 /workspace，收到 {cmd:?}"
         );
     }
 
@@ -1761,6 +1957,92 @@ mod tests {
         assert_eq!(parent_of("/home/user"), "/home");
         assert_eq!(parent_of("/home"), "/");
         assert_eq!(parent_of("/"), "/");
+        assert_eq!(normalize_remote_path("/home/./user/../user/"), "/home/user");
+        assert_eq!(normalize_remote_path("//home//user"), "/home/user");
+    }
+
+    #[test]
+    fn 导航加载期间清空旧列表并忽略旧结果() {
+        let (event_tx, rx) = tokio::sync::mpsc::channel(128);
+        let (handle_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_raw(handle_tx);
+        let mut view = SftpView {
+            host_name: "测试主机".into(),
+            handle,
+            rx,
+            current_path: "/home".into(),
+            sftp_home: "/home".into(),
+            entries: vec![RemoteEntry {
+                name: "old.txt".into(),
+                is_dir: false,
+                size: 1,
+                modified: None,
+                permissions: 0,
+            }],
+            selected: vec!["old.txt".into()],
+            selection_anchor: Some("old.txt".into()),
+            loading: false,
+            transfers: Vec::new(),
+            dialog: None,
+            error: None,
+            closed: false,
+            cell_width: 0.0,
+            last_primary_click: None,
+        };
+
+        view.navigate_to("/home/./workspace/../workspace");
+        assert_eq!(view.current_path, "/home/workspace");
+        assert!(view.entries.is_empty());
+        assert!(view.selected.is_empty());
+        assert!(view.loading);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(mino_core::ssh::sftp::SftpCmd::List { path }) if path == "/home/workspace"
+        ));
+
+        event_tx
+            .try_send(SftpEvent::Listed {
+                path: "/home".into(),
+                entries: vec![RemoteEntry {
+                    name: "stale.txt".into(),
+                    is_dir: false,
+                    size: 1,
+                    modified: None,
+                    permissions: 0,
+                }],
+            })
+            .unwrap();
+        assert!(view.poll_events());
+        assert!(view.entries.is_empty(), "旧目录结果不能回写当前页面");
+        assert!(view.loading);
+
+        event_tx
+            .try_send(SftpEvent::Error {
+                id: None,
+                label: "列出目录".into(),
+                message: "No such file: No such file".into(),
+                path: Some("/home".into()),
+            })
+            .unwrap();
+        assert!(view.poll_events());
+        assert!(view.error.is_none(), "旧目录错误不能污染当前页面");
+        assert!(view.loading);
+
+        event_tx
+            .try_send(SftpEvent::Listed {
+                path: "/home/workspace".into(),
+                entries: vec![RemoteEntry {
+                    name: "new.txt".into(),
+                    is_dir: false,
+                    size: 2,
+                    modified: None,
+                    permissions: 0,
+                }],
+            })
+            .unwrap();
+        assert!(view.poll_events());
+        assert_eq!(view.entries[0].name, "new.txt");
+        assert!(!view.loading);
     }
 
     /// 文件列表列对齐：大小/时间列位置固定，不随名称长度漂移；
@@ -1778,6 +2060,7 @@ mod tests {
             handle,
             rx,
             current_path: "/".into(),
+            sftp_home: "/".into(),
             entries: vec![
                 RemoteEntry {
                     name: "defaultUploadFolder".into(),
@@ -1802,6 +2085,7 @@ mod tests {
             error: None,
             closed: false,
             cell_width: 0.0,
+            last_primary_click: None,
         };
 
         let mut harness = egui_kittest::Harness::new_ui(|ui| {

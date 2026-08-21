@@ -10,33 +10,33 @@ use egui::{Color32, Context, CornerRadius, Stroke, Visuals};
 pub mod tokens {
     use egui::Color32;
 
-    // ==================== 背景分层（Mino 深空控制台） ====================
-    // 视觉层级从“灰色面板堆叠”改为深空底 + 蓝紫表面 + 细微青色边界，
-    // 让设置、主机卡片与终端属于同一套界面语言。
-    pub const BG_APP: Color32 = Color32::from_rgb(0x07, 0x10, 0x1d);
-    pub const BG_HEADER: Color32 = Color32::from_rgb(0x06, 0x0d, 0x18);
-    pub const BG_PANEL: Color32 = Color32::from_rgb(0x0d, 0x1a, 0x2b);
-    pub const BG_ELEVATED: Color32 = Color32::from_rgb(0x12, 0x24, 0x3a);
-    pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x06, 0x0e, 0x1a);
+    // ==================== 背景分层（Mino 紫夜控制台） ====================
+    // 默认皮肤以深紫为底，使用低饱和的薰衣草色做层级和交互提示，
+    // 让设置、主机卡片与终端有统一且更安静的视觉重心。
+    pub const BG_APP: Color32 = Color32::from_rgb(0x0c, 0x09, 0x18);
+    pub const BG_HEADER: Color32 = Color32::from_rgb(0x09, 0x07, 0x13);
+    pub const BG_PANEL: Color32 = Color32::from_rgb(0x15, 0x10, 0x27);
+    pub const BG_ELEVATED: Color32 = Color32::from_rgb(0x1d, 0x16, 0x35);
+    pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x08, 0x07, 0x11);
 
     pub const BORDER_SUBTLE: Color32 =
-        Color32::from_rgba_unmultiplied_const(0x72, 0xc9, 0xe8, 0x25);
-    pub const GRID_LINE: Color32 = Color32::from_rgba_unmultiplied_const(0x68, 0xc8, 0xe8, 0x07);
+        Color32::from_rgba_unmultiplied_const(0xa7, 0x8b, 0xfa, 0x2d);
+    pub const GRID_LINE: Color32 = Color32::from_rgba_unmultiplied_const(0xa7, 0x8b, 0xfa, 0x0c);
 
-    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xe6, 0xf4, 0xff);
-    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xa5, 0xbd, 0xd2);
-    pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x62, 0x7d, 0x98);
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xf2, 0xef, 0xff);
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xbd, 0xb2, 0xda);
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x81, 0x75, 0x9f);
 
-    // Mino 品牌强调色：冷青作为主动作，紫色作为状态/层级辅助。
-    pub const ACCENT: Color32 = Color32::from_rgb(0x65, 0xe4, 0xff);
-    pub const ACCENT_2: Color32 = Color32::from_rgb(0xa7, 0x8b, 0xfa);
-    pub const ACCENT_SOFT: Color32 = Color32::from_rgba_unmultiplied_const(0x65, 0xe4, 0xff, 0x25);
+    // Mino 品牌强调色：紫罗兰作为主动作，柔和的薰衣草作为层级辅助。
+    pub const ACCENT: Color32 = Color32::from_rgb(0xa7, 0x8b, 0xfa);
+    pub const ACCENT_2: Color32 = Color32::from_rgb(0xd5, 0xa6, 0xff);
+    pub const ACCENT_SOFT: Color32 = Color32::from_rgba_unmultiplied_const(0xa7, 0x8b, 0xfa, 0x2c);
     pub const ACCENT_FG: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
-    pub const FOCUS_RING: Color32 = Color32::from_rgba_unmultiplied_const(0x65, 0xe4, 0xff, 0x90);
+    pub const FOCUS_RING: Color32 = Color32::from_rgba_unmultiplied_const(0xa7, 0x8b, 0xfa, 0xa0);
 
-    pub const SUCCESS: Color32 = Color32::from_rgb(0x5c, 0xb8, 0x5c);
-    pub const WARNING: Color32 = Color32::from_rgb(0xf0, 0xad, 0x4e);
-    pub const DANGER: Color32 = Color32::from_rgb(0xd9, 0x53, 0x4f);
+    pub const SUCCESS: Color32 = Color32::from_rgb(0x78, 0xd6, 0xae);
+    pub const WARNING: Color32 = Color32::from_rgb(0xf1, 0xc2, 0x75);
+    pub const DANGER: Color32 = Color32::from_rgb(0xf0, 0x7a, 0x9b);
 
     pub const RADIUS_SM: f32 = 9.0;
     pub const RADIUS_ITEM: f32 = 7.0;
@@ -132,14 +132,14 @@ pub const TERM_FG: Rgb = Rgb {
     b: 0xe4,
 };
 pub const TERM_BG: Rgb = Rgb {
-    r: 0x0b,
-    g: 0x10,
-    b: 0x16,
+    r: 0x09,
+    g: 0x08,
+    b: 0x13,
 };
 pub const TERM_CURSOR: Rgb = Rgb {
-    r: 0xf2,
-    g: 0xf5,
-    b: 0xf8,
+    r: 0xf4,
+    g: 0xec,
+    b: 0xff,
 };
 
 /// xterm 256 色表固定部分（index ≥ 16：216 立方色 + 24 灰阶，与主题调色板无关）。

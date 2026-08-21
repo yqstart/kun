@@ -108,6 +108,8 @@ pub enum SftpEvent {
         id: Option<u64>,
         label: String,
         message: String,
+        /// 目录列表失败时携带请求路径，避免旧请求的错误污染当前页面。
+        path: Option<String>,
     },
     /// 连接关闭。
     Closed,
@@ -295,6 +297,7 @@ async fn sftp_main(
                                 id: None,
                                 label: "列出目录".into(),
                                 message: e,
+                                path: Some(path),
                             })
                             .await;
                     }
@@ -323,6 +326,7 @@ async fn sftp_main(
                                 id: Some(id),
                                 label,
                                 message: e,
+                                path: None,
                             })
                             .await;
                     }
@@ -351,6 +355,7 @@ async fn sftp_main(
                                 id: Some(id),
                                 label,
                                 message: e,
+                                path: None,
                             })
                             .await;
                     }
@@ -379,6 +384,7 @@ async fn sftp_main(
                                 id: None,
                                 label,
                                 message: e.to_string(),
+                                path: None,
                             })
                             .await;
                     }
@@ -396,6 +402,7 @@ async fn sftp_main(
                                 id: None,
                                 label,
                                 message: e.to_string(),
+                                path: None,
                             })
                             .await;
                     }
@@ -413,6 +420,7 @@ async fn sftp_main(
                                 id: None,
                                 label,
                                 message: e.to_string(),
+                                path: None,
                             })
                             .await;
                     }

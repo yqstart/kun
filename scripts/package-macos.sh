@@ -5,7 +5,7 @@
 # dmg 内含 Mino.app + Applications 快捷方式（拖拽即安装，与常规 macOS 应用一致）。
 set -e
 
-VERSION="${1:-0.1.1}"
+VERSION="${1:-0.1.2}"
 ARCH="${2:-arm64}"
 BIN="target/release/mino-app"
 APP_NAME="Mino"

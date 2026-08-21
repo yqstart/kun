@@ -2,11 +2,11 @@
 
 pub mod anim;
 mod app;
-pub mod completion;
 mod native;
 pub mod perf;
 pub mod theme;
 pub mod views;
+mod workdir;
 
 use app::{MinoApp, PRODUCT_NAME};
 use eframe::egui;
@@ -179,11 +179,11 @@ fn main() -> eframe::Result {
         .with_title(PRODUCT_NAME)
         // 保留 macOS 的 Titled 窗口样式，避免无边框窗口退出时触发 AppKit 的
         // NSTouchBarFinderObservation 崩溃；标题栏本身仍做成透明并与内容重叠，
-        // 外观继续由应用自绘。
+        // 红绿灯使用 macOS 原生按钮，保证悬浮图标与其他应用一致。
         .with_decorations(true)
         .with_fullsize_content_view(true)
         .with_title_shown(false)
-        .with_titlebar_buttons_shown(false)
+        .with_titlebar_buttons_shown(true)
         .with_titlebar_shown(false);
     // 设置应用图标（macOS Dock 图标由 eframe 运行时写入 NSApp）。
     if let Some(icon) = load_icon() {
