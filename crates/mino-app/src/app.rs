@@ -197,6 +197,10 @@ pub struct MinoApp {
     manual_update: bool,
     /// 安装脚本已启动，到该时间点关闭应用重启。
     restart_at: Option<f64>,
+    /// 安装脚本状态文件路径（原子写入后由 UI 轮询）。
+    install_result_path: Option<PathBuf>,
+    /// 安装脚本启动时间，用于检测脚本无响应。
+    install_started_at: Option<f64>,
     /// 性能 HUD 是否显示（`⌥P` 切换；默认关闭，不影响测试截图）。
     show_perf_hud: bool,
     /// 帧耗时统计（UI 线程打点）。
@@ -403,13 +407,24 @@ fn temp_dmg_path(file_name: &str, sequence: u64) -> PathBuf {
         .join(format!("{file_name}.{sequence}.part"))
 }
 
-/// 安装脚本：挂载 dmg → 等待主程序退出 → 替换 .app → 重启。
-/// 优先安装到 /Applications，失败回退 ~/Applications。
+/// 安装脚本：挂载 dmg → 与应用握手 → 等待主程序退出 → 替换 .app → 重启。
+/// 优先安装到 /Applications，失败回退 ~/Applications。第三个参数是状态文件，
+/// 使用临时文件 + mv 原子写入，避免 UI 读到半行状态。
 const INSTALL_SCRIPT: &str = r#"#!/bin/sh
 set -u
 DMG="$1"
 MOUNT="$2"
+RESULT="$3"
 FINAL=""
+RESULT_TMP="$RESULT.$$"
+write_result() {
+  printf '%s\n' "$1" > "$RESULT_TMP" 2>/dev/null || return 0
+  mv -f "$RESULT_TMP" "$RESULT" 2>/dev/null || true
+}
+fail() {
+  write_result "error:$1"
+  exit 1
+}
 install() {
   TARGET="$1"
   OLD="$TARGET.old"
@@ -426,21 +441,28 @@ install() {
   FINAL="$TARGET"
   return 0
 }
-mkdir -p "$MOUNT"
-hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT" >/dev/null 2>&1 || exit 1
+mkdir -p "$MOUNT" || fail "创建挂载目录失败"
+hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT" >/dev/null 2>&1 || fail "挂载 DMG 失败"
 SRC="$MOUNT/Mino.app"
-[ -d "$SRC" ] || { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; exit 2; }
+[ -d "$SRC" ] || { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; fail "DMG 中未找到 Mino.app"; }
+# 先通知应用已完成挂载和源文件校验；应用收到后退出，脚本再替换正在运行的旧版本。
+write_result "ready"
 i=0
 while [ $i -lt 50 ]; do
   if ! pgrep -x mino-app >/dev/null 2>&1; then break; fi
   sleep 0.2
   i=$((i+1))
 done
-install "/Applications/Mino.app" || install "$HOME/Applications/Mino.app" || { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; exit 3; }
+if pgrep -x mino-app >/dev/null 2>&1; then
+  hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true
+  fail "等待旧版本退出超时"
+fi
+install "/Applications/Mino.app" || install "$HOME/Applications/Mino.app" || { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; fail "替换应用失败"; }
 hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true
 rmdir "$MOUNT" 2>/dev/null || true
 rm -f "$DMG" 2>/dev/null
-open "$FINAL"
+open "$FINAL" || fail "启动新版本失败"
+write_result "success"
 "#;
 
 impl MinoApp {
@@ -503,6 +525,8 @@ impl MinoApp {
             download_sequence: 0,
             manual_update: false,
             restart_at: None,
+            install_result_path: None,
+            install_started_at: None,
             show_perf_hud: false,
             perf: crate::perf::PerfStats::new(),
         };
@@ -763,21 +787,76 @@ impl MinoApp {
 
     /// 启动安装脚本并安排重启。
     fn install_update(&mut self, ctx: &egui::Context, dmg_path: PathBuf) {
-        // 先切到"正在安装"（若脚本启动失败会退回错误态）。
-        if let UpdateState::Downloaded { info, .. } = &self.update_state {
-            self.update_state = UpdateState::Installing(info.clone());
-        }
-        let mount = std::env::temp_dir().join("mino-update").join("mount");
-        match launch_installer(&dmg_path, &mount) {
+        let UpdateState::Downloaded { info, .. } = &self.update_state else {
+            return;
+        };
+        let info = info.clone();
+        let dir = std::env::temp_dir().join("mino-update");
+        let sequence = self.download_sequence;
+        self.download_sequence = self.download_sequence.wrapping_add(1);
+        let mount = dir.join(format!("mount-{}-{sequence}", std::process::id()));
+        let result_path = dir.join(format!(
+            "install-result-{}-{sequence}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&result_path);
+        match launch_installer(&dmg_path, &mount, &result_path) {
             Ok(()) => {
-                self.update_state = UpdateState::Installed;
-                self.restart_at = Some(anim::now(ctx) + 0.9);
-                ctx.request_repaint_after(Duration::from_millis(50));
+                self.update_state = UpdateState::Installing(info);
+                self.install_result_path = Some(result_path);
+                self.install_started_at = Some(anim::now(ctx));
+                self.restart_at = None;
+                ctx.request_repaint_after(Duration::from_millis(100));
             }
             Err(e) => {
                 self.update_state = UpdateState::Error(format!("启动安装脚本失败：{e}"));
             }
         }
+    }
+
+    /// 轮询安装脚本状态；仅收到握手或最终成功状态后才安排退出。
+    fn poll_install(&mut self, ctx: &egui::Context) {
+        if !matches!(self.update_state, UpdateState::Installing(_)) {
+            return;
+        }
+        let Some(result_path) = self.install_result_path.clone() else {
+            self.update_state = UpdateState::Error("安装脚本缺少状态文件".into());
+            return;
+        };
+        let status = match std::fs::read_to_string(result_path) {
+            Ok(status) => status.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                self.update_state = UpdateState::Error(format!("读取安装状态失败：{e}"));
+                self.install_result_path = None;
+                self.install_started_at = None;
+                return;
+            }
+        };
+        if status == "ready" || status == "success" {
+            // ready 表示脚本已完成挂载与校验，应用退出后脚本才会继续替换旧版本。
+            self.update_state = UpdateState::Installed;
+            self.restart_at = Some(anim::now(ctx) + 0.9);
+            self.install_started_at = None;
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+        if let Some(message) = status.strip_prefix("error:") {
+            self.update_state = UpdateState::Error(format!("安装失败：{message}"));
+            self.install_result_path = None;
+            self.install_started_at = None;
+            return;
+        }
+        if self
+            .install_started_at
+            .is_some_and(|started| anim::now(ctx) - started > 120.0)
+        {
+            self.update_state = UpdateState::Error("安装脚本 120 秒内未返回状态".into());
+            self.install_result_path = None;
+            self.install_started_at = None;
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 
     /// 保存主机配置到磁盘。
@@ -2221,7 +2300,7 @@ impl MinoApp {
                     ui.horizontal(|ui| {
                         status_dot(ui, theme.success, false);
                         ui.label(
-                            egui::RichText::new("安装已启动，应用即将重启")
+                            egui::RichText::new("安装准备完成，应用即将退出并重启")
                                 .color(theme.success)
                                 .size(12.5),
                         );
@@ -2630,18 +2709,26 @@ fn fmt_bytes(n: u64) -> String {
 }
 
 /// 写安装脚本并启动（独立进程，应用退出后继续运行）。
-fn launch_installer(dmg: &Path, mount: &Path) -> Result<(), String> {
+fn launch_installer(dmg: &Path, mount: &Path, result_path: &Path) -> Result<(), String> {
     let dir = std::env::temp_dir().join("mino-update");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let script = dir.join("install.sh");
     std::fs::write(&script, INSTALL_SCRIPT).map_err(|e| e.to_string())?;
+    let log_path = dir.join(format!("install-{}.log", std::process::id()));
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|e| e.to_string())?;
+    let log_err = log.try_clone().map_err(|e| e.to_string())?;
     Command::new("/bin/sh")
         .arg(&script)
         .arg(dmg)
         .arg(mount)
+        .arg(result_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -2723,6 +2810,7 @@ impl eframe::App for MinoApp {
         self.poll_sftp();
         self.poll_update();
         self.poll_download(&ctx);
+        self.poll_install(&ctx);
 
         // ==================== 顶部标签页栏（合并了原 toolbar：齿轮入口在最右） ====================
         let theme = crate::theme::current_theme();
