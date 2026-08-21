@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use mino_core::config::{default_config_path, Auth, HostConfig, HostProfile};
@@ -534,7 +534,7 @@ impl MinoApp {
         if load_error {
             app.show_toast("主机配置读取失败，原文已备份为 hosts.toml.bak", true);
         }
-        app.start_update_check(true);
+        app.start_update_check(true, &ctx);
         // 初始一个本地终端 tab；设置改弹窗（`show_settings`）。
         app.new_local_tab(&ctx);
         app
@@ -634,16 +634,18 @@ impl MinoApp {
     }
 
     /// 启动后台更新检查（delay=true 时延迟 3 秒，避免影响启动）。
-    fn start_update_check(&mut self, delay: bool) {
+    fn start_update_check(&mut self, delay: bool, ctx: &egui::Context) {
         let (tx, rx) = std::sync::mpsc::channel();
         let current = env!("CARGO_PKG_VERSION").to_string();
         let arch = macos_arch().to_string();
+        let repaint_ctx = ctx.clone();
         std::thread::spawn(move || {
             if delay {
                 std::thread::sleep(Duration::from_secs(3));
             }
             let result = check_for_update(&current, mino_core::updater::DEFAULT_REPO, &arch);
             let _ = tx.send(result);
+            repaint_ctx.request_repaint();
         });
         self.update_rx = Some(rx);
         self.update_state = UpdateState::Checking;
@@ -685,7 +687,7 @@ impl MinoApp {
     }
 
     /// 开始下载更新资产。
-    fn start_download(&mut self, info: UpdateInfo) {
+    fn start_download(&mut self, info: UpdateInfo, ctx: &egui::Context) {
         self.cancel_download();
         let (tx, rx) = std::sync::mpsc::channel();
         let url = info.asset_url.clone();
@@ -695,7 +697,9 @@ impl MinoApp {
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
         let thread_dest = dest.clone();
+        let repaint_ctx = ctx.clone();
         std::thread::spawn(move || {
+            let mut last_repaint = Instant::now() - Duration::from_secs(1);
             let result = mino_core::updater::download_asset_with_cancel(
                 &url,
                 &thread_dest,
@@ -705,12 +709,17 @@ impl MinoApp {
                         downloaded: done,
                         total,
                     });
+                    if last_repaint.elapsed() >= Duration::from_millis(50) {
+                        repaint_ctx.request_repaint();
+                        last_repaint = Instant::now();
+                    }
                 },
             );
             if thread_cancel.load(Ordering::Relaxed) {
                 let _ = std::fs::remove_file(&thread_dest);
                 return;
             }
+            repaint_ctx.request_repaint();
             match result {
                 Ok(()) => {
                     let _ = tx.send(DownloadEvent::Done(thread_dest));
@@ -1219,7 +1228,7 @@ impl MinoApp {
                                             | UpdateState::Error(_)
                                     )
                                 {
-                                    self.start_update_check(false);
+                                    self.start_update_check(false, ctx);
                                 }
                             });
                             ui.add_space(8.0);
@@ -2391,13 +2400,13 @@ impl MinoApp {
 
         match action {
             Some(UpdateAction::Dismiss) => self.update_state = UpdateState::Idle,
-            Some(UpdateAction::StartDownload(info)) => self.start_download(info),
+            Some(UpdateAction::StartDownload(info)) => self.start_download(info, ctx),
             Some(UpdateAction::CancelDownload) => {
                 self.cancel_download();
                 self.update_state = UpdateState::Idle;
             }
             Some(UpdateAction::Install { dmg_path }) => self.install_update(ctx, dmg_path),
-            Some(UpdateAction::Retry) => self.start_update_check(false),
+            Some(UpdateAction::Retry) => self.start_update_check(false, ctx),
             None => {}
         }
     }
