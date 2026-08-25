@@ -2939,7 +2939,9 @@ impl eframe::App for MinoApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::P)) {
             self.show_perf_hud = !self.show_perf_hud;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N))
+            && !self.show_new_conn
+        {
             self.open_new_connection();
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T)) {
@@ -4419,6 +4421,17 @@ mod settings_tests {
         name_input.click();
         harness.run_steps(2);
         harness.event(egui::Event::Text("上一次连接".into()));
+        harness.run_steps(3);
+        assert_eq!(harness.state().form.name, "上一次连接");
+
+        // 弹窗已经打开时重复按 ⌘N 不应重置用户正在填写的表单。
+        harness.event(egui::Event::Key {
+            key: egui::Key::N,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
         harness.run_steps(3);
         assert_eq!(harness.state().form.name, "上一次连接");
 
