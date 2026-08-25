@@ -100,9 +100,12 @@ fn encode_char(c: char, mods: Mods) -> Option<Vec<u8>> {
         out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         return Some(out);
     }
-    // Ctrl 组合 → 控制字符。
+    // Ctrl 组合 → 控制字符；Alt+Ctrl 保留 Alt 的 ESC 前缀（xterm 语义）。
     if mods.ctrl {
         if let Some(ctrl) = ctrl_char(c) {
+            if mods.alt && !mods.super_ {
+                return Some(vec![0x1b, ctrl]);
+            }
             return Some(vec![ctrl]);
         }
         // 无法映射的控制组合丢弃（避免意外写入）。
@@ -270,6 +273,23 @@ mod tests {
         };
         let bytes = encode_key(Key::Char('x'), mods, TermMode::NONE).unwrap();
         assert_eq!(bytes, b"\x1bx");
+    }
+
+    #[test]
+    fn alt_ctrl保留转义前缀() {
+        let mods = Mods {
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(Key::Char('c'), mods, TermMode::NONE).unwrap(),
+            b"\x1b\x03"
+        );
+        assert_eq!(
+            encode_key(Key::Char('m'), mods, TermMode::NONE).unwrap(),
+            b"\x1b\r"
+        );
     }
 
     #[test]
