@@ -139,14 +139,11 @@ impl EventListener for Listener {
                     }
                     true
                 }
-                Event::Bell => {
-                    if pending.len() < MAX_PENDING_EVENTS {
-                        pending.push(SessionEvent::Bell);
-                        true
-                    } else {
-                        false
-                    }
+                Event::Bell if pending.len() < MAX_PENDING_EVENTS => {
+                    pending.push(SessionEvent::Bell);
+                    true
                 }
+                Event::Bell => false,
                 // 不要为未入队事件用 pending.last() 通知：队列已满时会
                 // 误重复通知上一次事件，造成无意义的重绘。
                 _ => false,
