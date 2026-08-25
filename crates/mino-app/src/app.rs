@@ -351,6 +351,27 @@ fn macos_arch() -> &'static str {
     }
 }
 
+/// 备份主机配置并强制 0600（备份可能含明文密码/私钥口令，而源文件
+/// 权限不可信——手建或旧版本可能是 0644，copy 会保留源权限位）。
+/// chmod 失败时删除备份并返回错误（宁可禁止覆盖原文件也不留明文副本）。
+#[cfg(unix)]
+fn backup_config(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::copy(src, dst)?;
+    match std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(dst);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn backup_config(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst).map(|_| ())
+}
+
 /// 更新工作目录：进程内复用同一私有目录（0700），目录名含 pid 与纳秒
 /// 时间戳不可预测。此前固定使用 `/tmp/mino-update`：/tmp 的 sticky 位
 /// 不保护子目录内容，其他本地用户可预建该目录（0777）后替换 install.sh
@@ -481,8 +502,8 @@ impl MinoApp {
                     (HostConfig::default(), None, false)
                 } else if existed {
                     let bak = config_path.with_extension("toml.bak");
-                    match std::fs::copy(&config_path, &bak) {
-                        Ok(_) => {
+                    match backup_config(&config_path, &bak) {
+                        Ok(()) => {
                             log::error!("主机配置加载失败（原文已备份为 {bak:?}）：{e}");
                             (
                                 HostConfig::default(),
@@ -3156,6 +3177,30 @@ mod tests {
         harness.get_by_label("本地终端");
         harness.get_by_label("状态栏");
         harness.get_by_label("终端区域");
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn 配置损坏备份强制0600() {
+        let src = test_config_path("backup-src");
+        let dst = src.with_extension("toml.bak");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+        std::fs::write(&src, "[broken").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        backup_config(&src, &dst).unwrap();
+        let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "配置备份必须以 0600 落盘");
+
+        std::fs::remove_file(&src).ok();
+        std::fs::remove_file(&dst).ok();
     }
 }
 
