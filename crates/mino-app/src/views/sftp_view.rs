@@ -296,7 +296,7 @@ impl SftpView {
                         });
                     }
                 }
-                SftpEvent::Done { id, label } => {
+                SftpEvent::Done { id, label, refresh } => {
                     if let Some(id) = id {
                         if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
                             t.finished = true;
@@ -311,10 +311,13 @@ impl SftpView {
                             });
                         }
                     }
-                    // 操作完成后刷新目录。
-                    let path = self.current_path.clone();
-                    self.handle.list(&path);
-                    self.loading = true;
+                    // 只有远程目录内容发生变化的操作才刷新列表；下载只写本地，
+                    // 不应触发批量传输中的重复 read_dir 与 loading 闪烁。
+                    if refresh {
+                        let path = self.current_path.clone();
+                        self.handle.list(&path);
+                        self.loading = true;
+                    }
                 }
                 SftpEvent::Error {
                     id,
@@ -1664,6 +1667,7 @@ mod tests {
             .try_send(SftpEvent::Done {
                 id: Some(1),
                 label: "上传 same.bin".into(),
+                refresh: true,
             })
             .unwrap();
         event_tx

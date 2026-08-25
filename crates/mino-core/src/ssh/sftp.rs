@@ -102,8 +102,12 @@ pub enum SftpEvent {
         done: u64,
         total: u64,
     },
-    /// 操作完成。
-    Done { id: Option<u64>, label: String },
+    /// 操作完成；`refresh` 表示远程当前目录内容发生变化，需要重新列目录。
+    Done {
+        id: Option<u64>,
+        label: String,
+        refresh: bool,
+    },
     /// 操作失败。
     Error {
         id: Option<u64>,
@@ -358,6 +362,7 @@ async fn sftp_main(
                             .send(SftpEvent::Done {
                                 id: Some(id),
                                 label,
+                                refresh: true,
                             })
                             .await;
                     }
@@ -387,6 +392,7 @@ async fn sftp_main(
                             .send(SftpEvent::Done {
                                 id: Some(id),
                                 label,
+                                refresh: false,
                             })
                             .await;
                     }
@@ -417,7 +423,13 @@ async fn sftp_main(
                 };
                 match result {
                     Ok(()) => {
-                        let _ = ev_tx.send(SftpEvent::Done { id: None, label }).await;
+                        let _ = ev_tx
+                            .send(SftpEvent::Done {
+                                id: None,
+                                label,
+                                refresh: true,
+                            })
+                            .await;
                     }
                     Err(e) => {
                         let _ = ev_tx
@@ -435,7 +447,13 @@ async fn sftp_main(
                 let label = format!("重命名 {}", from);
                 match sftp.rename(&from, &to).await {
                     Ok(()) => {
-                        let _ = ev_tx.send(SftpEvent::Done { id: None, label }).await;
+                        let _ = ev_tx
+                            .send(SftpEvent::Done {
+                                id: None,
+                                label,
+                                refresh: true,
+                            })
+                            .await;
                     }
                     Err(e) => {
                         let _ = ev_tx
@@ -453,7 +471,13 @@ async fn sftp_main(
                 let label = format!("新建目录 {}", path);
                 match sftp.create_dir(&path).await {
                     Ok(()) => {
-                        let _ = ev_tx.send(SftpEvent::Done { id: None, label }).await;
+                        let _ = ev_tx
+                            .send(SftpEvent::Done {
+                                id: None,
+                                label,
+                                refresh: true,
+                            })
+                            .await;
                     }
                     Err(e) => {
                         let _ = ev_tx
