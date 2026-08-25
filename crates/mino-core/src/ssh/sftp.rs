@@ -630,7 +630,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 关闭句柄置位取消标志并发送Shutdown() {
+    fn 关闭句柄置位取消标志并发送关闭命令() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(tx);
         handle.close();
