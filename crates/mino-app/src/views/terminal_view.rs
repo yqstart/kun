@@ -16,7 +16,7 @@ use alacritty_terminal::term::TermDamage;
 use alacritty_terminal::vte::ansi::{Color as AColor, CursorShape, NamedColor, Rgb};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, Rect, Stroke, TextFormat, Ui, Vec2};
-use mino_core::terminal::keys::{self, Key, Mods};
+use mino_core::terminal::keys::{self, Key, Mods, MouseWheelDirection};
 use mino_core::terminal::{Session, SessionEvent, TermMode};
 
 /// 行缓存：内容 hash 未变时复用已布局文本（Galley），避免每帧重建。
@@ -609,12 +609,12 @@ impl TerminalView {
             self.selecting = false;
         }
         if ui.memory(|m| m.has_focus(self.focus_id)) {
-            self.handle_input(ui);
+            self.handle_input(ui, inner);
         }
     }
 
     /// 处理键盘与鼠标输入（转发到 PTY / 网格滚动）。
-    fn handle_input(&mut self, ui: &Ui) {
+    fn handle_input(&mut self, ui: &Ui, inner: Rect) {
         let session = &self.session;
         let mode = self.last_mode;
         let cell_height = self.cell_height;
@@ -738,35 +738,96 @@ impl TerminalView {
                         modifiers,
                         ..
                     } => {
-                        let lines = match unit {
-                            egui::MouseWheelUnit::Point => (delta.y / (cell_height * 3.0)) as i32,
-                            egui::MouseWheelUnit::Line => delta.y as i32,
-                            egui::MouseWheelUnit::Page => {
-                                let term_arc = session.term();
-                                let mut guard = term_arc.lock();
-                                if delta.y > 0.0 {
-                                    guard.grid_mut().scroll_display(Scroll::PageUp);
-                                } else {
-                                    guard.grid_mut().scroll_display(Scroll::PageDown);
-                                }
-                                need_repaint = true;
-                                0
-                            }
+                        let Some(pointer) =
+                            i.pointer.hover_pos().filter(|pos| inner.contains(*pos))
+                        else {
+                            continue;
                         };
-                        if lines != 0 {
-                            let term_arc = session.term();
-                            let mut guard = term_arc.lock();
-                            let grid = guard.grid_mut();
-                            if modifiers.alt {
-                                if lines > 0 {
-                                    grid.scroll_display(Scroll::PageUp);
-                                } else {
-                                    grid.scroll_display(Scroll::PageDown);
+                        let Some(direction) = mouse_wheel_direction(delta.y) else {
+                            continue;
+                        };
+                        let steps = mouse_wheel_steps(*unit, delta.y, cell_height, self.rows);
+                        if steps == 0 {
+                            continue;
+                        }
+
+                        // 终端应用（如 Vim）先于本地 scrollback 取得滚轮：应用打开
+                        // DECSET 鼠标上报后，必须收到 xterm 鼠标按键序列才能处理滚动。
+                        match wheel_target(mode) {
+                            WheelTarget::ApplicationMouse => {
+                                let (column, row) = terminal_cell_from_screen(
+                                    pointer,
+                                    inner,
+                                    self.cell_width,
+                                    cell_height,
+                                    self.cols as usize,
+                                    self.rows as usize,
+                                );
+                                let mods = Mods {
+                                    shift: modifiers.shift,
+                                    alt: modifiers.alt,
+                                    ctrl: modifiers.ctrl,
+                                    super_: false,
+                                };
+                                let Some(bytes) =
+                                    keys::encode_mouse_wheel(direction, mods, mode, column, row)
+                                else {
+                                    continue;
+                                };
+                                for _ in 0..steps {
+                                    session.write(&bytes);
+                                    actions.push(InputAction::Bytes(bytes.clone()));
                                 }
-                            } else {
-                                grid.scroll_display(Scroll::Delta(lines));
                             }
-                            need_repaint = true;
+                            // 未启用鼠标上报的替代屏应用仍应遵循终端惯例，将滚轮
+                            // 映射为方向键（例如未设 mouse=a 的 Vim 或 less）。
+                            WheelTarget::AlternateScroll => {
+                                let key = match direction {
+                                    MouseWheelDirection::Up => Key::Up,
+                                    MouseWheelDirection::Down => Key::Down,
+                                };
+                                let Some(bytes) = keys::encode_key(key, Mods::default(), mode)
+                                else {
+                                    continue;
+                                };
+                                for _ in 0..steps {
+                                    session.write(&bytes);
+                                    actions.push(InputAction::Bytes(bytes.clone()));
+                                }
+                            }
+                            WheelTarget::Scrollback => {
+                                let lines = match unit {
+                                    egui::MouseWheelUnit::Point => {
+                                        (delta.y / (cell_height * 3.0)) as i32
+                                    }
+                                    egui::MouseWheelUnit::Line => delta.y as i32,
+                                    egui::MouseWheelUnit::Page => {
+                                        let term_arc = session.term();
+                                        let mut guard = term_arc.lock();
+                                        if delta.y > 0.0 {
+                                            guard.scroll_display(Scroll::PageUp);
+                                        } else {
+                                            guard.scroll_display(Scroll::PageDown);
+                                        }
+                                        need_repaint = true;
+                                        0
+                                    }
+                                };
+                                if lines != 0 {
+                                    let term_arc = session.term();
+                                    let mut guard = term_arc.lock();
+                                    if modifiers.alt {
+                                        if lines > 0 {
+                                            guard.scroll_display(Scroll::PageUp);
+                                        } else {
+                                            guard.scroll_display(Scroll::PageDown);
+                                        }
+                                    } else {
+                                        guard.scroll_display(Scroll::Delta(lines));
+                                    }
+                                    need_repaint = true;
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -906,6 +967,76 @@ enum InputAction {
 }
 
 // ==================== 辅助函数 ====================
+
+/// 滚轮事件的优先目标：全屏应用的鼠标协议优先于本地 scrollback。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelTarget {
+    ApplicationMouse,
+    AlternateScroll,
+    Scrollback,
+}
+
+fn wheel_target(mode: TermMode) -> WheelTarget {
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        WheelTarget::ApplicationMouse
+    } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        WheelTarget::AlternateScroll
+    } else {
+        WheelTarget::Scrollback
+    }
+}
+
+fn mouse_wheel_direction(delta_y: f32) -> Option<MouseWheelDirection> {
+    if delta_y > 0.0 {
+        Some(MouseWheelDirection::Up)
+    } else if delta_y < 0.0 {
+        Some(MouseWheelDirection::Down)
+    } else {
+        None
+    }
+}
+
+/// 一次 egui 滚轮事件应转换成多少个离散 xterm 滚轮按键。
+fn mouse_wheel_steps(
+    unit: egui::MouseWheelUnit,
+    delta_y: f32,
+    cell_height: f32,
+    rows: u16,
+) -> usize {
+    let magnitude = delta_y.abs();
+    if !magnitude.is_finite() || magnitude == 0.0 {
+        return 0;
+    }
+
+    let max_steps = usize::from(rows).max(1);
+    let steps = match unit {
+        // Point 事件可能小于一个 cell；xterm 滚轮是离散按钮，至少发一次，
+        // 避免触控板的小增量被全部截断。
+        egui::MouseWheelUnit::Point => (magnitude / (cell_height.max(1.0) * 3.0)).ceil(),
+        egui::MouseWheelUnit::Line => magnitude.ceil(),
+        egui::MouseWheelUnit::Page => max_steps as f32,
+    };
+    steps.max(1.0).min(max_steps as f32) as usize
+}
+
+/// 屏幕坐标 → 当前终端视口 cell 坐标（从零开始）。
+fn terminal_cell_from_screen(
+    pos: egui::Pos2,
+    inner: Rect,
+    cell_width: f32,
+    cell_height: f32,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize) {
+    let x = (pos.x - inner.left()).clamp(0.0, inner.width().max(0.0));
+    let y = (pos.y - inner.top()).clamp(0.0, inner.height().max(0.0));
+    let col = (x / cell_width.max(1.0)).floor() as usize;
+    let row = (y / cell_height.max(1.0)).floor() as usize;
+    (
+        col.min(cols.saturating_sub(1)),
+        row.min(rows.saturating_sub(1)),
+    )
+}
 
 /// 屏幕坐标 → 当前视口对应的网格坐标。
 fn selection_point_from_screen(
@@ -1729,7 +1860,9 @@ mod deadlock_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        // 注入滚轮事件（Point/Line/Page 三种单位）。
+        // 注入滚轮事件（Point/Line/Page 三种单位）。滚轮只在指针位于终端时处理。
+        harness.event(egui::Event::PointerMoved(egui::pos2(100.0, 100.0)));
+        harness.step();
         for unit in [
             egui::MouseWheelUnit::Point,
             egui::MouseWheelUnit::Line,
@@ -1745,6 +1878,45 @@ mod deadlock_tests {
             harness.step();
         }
         // 若修复失效，此处会在 10 秒死锁后 panic；到达这里说明通过。
+    }
+}
+
+#[cfg(test)]
+mod mouse_wheel_tests {
+    use super::*;
+
+    #[test]
+    fn 鼠标上报优先于替代屏和scrollback() {
+        assert_eq!(
+            wheel_target(
+                TermMode::MOUSE_REPORT_CLICK
+                    | TermMode::SGR_MOUSE
+                    | TermMode::ALT_SCREEN
+                    | TermMode::ALTERNATE_SCROLL,
+            ),
+            WheelTarget::ApplicationMouse
+        );
+        assert_eq!(
+            wheel_target(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL),
+            WheelTarget::AlternateScroll
+        );
+        assert_eq!(wheel_target(TermMode::NONE), WheelTarget::Scrollback);
+    }
+
+    #[test]
+    fn 小幅point滚轮不会被截断() {
+        assert_eq!(
+            mouse_wheel_steps(egui::MouseWheelUnit::Point, 0.25, 16.0, 24),
+            1
+        );
+        assert_eq!(
+            mouse_wheel_steps(egui::MouseWheelUnit::Line, -3.0, 16.0, 24),
+            3
+        );
+        assert_eq!(
+            mouse_wheel_steps(egui::MouseWheelUnit::Page, 1.0, 16.0, 24),
+            24
+        );
     }
 }
 

@@ -26,6 +26,13 @@ pub enum Key {
     Char(char),
 }
 
+/// 鼠标滚轮方向（xterm 鼠标协议中的按键 64/65）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseWheelDirection {
+    Up,
+    Down,
+}
+
 /// 修饰键集合。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Mods {
@@ -232,6 +239,61 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
     }
 }
 
+/// 将鼠标滚轮事件编码为 xterm 鼠标上报序列。
+///
+/// `column` 与 `row` 为从零开始的当前视口 cell 坐标。只有终端程序已通过
+/// DECSET 启用鼠标上报时才返回字节；优先使用 SGR（1006），并兼容 X10 与
+/// UTF-8（1005）编码。
+pub fn encode_mouse_wheel(
+    direction: MouseWheelDirection,
+    mods: Mods,
+    mode: TermMode,
+    column: usize,
+    row: usize,
+) -> Option<Vec<u8>> {
+    if !mode.intersects(TermMode::MOUSE_MODE) {
+        return None;
+    }
+
+    let button = match direction {
+        MouseWheelDirection::Up => 64,
+        MouseWheelDirection::Down => 65,
+    } + mouse_modifier_bits(mods);
+    let column = column.saturating_add(1);
+    let row = row.saturating_add(1);
+
+    if mode.contains(TermMode::SGR_MOUSE) {
+        return Some(format!("\x1b[<{button};{column};{row}M").into_bytes());
+    }
+
+    let mut output = b"\x1b[M".to_vec();
+    let utf8 = mode.contains(TermMode::UTF8_MOUSE);
+    push_legacy_mouse_component(&mut output, button, utf8);
+    push_legacy_mouse_component(&mut output, column, utf8);
+    push_legacy_mouse_component(&mut output, row, utf8);
+    Some(output)
+}
+
+/// xterm 鼠标修饰位：Shift=4、Alt=8、Ctrl=16。
+fn mouse_modifier_bits(mods: Mods) -> usize {
+    (mods.shift as usize * 4) + (mods.alt as usize * 8) + (mods.ctrl as usize * 16)
+}
+
+/// 追加传统 X10/UTF-8 鼠标协议中的一个 `value + 32` 分量。
+fn push_legacy_mouse_component(output: &mut Vec<u8>, value: usize, utf8: bool) {
+    let value = value.saturating_add(32);
+    if utf8 {
+        // xterm 1005 使用最多两字节 UTF-8 坐标，最大可表达 U+07FF。
+        let value = value.min(0x07ff) as u32;
+        let character = char::from_u32(value).expect("U+07FF 范围内始终是有效标量值");
+        let mut buffer = [0; 4];
+        output.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+    } else {
+        // 传统 X10 每个分量只有一个字节；超出范围时按 xterm 约定钳制。
+        output.push(value.min(u8::MAX as usize) as u8);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +446,61 @@ mod tests {
         // 应用键盘模式后回车不执行（回归测试）。
         let bytes = encode_key(Key::Enter, no_mods(), TermMode::APP_KEYPAD).unwrap();
         assert_eq!(bytes, b"\r");
+    }
+
+    #[test]
+    fn 鼠标滚轮按xterm协议编码() {
+        let sgr_mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(
+            encode_mouse_wheel(MouseWheelDirection::Up, no_mods(), sgr_mode, 2, 4).unwrap(),
+            b"\x1b[<64;3;5M"
+        );
+        assert_eq!(
+            encode_mouse_wheel(
+                MouseWheelDirection::Up,
+                Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                sgr_mode,
+                2,
+                4,
+            )
+            .unwrap(),
+            b"\x1b[<80;3;5M"
+        );
+
+        let x10 = encode_mouse_wheel(
+            MouseWheelDirection::Up,
+            no_mods(),
+            TermMode::MOUSE_REPORT_CLICK,
+            2,
+            4,
+        )
+        .unwrap();
+        assert_eq!(x10, vec![0x1b, b'[', b'M', 96, 35, 37]);
+    }
+
+    #[test]
+    fn 鼠标滚轮utf8坐标编码() {
+        // column=223 → 1-based 坐标 224，传统单字节协议无法表达；1005 应编码 U+0100。
+        let bytes = encode_mouse_wheel(
+            MouseWheelDirection::Up,
+            no_mods(),
+            TermMode::MOUSE_REPORT_CLICK | TermMode::UTF8_MOUSE,
+            223,
+            4,
+        )
+        .unwrap();
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', 96, 0xc4, 0x80, 37]);
+    }
+
+    #[test]
+    fn 鼠标滚轮未启用上报时不编码() {
+        assert!(
+            encode_mouse_wheel(MouseWheelDirection::Down, no_mods(), TermMode::NONE, 0, 0,)
+                .is_none()
+        );
     }
 
     #[test]

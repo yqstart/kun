@@ -10,136 +10,136 @@ use egui::{Color32, Context, CornerRadius, Stroke, Visuals};
 pub mod tokens {
     use egui::Color32;
 
-    // ==================== 背景分层（Mino 紫夜控制台） ====================
-    // 默认皮肤以深紫为底，使用低饱和的薰衣草色做层级和交互提示，
-    // 让设置、主机卡片与终端有统一且更安静的视觉重心。
-    pub const BG_APP: Color32 = Color32::from_rgb(0x0c, 0x09, 0x18);
-    pub const BG_HEADER: Color32 = Color32::from_rgb(0x09, 0x07, 0x13);
-    pub const BG_PANEL: Color32 = Color32::from_rgb(0x15, 0x10, 0x27);
-    pub const BG_ELEVATED: Color32 = Color32::from_rgb(0x1d, 0x16, 0x35);
-    pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x08, 0x07, 0x11);
+    // ==================== 背景分层（石墨终端） ====================
+    // 默认皮肤使用近黑石墨色作为底层，面板略带冷灰绿，保持终端工具的
+    // 低干扰层级；交互强调使用低饱和青绿与琥珀，不包含粉色或紫色。
+    pub const BG_APP: Color32 = Color32::from_rgb(0x0d, 0x11, 0x12);
+    pub const BG_HEADER: Color32 = Color32::from_rgb(0x08, 0x0b, 0x0c);
+    pub const BG_PANEL: Color32 = Color32::from_rgb(0x12, 0x19, 0x1a);
+    pub const BG_ELEVATED: Color32 = Color32::from_rgb(0x19, 0x21, 0x22);
+    pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x09, 0x0d, 0x0d);
 
     pub const BORDER_SUBTLE: Color32 =
-        Color32::from_rgba_unmultiplied_const(0xa7, 0x8b, 0xfa, 0x2d);
-    pub const GRID_LINE: Color32 = Color32::from_rgba_unmultiplied_const(0xa7, 0x8b, 0xfa, 0x0c);
+        Color32::from_rgba_unmultiplied_const(0x7e, 0xa1, 0x97, 0x24);
+    pub const GRID_LINE: Color32 = Color32::from_rgba_unmultiplied_const(0x7e, 0xa1, 0x97, 0x09);
 
-    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xf2, 0xef, 0xff);
-    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xbd, 0xb2, 0xda);
-    pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x81, 0x75, 0x9f);
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xd9, 0xe2, 0xdf);
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xa6, 0xb4, 0xb0);
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x67, 0x76, 0x72);
 
-    // Mino 品牌强调色：紫罗兰作为主动作，柔和的薰衣草作为层级辅助。
-    pub const ACCENT: Color32 = Color32::from_rgb(0xa7, 0x8b, 0xfa);
-    pub const ACCENT_2: Color32 = Color32::from_rgb(0xd5, 0xa6, 0xff);
-    pub const ACCENT_SOFT: Color32 = Color32::from_rgba_unmultiplied_const(0xa7, 0x8b, 0xfa, 0x2c);
+    // 主动作使用终端绿，辅助强调使用克制的琥珀色。
+    pub const ACCENT: Color32 = Color32::from_rgb(0x4f, 0x9d, 0x83);
+    pub const ACCENT_2: Color32 = Color32::from_rgb(0xc3, 0x9a, 0x5b);
+    pub const ACCENT_SOFT: Color32 = Color32::from_rgba_unmultiplied_const(0x4f, 0x9d, 0x83, 0x2a);
     pub const ACCENT_FG: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
-    pub const FOCUS_RING: Color32 = Color32::from_rgba_unmultiplied_const(0xa7, 0x8b, 0xfa, 0xa0);
+    pub const FOCUS_RING: Color32 = Color32::from_rgba_unmultiplied_const(0x4f, 0x9d, 0x83, 0x90);
 
-    pub const SUCCESS: Color32 = Color32::from_rgb(0x78, 0xd6, 0xae);
-    pub const WARNING: Color32 = Color32::from_rgb(0xf1, 0xc2, 0x75);
-    pub const DANGER: Color32 = Color32::from_rgb(0xf0, 0x7a, 0x9b);
+    pub const SUCCESS: Color32 = Color32::from_rgb(0x63, 0xa8, 0x78);
+    pub const WARNING: Color32 = Color32::from_rgb(0xc7, 0x9c, 0x55);
+    pub const DANGER: Color32 = Color32::from_rgb(0xb8, 0x5c, 0x54);
 
     pub const RADIUS_SM: f32 = 9.0;
     pub const RADIUS_ITEM: f32 = 7.0;
 }
 
-// ==================== 终端调色板（Catppuccin Mocha 基准） ====================
+// ==================== 终端调色板（石墨终端基准） ====================
 pub const TERM_PALETTE_16: [Rgb; 16] = [
     Rgb {
-        r: 0x45,
-        g: 0x47,
-        b: 0x5a,
+        r: 0x1a,
+        g: 0x1f,
+        b: 0x20,
     },
     Rgb {
-        r: 0xf3,
-        g: 0x8b,
-        b: 0xa8,
+        r: 0xb8,
+        g: 0x5c,
+        b: 0x54,
+    },
+    Rgb {
+        r: 0x76,
+        g: 0x9c,
+        b: 0x67,
+    },
+    Rgb {
+        r: 0xb8,
+        g: 0x9a,
+        b: 0x5b,
+    },
+    Rgb {
+        r: 0x5f,
+        g: 0x81,
+        b: 0x9d,
     },
     Rgb {
         r: 0xa6,
-        g: 0xe3,
-        b: 0xa1,
+        g: 0x7c,
+        b: 0x52,
     },
     Rgb {
-        r: 0xf9,
-        g: 0xe2,
-        b: 0xaf,
+        r: 0x5f,
+        g: 0x9a,
+        b: 0x95,
     },
     Rgb {
-        r: 0x89,
+        r: 0xc7,
+        g: 0xd0,
+        b: 0xcd,
+    },
+    Rgb {
+        r: 0x52,
+        g: 0x60,
+        b: 0x5e,
+    },
+    Rgb {
+        r: 0xcf,
+        g: 0x6a,
+        b: 0x5d,
+    },
+    Rgb {
+        r: 0x8f,
         g: 0xb4,
-        b: 0xfa,
+        b: 0x77,
     },
     Rgb {
-        r: 0xf5,
-        g: 0xc2,
-        b: 0xe7,
-    },
-    Rgb {
-        r: 0x94,
-        g: 0xe2,
-        b: 0xd5,
-    },
-    Rgb {
-        r: 0xba,
-        g: 0xc2,
-        b: 0xde,
-    },
-    Rgb {
-        r: 0x58,
-        g: 0x5b,
-        b: 0x70,
-    },
-    Rgb {
-        r: 0xf3,
-        g: 0x8b,
-        b: 0xa8,
-    },
-    Rgb {
-        r: 0xa6,
-        g: 0xe3,
-        b: 0xa1,
-    },
-    Rgb {
-        r: 0xf9,
-        g: 0xe2,
-        b: 0xaf,
-    },
-    Rgb {
-        r: 0x89,
-        g: 0xb4,
-        b: 0xfa,
-    },
-    Rgb {
-        r: 0xf5,
-        g: 0xc2,
-        b: 0xe7,
-    },
-    Rgb {
-        r: 0x94,
-        g: 0xe2,
-        b: 0xd5,
-    },
-    Rgb {
-        r: 0xa6,
+        r: 0xd0,
         g: 0xad,
-        b: 0xc8,
+        b: 0x67,
+    },
+    Rgb {
+        r: 0x7c,
+        g: 0x9b,
+        b: 0xb3,
+    },
+    Rgb {
+        r: 0xc1,
+        g: 0x8b,
+        b: 0x5c,
+    },
+    Rgb {
+        r: 0x78,
+        g: 0xb5,
+        b: 0xad,
+    },
+    Rgb {
+        r: 0xe2,
+        g: 0xe7,
+        b: 0xe5,
     },
 ];
 
 pub const TERM_FG: Rgb = Rgb {
-    r: 0xd5,
-    g: 0xdc,
-    b: 0xe4,
+    r: 0xc9,
+    g: 0xd3,
+    b: 0xd0,
 };
 pub const TERM_BG: Rgb = Rgb {
     r: 0x09,
-    g: 0x08,
-    b: 0x13,
+    g: 0x0d,
+    b: 0x0d,
 };
 pub const TERM_CURSOR: Rgb = Rgb {
-    r: 0xf4,
-    g: 0xec,
-    b: 0xff,
+    r: 0x84,
+    g: 0xb6,
+    b: 0x9f,
 };
 
 /// xterm 256 色表固定部分（index ≥ 16：216 立方色 + 24 灰阶，与主题调色板无关）。
@@ -297,7 +297,7 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
 
 // ---- 终端调色板：三套 ----
 
-const PALETTE_WARP: [Rgb; 16] = TERM_PALETTE_16;
+const PALETTE_GRAPHITE: [Rgb; 16] = TERM_PALETTE_16;
 
 const PALETTE_MIDNIGHT: [Rgb; 16] = [
     Rgb {
@@ -486,7 +486,7 @@ pub static THEMES: [Theme; 3] = [
         term_bg: TERM_BG,
         term_fg: TERM_FG,
         term_cursor: TERM_CURSOR,
-        term_palette: PALETTE_WARP,
+        term_palette: PALETTE_GRAPHITE,
     },
     Theme {
         name: "深蓝",
@@ -557,3 +557,75 @@ pub static THEMES: [Theme; 3] = [
         term_palette: PALETTE_CYBER,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn luminance(color: Color32) -> u16 {
+        u16::from(color.r()) * 3 + u16::from(color.g()) * 6 + u16::from(color.b())
+    }
+
+    fn is_pink_or_purple(r: u8, g: u8, b: u8) -> bool {
+        r.saturating_sub(g) > 12 && b.saturating_sub(g) > 12
+    }
+
+    #[test]
+    fn 默认深色主题保持低亮度石墨层级() {
+        let theme = &THEMES[0];
+        assert_eq!(theme.name, "深色");
+        for background in [
+            theme.bg_header,
+            theme.bg_app,
+            theme.bg_panel,
+            theme.bg_elevated,
+        ] {
+            assert!(
+                background.r().max(background.g()).max(background.b()) <= 0x22,
+                "默认背景过亮：{background:?}"
+            );
+        }
+        assert!(luminance(theme.bg_header) < luminance(theme.bg_app));
+        assert!(luminance(theme.bg_app) < luminance(theme.bg_panel));
+        assert!(luminance(theme.bg_panel) < luminance(theme.bg_elevated));
+        assert!(theme.term_bg.r.max(theme.term_bg.g).max(theme.term_bg.b) <= 0x0d);
+    }
+
+    #[test]
+    fn 默认深色主题不含粉色或紫色() {
+        let theme = &THEMES[0];
+        for color in [
+            theme.bg_app,
+            theme.bg_header,
+            theme.bg_panel,
+            theme.bg_elevated,
+            theme.border,
+            theme.text_primary,
+            theme.text_secondary,
+            theme.text_muted,
+            theme.accent,
+            theme.accent2,
+            theme.accent_soft,
+            theme.success,
+            theme.warning,
+            theme.danger,
+        ] {
+            assert!(
+                !is_pink_or_purple(color.r(), color.g(), color.b()),
+                "默认 UI 色包含粉紫倾向：{color:?}"
+            );
+        }
+
+        for color in
+            theme
+                .term_palette
+                .iter()
+                .chain([&theme.term_bg, &theme.term_fg, &theme.term_cursor])
+        {
+            assert!(
+                !is_pink_or_purple(color.r, color.g, color.b),
+                "默认终端色包含粉紫倾向：{color:?}"
+            );
+        }
+    }
+}
