@@ -8,6 +8,7 @@ pub mod sftp;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, Term};
@@ -42,6 +43,10 @@ pub enum ConnectResult {
 
 /// 统一的 SSH 客户端配置：30 秒无数据发 keepalive，3 次无响应断开
 /// （空闲连接被中间设备静默断开后能及时发现，避免会话假死）。
+///
+/// 注意：russh 0.62 的 `client::Config` 没有连接超时字段（TCP 阶段依赖 OS
+/// 默认超时，可达 75s+），TCP 连接/握手与认证阶段的限时由调用处
+/// `tokio::time::timeout` 显式包裹（见 `CONNECT_TIMEOUT`/`AUTH_TIMEOUT`）。
 fn ssh_config() -> client::Config {
     client::Config {
         keepalive_interval: Some(std::time::Duration::from_secs(30)),
@@ -50,7 +55,16 @@ fn ssh_config() -> client::Config {
     }
 }
 
+/// TCP 连接 + SSH 握手 + KEX 阶段超时：不可达主机（黑洞防火墙/路由丢弃）
+/// 下 OS TCP 超时过长，UI 会无限期"正在连接…"且无取消入口。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 认证阶段超时：服务器接受 TCP 后静默时，认证不应无限挂起
+/// （密码/私钥均为自动认证，无需等待人工输入）。
+const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 连接并校验服务器密钥（TOFU），失败时返回带原因的错误。
+/// TCP 连接与握手阶段限时 `CONNECT_TIMEOUT`，超时返回明确错误。
 pub(crate) async fn connect_verified(
     config: Arc<client::Config>,
     profile: &crate::config::HostProfile,
@@ -60,14 +74,23 @@ pub(crate) async fn connect_verified(
         profile.port,
         default_known_hosts_path(),
     );
-    match client::connect(config, (profile.host.as_str(), profile.port), verifier).await {
-        Ok(handle) => Ok(handle),
-        Err(e) => {
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        client::connect(config, (profile.host.as_str(), profile.port), verifier),
+    )
+    .await
+    {
+        Ok(Ok(handle)) => Ok(handle),
+        Ok(Err(e)) => {
             // 密钥校验失败时给出明确原因（指纹不匹配 + 修复指引）；
             // 其他错误（TCP 拒绝等）沿用 russh 原文。
             let detail = verifier_error.lock().unwrap().take();
             Err(detail.unwrap_or_else(|| e.to_string()))
         }
+        Err(_) => Err(format!(
+            "连接超时（{} 秒无响应）",
+            CONNECT_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -87,11 +110,19 @@ pub fn connect_remote(
     let (tx, rx) = mpsc::unbounded_channel();
     let profile = profile.clone();
     let handle = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        // runtime 创建失败（资源耗尽等极端情况）也必须回传失败事件，
+        // 不能 panic 在后台线程让 UI 永久停在"正在连接…"。
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
-            .expect("创建 tokio runtime 失败");
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                let _ = tx.send(ConnectResult::Failed(format!("初始化连接运行时失败：{e}")));
+                return;
+            }
+        };
         let session_done = Arc::new(tokio::sync::Notify::new());
         let session_done_loop = session_done.clone();
         runtime.block_on(async move {
@@ -297,7 +328,18 @@ fn load_private_key(
 }
 
 /// 执行认证（密码或私钥），返回是否成功。
+/// 整体限时 `AUTH_TIMEOUT`：服务器接受 TCP 后静默时认证不应无限挂起。
 pub(crate) async fn authenticate(
+    handle: &mut client::Handle<HostKeyVerifier>,
+    profile: &crate::config::HostProfile,
+) -> Result<bool, String> {
+    tokio::time::timeout(AUTH_TIMEOUT, authenticate_inner(handle, profile))
+        .await
+        .map_err(|_| format!("认证超时（{} 秒无响应）", AUTH_TIMEOUT.as_secs()))?
+}
+
+/// `authenticate` 的实际认证逻辑（密码或私钥）。
+async fn authenticate_inner(
     handle: &mut client::Handle<HostKeyVerifier>,
     profile: &crate::config::HostProfile,
 ) -> Result<bool, String> {
