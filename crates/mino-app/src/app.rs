@@ -1,6 +1,6 @@
 //! Mino 应用主体：布局、连接管理与状态。
 //!
-//! 视觉参照 Warp：分层深色背景、品牌紫青渐变、圆角幽灵按钮、
+//! 视觉参照 Warp：分层深色背景、终端绿与琥珀强调、圆角幽灵按钮、
 //! 标签页底部指示条与扫光动效（动效细节见 `crate::anim`）。
 
 use std::path::{Path, PathBuf};
@@ -198,7 +198,7 @@ pub struct MinoApp {
     install_result_path: Option<PathBuf>,
     /// 安装脚本启动时间，用于检测脚本无响应。
     install_started_at: Option<f64>,
-    /// 性能 HUD 是否显示（`⌥P` 切换；默认关闭，不影响测试截图）。
+    /// 性能 HUD 是否显示（`⌥P` 切换；默认展示）。
     show_perf_hud: bool,
     /// 帧耗时统计（UI 线程打点）。
     perf: crate::perf::PerfStats,
@@ -571,7 +571,7 @@ impl MinoApp {
             restart_at: None,
             install_result_path: None,
             install_started_at: None,
-            show_perf_hud: false,
+            show_perf_hud: true,
             perf: crate::perf::PerfStats::new(),
         };
         // 启动时自动检查更新（后台线程，延迟 3 秒，静默）。
@@ -2349,8 +2349,18 @@ impl MinoApp {
             if let Some(e) = &self.sftp_error {
                 ui.separator();
                 status_dot(ui, theme.danger, false);
-                ui.label(egui::RichText::new(e).size(11.5).color(theme.danger))
-                    .on_hover_text("重新连接主机可再次尝试");
+                // 截断显示，避免长错误把右侧 HUD 挤出状态栏；hover 看全文。
+                ui.add(
+                    egui::Label::new(egui::RichText::new(e).size(11.5).color(theme.danger))
+                        .truncate(),
+                )
+                .on_hover_text(format!("{e}\n\n重新连接主机可再次尝试"));
+            }
+            // 性能 HUD 与左侧会话状态同处一行：剩余空间右对齐。
+            if self.show_perf_hud {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    render_perf_hud(ui, &self.perf);
+                });
             }
         });
     }
@@ -2755,7 +2765,7 @@ fn form_input(
     ui.add_sized([width, 30.0], edit)
 }
 
-/// 品牌标记：紫青渐变圆角底 + 白色极简终端提示符 `>_`。
+/// 品牌标记：主题强调色渐变圆角底 + 白色极简终端提示符 `>_`。
 ///
 /// 与应用图标（scripts/make-icon.swift）同构图；hover 时带 accent 辉光。
 fn draw_logo_mark(ui: &mut egui::Ui, size: f32) -> egui::Rect {
@@ -2987,9 +2997,10 @@ impl eframe::App for MinoApp {
             }
         }
 
-        // egui Window 的 Esc 默认只清除焦点，不会关闭自绘标题栏窗口；
-        // 这里按前台弹窗优先级显式处理，避免 UI 提示与实际行为不一致。
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        // Esc 只关闭前台弹窗。无弹窗时必须保留事件给终端（例如 Vim 退出插入模式）。
+        if (self.show_new_conn || self.show_settings)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
             if self.show_new_conn {
                 self.show_new_conn = false;
                 self.form.name_focused = false;
@@ -3129,33 +3140,19 @@ impl eframe::App for MinoApp {
             self.perf.add_layout(layout);
             self.perf.add_paint(paint);
         }
-        if self.show_perf_hud {
-            render_perf_hud(&ctx, &self.perf);
-        }
     }
 }
 
-/// 渲染性能 HUD（右上角半透明小面板，调试用）。
-fn render_perf_hud(ctx: &egui::Context, perf: &crate::perf::PerfStats) {
+/// 渲染性能 HUD 文本（底部状态栏右侧）。
+fn render_perf_hud(ui: &mut egui::Ui, perf: &crate::perf::PerfStats) {
     let theme = crate::theme::current_theme();
-    egui::Area::new(egui::Id::new("perf_hud"))
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 44.0))
-        .order(egui::Order::Foreground)
-        .interactable(false)
-        .show(ctx, |ui| {
-            let frame = egui::Frame::new()
-                .fill(theme.bg_elevated.gamma_multiply(0.92))
-                .corner_radius(6.0)
-                .inner_margin(egui::Margin::symmetric(10, 6));
-            frame.show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(perf.summary())
-                        .monospace()
-                        .size(10.5)
-                        .color(theme.text_muted),
-                );
-            });
-        });
+    ui.label(
+        egui::RichText::new(perf.summary())
+            .monospace()
+            .size(11.0)
+            .color(theme.text_secondary),
+    )
+    .on_hover_text("帧耗时 / FPS / 终端构建、布局与绘制耗时（⌥P 切换）");
 }
 
 #[cfg(test)]
@@ -3532,6 +3529,68 @@ mod app_tests {
         assert!(
             executed,
             "回车未执行命令，终端内容：\n{}",
+            app_grid_text(harness.state())
+        );
+    }
+
+    /// 无前台弹窗时 Esc 必须到达终端；Vim 依赖它退出插入模式。
+    #[test]
+    fn 完整应用转义键转发给终端() {
+        use std::time::{Duration, Instant};
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
+        harness.run_steps(6);
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if app_grid_text(harness.state()).contains('~') {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(ready, "zsh 未就绪");
+
+        // `read` 在规范输入模式下等待换行；PTY 会把收到的实际 ESC 字节
+        // 回显为 `^[`。这直接验证应用级快捷键没有先消费该按键。
+        harness.event(egui::Event::Text("IFS= read -r c".into()));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            modifiers: egui::Modifiers::NONE,
+            repeat: false,
+            pressed: true,
+        });
+        for _ in 0..6 {
+            harness.step();
+        }
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            modifiers: egui::Modifiers::NONE,
+            repeat: false,
+            pressed: true,
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut forwarded = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if app_grid_text(harness.state())
+                .lines()
+                .any(|line| line.trim() == "^[")
+            {
+                forwarded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            forwarded,
+            "Esc 未转发给终端，内容：\n{}",
             app_grid_text(harness.state())
         );
     }
@@ -4261,6 +4320,55 @@ mod settings_tests {
                 .next()
                 .is_none(),
             "设置弹窗未打开时不应渲染主机管理"
+        );
+    }
+
+    /// 性能 HUD 默认显示在底部状态栏右侧。
+    #[test]
+    fn 性能_hud默认显示在状态栏右侧() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
+        harness.run_steps(6);
+
+        assert!(harness.state().show_perf_hud, "性能 HUD 启动时应默认展示");
+        assert!(
+            harness
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("perf_hud")))
+                .is_none(),
+            "性能 HUD 不应再创建独立悬浮区域"
+        );
+
+        let hud = harness
+            .root()
+            .query_all_by_label_contains("帧")
+            .next()
+            .expect("状态栏中应显示性能 HUD 文本");
+        let viewport = harness.ctx.viewport_rect();
+        assert!(
+            hud.rect().right() > viewport.right() - 300.0,
+            "性能 HUD 应位于状态栏右侧，实际 right={} viewport right={}",
+            hud.rect().right(),
+            viewport.right()
+        );
+        assert!(
+            hud.rect().bottom() > viewport.bottom() - 40.0,
+            "性能 HUD 应位于底部状态栏，实际 bottom={} viewport bottom={}",
+            hud.rect().bottom(),
+            viewport.bottom()
+        );
+        // 与左侧会话标题同处一行（垂直中心对齐）。
+        let title = harness
+            .root()
+            .query_all_by_label_contains("本地终端")
+            .find(|node| node.rect().bottom() > viewport.bottom() - 40.0)
+            .expect("状态栏中应显示会话标题");
+        assert!(
+            (hud.rect().center().y - title.rect().center().y).abs() < 8.0,
+            "性能 HUD 应与会话标题同处一行，hud 中心 y={} title 中心 y={}",
+            hud.rect().center().y,
+            title.rect().center().y
         );
     }
 
