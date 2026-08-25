@@ -1,7 +1,7 @@
 //! SFTP 客户端：后台线程驱动，UI 通过命令队列操作、事件流接收结果。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -121,14 +121,27 @@ pub enum SftpEvent {
 pub struct SftpHandle {
     cmd_tx: UnboundedSender<SftpCmd>,
     next_transfer_id: Arc<AtomicU64>,
+    /// 关闭标志：`close()` 立即置位，传输循环每块数据间检查，
+    /// 不依赖 Shutdown 命令在队列中的顺序（排在传输后就会跑完整个传输）。
+    shutdown: Arc<AtomicBool>,
 }
 
 impl SftpHandle {
-    /// 从原始发送端构造（测试用）。
+    /// 从原始发送端构造（测试用），附带独立的取消标志。
     pub fn from_raw(cmd_tx: UnboundedSender<SftpCmd>) -> Self {
         Self {
             cmd_tx,
             next_transfer_id: Arc::new(AtomicU64::new(1)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// 从原始发送端与取消标志构造（`connect_sftp` 内部使用）。
+    fn with_shutdown(cmd_tx: UnboundedSender<SftpCmd>, shutdown: Arc<AtomicBool>) -> Self {
+        Self {
+            cmd_tx,
+            next_transfer_id: Arc::new(AtomicU64::new(1)),
+            shutdown,
         }
     }
 }
@@ -186,8 +199,12 @@ impl SftpHandle {
         });
     }
 
-    /// 关闭 SFTP 连接。
+    /// 关闭 SFTP 连接，立即中止进行中的传输。
     pub fn close(&self) {
+        // 先置位取消标志：传输循环每块数据（64KB）间检查，正在进行的
+        // 传输立刻中止并清理半成品，不等待队列中排在前面的命令执行完；
+        // Shutdown 命令作为操作循环退出的兜底。
+        self.shutdown.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.send(SftpCmd::Shutdown);
     }
 }
@@ -201,6 +218,10 @@ pub fn connect_sftp(
     // 事件流有界，避免非活动标签在大文件传输时无限积压进度事件。
     let (ev_tx, ev_rx) = mpsc::channel::<SftpEvent>(128);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SftpCmd>();
+    // 关闭标志：UI 调用 SftpHandle::close() 立即置位，后台传输循环
+    // 每块数据间检查（见 upload_file/download_file），不等队列排空。
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let thread_shutdown = shutdown.clone();
     let profile = profile.clone();
     let handle = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -208,9 +229,9 @@ pub fn connect_sftp(
             .enable_all()
             .build()
             .expect("创建 tokio runtime 失败");
-        runtime.block_on(sftp_main(profile, cmd_rx, ev_tx));
+        runtime.block_on(sftp_main(profile, cmd_rx, ev_tx, thread_shutdown));
     });
-    (handle, SftpHandle::from_raw(cmd_tx), ev_rx)
+    (handle, SftpHandle::with_shutdown(cmd_tx, shutdown), ev_rx)
 }
 
 /// 连接并运行 SFTP 操作循环（阻塞直到关闭）。
@@ -218,6 +239,7 @@ async fn sftp_main(
     profile: HostProfile,
     mut cmd_rx: UnboundedReceiver<SftpCmd>,
     ev_tx: Sender<SftpEvent>,
+    shutdown: Arc<AtomicBool>,
 ) {
     // ==================== 1. 连接与认证（含主机密钥 TOFU 校验） ====================
     log::info!("sftp_main 启动：{}:{}", profile.host, profile.port);
@@ -293,8 +315,8 @@ async fn sftp_main(
         let cmd = tokio::select! {
             cmd = cmd_rx.recv() => cmd,
             _ = tokio::time::sleep(LIVENESS_POLL) => {
-                if handle.is_closed() {
-                    log::warn!("SFTP 连接已断开，退出操作循环");
+                if shutdown.load(Ordering::SeqCst) || handle.is_closed() {
+                    log::warn!("SFTP 连接已关闭/断开，退出操作循环");
                     break;
                 }
                 continue;
@@ -330,7 +352,7 @@ async fn sftp_main(
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| local.display().to_string())
                 );
-                match upload_file(&sftp, &local, &remote, id, &label, &ev_tx).await {
+                match upload_file(&sftp, &local, &remote, id, &label, &ev_tx, &shutdown).await {
                     Ok(()) => {
                         let _ = ev_tx
                             .send(SftpEvent::Done {
@@ -359,7 +381,7 @@ async fn sftp_main(
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| remote.clone())
                 );
-                match download_file(&sftp, &remote, &local, id, &label, &ev_tx).await {
+                match download_file(&sftp, &remote, &local, id, &label, &ev_tx, &shutdown).await {
                     Ok(()) => {
                         let _ = ev_tx
                             .send(SftpEvent::Done {
@@ -445,7 +467,10 @@ async fn sftp_main(
                     }
                 }
             }
-            SftpCmd::Shutdown => break,
+            SftpCmd::Shutdown => {
+                shutdown.store(true, Ordering::SeqCst);
+                break;
+            }
         }
     }
     let _ = ev_tx.send(SftpEvent::Closed).await;
@@ -474,6 +499,8 @@ async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>, St
 }
 
 /// 上传本地文件到远程（带进度）。
+/// `shutdown` 置位时在块边界中止并返回错误（调用方沿用既有半成品清理路径）。
+#[allow(clippy::too_many_arguments)]
 async fn upload_file(
     sftp: &SftpSession,
     local: &Path,
@@ -481,6 +508,7 @@ async fn upload_file(
     id: u64,
     label: &str,
     ev_tx: &Sender<SftpEvent>,
+    shutdown: &AtomicBool,
 ) -> Result<(), String> {
     let partial = partial_remote_path(remote);
     let result = async {
@@ -513,6 +541,10 @@ async fn upload_file(
                 done,
                 total,
             });
+            // 关闭标签页/连接时立即中止：外层错误路径会删除远程半成品。
+            if shutdown.load(Ordering::SeqCst) {
+                return Err("传输已取消".into());
+            }
         }
         remote_file.close().await.map_err(|e| e.to_string())
     }
@@ -529,6 +561,8 @@ async fn upload_file(
 }
 
 /// 下载远程文件到本地（带进度）。
+/// `shutdown` 置位时在块边界中止并返回错误（调用方沿用既有半成品清理路径）。
+#[allow(clippy::too_many_arguments)]
 async fn download_file(
     sftp: &SftpSession,
     remote: &str,
@@ -536,6 +570,7 @@ async fn download_file(
     id: u64,
     label: &str,
     ev_tx: &Sender<SftpEvent>,
+    shutdown: &AtomicBool,
 ) -> Result<(), String> {
     let partial = partial_local_path(local);
     let result = async {
@@ -570,6 +605,10 @@ async fn download_file(
                 done,
                 total,
             });
+            // 关闭标签页/连接时立即中止：外层错误路径会删除本地半成品。
+            if shutdown.load(Ordering::SeqCst) {
+                return Err("传输已取消".into());
+            }
         }
         local_file.flush().await.map_err(|e| e.to_string())?;
         local_file.sync_all().await.map_err(|e| e.to_string())
@@ -589,6 +628,17 @@ async fn download_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 关闭句柄置位取消标志并发送Shutdown() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = SftpHandle::from_raw(tx);
+        handle.close();
+        // 取消标志立即置位：后台传输循环不等命令队列排空即可中止。
+        assert!(handle.shutdown.load(Ordering::SeqCst));
+        // Shutdown 命令作为操作循环退出的兜底。
+        assert!(matches!(rx.try_recv(), Ok(SftpCmd::Shutdown)));
+    }
 
     #[test]
     fn 传输临时文件与目标同目录() {

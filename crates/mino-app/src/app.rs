@@ -585,6 +585,11 @@ impl MinoApp {
         {
             self.close_pending_sftp(tab_id);
         }
+        // 已挂载的 SFTP：显式 close，置位取消标志立即中止进行中的传输
+        // 并清理半成品（此前只靠 handle drop，传输会继续跑到完成）。
+        if let Some(sftp) = self.tabs[index].sftp.as_ref() {
+            sftp.close();
+        }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active_tab = 0;
