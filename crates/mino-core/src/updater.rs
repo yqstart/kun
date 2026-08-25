@@ -131,6 +131,12 @@ pub fn download_asset(
     download_asset_with_cancel(url, dest, &cancelled, on_progress)
 }
 
+/// 下载完成后的完整性校验：已下载字节数必须与 Content-Length 一致，
+/// 且大小落在合理边界内（常规 DMG 数十 MB；下限防截断/损坏文件，
+/// 上限防恶意服务器无限流写盘）。
+const MIN_ASSET_BYTES: u64 = 1024 * 1024;
+const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// 可取消地下载资产。
 ///
 /// 取消标记由调用方持有并设置；下载线程会在请求和每个数据块之间检查，
@@ -164,6 +170,12 @@ pub fn download_asset_with_cancel(
             .get("Content-Length")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
+        // 服务端声明的总大小越界即拒绝，不等下载完成。
+        if let Some(total) = total {
+            if !(MIN_ASSET_BYTES..=MAX_ASSET_BYTES).contains(&total) {
+                return Err(format!("下载大小异常（{total} 字节），拒绝安装"));
+            }
+        }
 
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
@@ -189,9 +201,25 @@ pub fn download_asset_with_cancel(
             file.write_all(&buf[..n])
                 .map_err(|e| format!("写入文件失败：{e}"))?;
             downloaded += n as u64;
+            // 数据流超过上限即中止（服务端未声明 Content-Length 时兜底）。
+            if downloaded > MAX_ASSET_BYTES {
+                return Err(format!("下载超过大小上限（{MAX_ASSET_BYTES} 字节）"));
+            }
             on_progress(downloaded, total);
         }
         file.sync_all().map_err(|e| format!("落盘失败：{e}"))?;
+        // 完整性校验：字节数必须与 Content-Length 一致（代理/服务器
+        // 异常截断时文件会缺失尾部，直接安装可能损坏），且满足大小下限。
+        if let Some(total) = total {
+            if downloaded != total {
+                return Err(format!(
+                    "下载不完整：预期 {total} 字节，实际收到 {downloaded} 字节"
+                ));
+            }
+        }
+        if downloaded < MIN_ASSET_BYTES {
+            return Err(format!("下载文件过小（{downloaded} 字节），疑似损坏"));
+        }
         Ok(())
     })();
     if result.is_err() {
