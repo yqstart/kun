@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::cell::{Flags, LineLength};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::TermDamage;
@@ -336,6 +336,9 @@ impl TerminalView {
             // 通知 PTY 并同步终端状态机网格（Session::resize 内部完成锁内 resize）。
             self.session.resize(self.cols, self.rows);
             self.rows_cache.clear();
+            // 选区的 grid_line 是建立时的快照，resize 重排网格后可能悬空
+            // （复制时越界索引在 release 下会 panic），尺寸变化即放弃选区。
+            self.selection = None;
         }
 
         // ==================== 构建渲染数据（锁内，行级增量） ====================
@@ -941,6 +944,14 @@ fn selection_to_text(
     } else {
         (selection.focus, selection.anchor)
     };
+    // 选区是建立时的 grid_line 快照，网格可能因 resize/scrollback 裁剪而缩小；
+    // alacritty 的 Storage 越界防护仅 debug_assert，release 下会直接 panic——
+    // 复制前校验范围（有效网格行号 = [-history_size, screen_lines)），越界放弃复制。
+    let history = grid.history_size() as i32;
+    let screen = grid.screen_lines() as i32;
+    if start.grid_line < -history || end.grid_line >= screen {
+        return String::new();
+    }
     let mut output = String::new();
     for grid_line in start.grid_line..=end.grid_line {
         let Some((mut from, to)) = selection.columns_for_line(grid_line, cols) else {
@@ -2037,6 +2048,18 @@ mod cell_semantics_tests {
 
         let text = selection_to_text(&grid, selection((0, 0), (0, 1)), 6);
         assert_eq!(text, "a ");
+    }
+
+    #[test]
+    fn 过期选区越界时安全返回空串() {
+        // 选区是建立时的 grid_line 快照；resize/scrollback 裁剪后网格缩小，
+        // 快照可能悬空。alacritty Storage 越界防护仅 debug_assert，
+        // release 下索引越界会 panic——越界时须安全返回空串（放弃复制）。
+        let grid = Grid::<Cell>::new(2, 6, 0);
+        // 网格只有 2 行可视 + 0 行 scrollback，快照却引用第 5 行。
+        assert_eq!(selection_to_text(&grid, selection((5, 0), (5, 1)), 6), "");
+        // 快照引用 scrollback 深处（history=0 时负行号同样越界）。
+        assert_eq!(selection_to_text(&grid, selection((-3, 0), (-3, 1)), 6), "");
     }
 
     #[test]
