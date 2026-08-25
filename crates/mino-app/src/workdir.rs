@@ -42,6 +42,7 @@ impl WorkdirTracker {
     /// 覆盖当前工作目录（远程会话由 SFTP 连接建立时提供初始目录）。
     pub fn set_cwd(&mut self, cwd: PathBuf) {
         self.cwd = cwd;
+        self.text.clear();
         self.valid = true;
     }
 
@@ -84,12 +85,23 @@ impl WorkdirTracker {
     /// 提取当前输入中的 `cd` 参数。
     fn cd_argument(&self) -> Option<String> {
         // 前缀判定要求 `cd` 后为空或空白开头——`cdfoo` 是另一个命令，
-        // 不能误判为 `cd foo`。
-        self.text
+        // 不能误判为 `cd foo`。遇到 shell 控制语法时保守放弃更新，避免
+        // 把 `cd /tmp && ls`、引号路径或变量展开误当成一个远程路径。
+        let rest = self
+            .text
             .trim()
             .strip_prefix("cd")
-            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-            .map(|rest| rest.trim().to_string())
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))?;
+        let arg = rest.trim();
+        if arg.chars().any(|c| {
+            matches!(
+                c,
+                '&' | '|' | ';' | '#' | '>' | '<' | '"' | '\'' | '\\' | '$'
+            )
+        }) {
+            return None;
+        }
+        Some(arg.to_string())
     }
 
     /// 应用本地 `cd` 参数。
@@ -97,6 +109,11 @@ impl WorkdirTracker {
         let home = std::env::var("HOME").map(PathBuf::from).ok();
         let target = if arg.is_empty() {
             home.clone().unwrap_or_else(|| self.cwd.clone())
+        } else if arg == "~" {
+            match home {
+                Some(home) => home,
+                None => self.cwd.clone(),
+            }
         } else if let Some(rest) = arg.strip_prefix("~/") {
             match home {
                 Some(home) => home.join(rest),
@@ -183,6 +200,10 @@ mod tests {
         tracker.execute();
         assert_eq!(tracker.cwd, PathBuf::from(&home));
 
+        tracker.push_text("cd ~");
+        tracker.execute();
+        assert_eq!(tracker.cwd, PathBuf::from(&home));
+
         tracker.push_text("cd /no/such/dir-xyz");
         tracker.execute();
         assert_eq!(tracker.cwd, PathBuf::from(&home));
@@ -208,20 +229,14 @@ mod tests {
     }
 
     #[test]
-    fn 远程cd按路径规则追踪() {
+    fn 远程复合cd命令不误改目录() {
         let mut tracker = WorkdirTracker::new(PathBuf::from("/srv/app"));
-        let home = PathBuf::from("/home/demo");
+        tracker.push_text("cd /tmp && ls");
+        tracker.execute_remote(Some(Path::new("/home/demo")));
+        assert_eq!(tracker.cwd, PathBuf::from("/srv/app"));
 
-        tracker.push_text("cd ../logs");
-        tracker.execute_remote(Some(&home));
-        assert_eq!(tracker.cwd, PathBuf::from("/srv/logs"));
-
-        tracker.push_text("cd ~/workspace/./mino");
-        tracker.execute_remote(Some(&home));
-        assert_eq!(tracker.cwd, PathBuf::from("/home/demo/workspace/mino"));
-
-        tracker.push_text("cd ../../../../");
-        tracker.execute_remote(Some(&home));
-        assert_eq!(tracker.cwd, PathBuf::from("/"));
+        tracker.push_text("cd \"/tmp/work space\"");
+        tracker.execute_remote(Some(Path::new("/home/demo")));
+        assert_eq!(tracker.cwd, PathBuf::from("/srv/app"));
     }
 }
