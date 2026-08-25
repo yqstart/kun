@@ -351,11 +351,35 @@ fn macos_arch() -> &'static str {
     }
 }
 
+/// 更新工作目录：进程内复用同一私有目录（0700），目录名含 pid 与纳秒
+/// 时间戳不可预测。此前固定使用 `/tmp/mino-update`：/tmp 的 sticky 位
+/// 不保护子目录内容，其他本地用户可预建该目录（0777）后替换 install.sh
+/// 或预放符号链接，随后被本应用以当前用户权限执行/写入。
+fn update_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("mino-update-{}-{nanos:x}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // 写入任何内容之前收紧为 0700，隔离其他本地用户。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        dir
+    })
+    .clone()
+}
+
 /// 下载缓存目录下的 dmg 路径。
 fn temp_dmg_path(file_name: &str, sequence: u64) -> PathBuf {
-    std::env::temp_dir()
-        .join("mino-update")
-        .join(format!("{file_name}.{sequence}.part"))
+    update_dir().join(format!("{file_name}.{sequence}.part"))
 }
 
 /// 安装脚本：挂载 dmg → 与应用握手 → 等待主程序退出 → 替换 .app → 重启。
@@ -800,7 +824,7 @@ impl MinoApp {
             return;
         };
         let info = info.clone();
-        let dir = std::env::temp_dir().join("mino-update");
+        let dir = update_dir();
         let sequence = self.download_sequence;
         self.download_sequence = self.download_sequence.wrapping_add(1);
         let mount = dir.join(format!("mount-{}-{sequence}", std::process::id()));
@@ -2850,7 +2874,9 @@ fn fmt_bytes(n: u64) -> String {
 
 /// 写安装脚本并启动（独立进程，应用退出后继续运行）。
 fn launch_installer(dmg: &Path, mount: &Path, result_path: &Path) -> Result<(), String> {
-    let dir = std::env::temp_dir().join("mino-update");
+    // 私有 0700 目录（见 update_dir）：install.sh 与其他文件均不可被
+    // 其他本地用户预建/替换。
+    let dir = update_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let script = dir.join("install.sh");
     std::fs::write(&script, INSTALL_SCRIPT).map_err(|e| e.to_string())?;
