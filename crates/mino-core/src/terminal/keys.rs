@@ -84,7 +84,10 @@ fn ctrl_char(c: char) -> Option<u8> {
         '\\' | '|' => Some(0x1c),
         ']' | '}' => Some(0x1d),
         '^' | '~' => Some(0x1e),
-        '_' => Some(0x1f),
+        '_' | '-' => Some(0x1f),
+        ',' => Some(0x1c),
+        '.' => Some(0x1e),
+        '2' => Some(0x00),
         '/' => Some(0x1f),
         '?' => Some(0x7f),
         _ => None,
@@ -262,6 +265,30 @@ mod tests {
         assert_eq!(
             encode_key(Key::Char('a'), mods, TermMode::NONE).unwrap(),
             vec![0x01]
+        );
+    }
+
+    #[test]
+    fn ctrl标点映射控制字符() {
+        let mods = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(Key::Char('-'), mods, TermMode::NONE).unwrap(),
+            vec![0x1f]
+        );
+        assert_eq!(
+            encode_key(Key::Char(','), mods, TermMode::NONE).unwrap(),
+            vec![0x1c]
+        );
+        assert_eq!(
+            encode_key(Key::Char('.'), mods, TermMode::NONE).unwrap(),
+            vec![0x1e]
+        );
+        assert_eq!(
+            encode_key(Key::Char('2'), mods, TermMode::NONE).unwrap(),
+            vec![0x00]
         );
     }
 
