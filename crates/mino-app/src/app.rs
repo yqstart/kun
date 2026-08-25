@@ -441,6 +441,12 @@ mkdir -p "$MOUNT" || fail "创建挂载目录失败"
 hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT" >/dev/null 2>&1 || fail "挂载 DMG 失败"
 SRC="$MOUNT/Mino.app"
 [ -d "$SRC" ] || { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; fail "DMG 中未找到 Mino.app"; }
+# 发布脚本会对 .app 做签名；安装前验证整个 bundle，防止下载包被篡改
+# 或替换为未签名内容后直接以用户权限执行。
+if ! codesign --verify --deep --strict "$SRC" >/dev/null 2>&1; then
+  hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true
+  fail "应用签名校验失败"
+fi
 # 先通知应用已完成挂载和源文件校验；应用收到后退出，脚本再替换正在运行的旧版本。
 write_result "ready"
 i=0
