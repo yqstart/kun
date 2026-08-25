@@ -2985,6 +2985,17 @@ impl eframe::App for MinoApp {
             }
         }
 
+        // egui Window 的 Esc 默认只清除焦点，不会关闭自绘标题栏窗口；
+        // 这里按前台弹窗优先级显式处理，避免 UI 提示与实际行为不一致。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if self.show_new_conn {
+                self.show_new_conn = false;
+                self.form.name_focused = false;
+            } else if self.show_settings {
+                self.show_settings = false;
+            }
+        }
+
         // ==================== 处理异步结果 ====================
         // 所有标签都轮询后台状态，非活动标签不会积压终端写回或 SFTP 事件。
         for tab in &mut self.tabs {
@@ -4302,6 +4313,52 @@ mod settings_tests {
             harness.step();
         }
         assert!(!harness.state().show_settings, "⌘, 应再次关闭设置弹窗");
+    }
+
+    #[test]
+    fn 转义键关闭设置与连接弹窗() {
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
+        harness.run_steps(6);
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run_steps(3);
+        assert!(harness.state().show_settings);
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(3);
+        assert!(!harness.state().show_settings, "Esc 应关闭设置弹窗");
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::N,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run_steps(3);
+        assert!(harness.state().show_new_conn);
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(3);
+        assert!(!harness.state().show_new_conn, "Esc 应关闭新建连接对话框");
     }
 
     /// 标签栏齿轮按钮存在且在标签栏最右侧（> 200 px）。
