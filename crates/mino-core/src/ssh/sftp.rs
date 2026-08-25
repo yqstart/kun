@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -283,7 +284,25 @@ async fn sftp_main(
     let _ = ev_tx.send(SftpEvent::Ready { home }).await;
 
     // ==================== 3. 操作循环 ====================
-    while let Some(cmd) = cmd_rx.recv().await {
+    // 命令循环同时轮询连接健康：服务器断开后 russh 底层会把连接标记为
+    // 已关闭，此前的实现只在 recv 上等待，断连后命令持续失败但永远不
+    // 退出、永远不发 Closed（UI 状态栏永远显示"已连接"）。每 2 秒轻量
+    // 探测一次，断连即退出循环并发送 Closed。
+    const LIVENESS_POLL: Duration = Duration::from_secs(2);
+    loop {
+        let cmd = tokio::select! {
+            cmd = cmd_rx.recv() => cmd,
+            _ = tokio::time::sleep(LIVENESS_POLL) => {
+                if handle.is_closed() {
+                    log::warn!("SFTP 连接已断开，退出操作循环");
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(cmd) = cmd else {
+            break;
+        };
         match cmd {
             SftpCmd::List { path } => {
                 let result = list_dir(&sftp, &path).await;
