@@ -269,7 +269,7 @@ impl TerminalView {
             0.0,
             Color32::from_rgb(term_bg.r, term_bg.g, term_bg.b),
         );
-        // 低对比网格与右上角柔光：提供科技感的空间层次，但不干扰终端文本。
+        // 低对比网格：提供科技感的空间层次，但不干扰终端文本。
         let grid_step = 32.0;
         let grid_color = crate::theme::tokens::GRID_LINE;
         let first_x = outer.left() - outer.left().rem_euclid(grid_step);
@@ -290,12 +290,6 @@ impl TerminalView {
                 egui::Stroke::new(1.0, grid_color),
             );
         }
-        crate::anim::paint_glow(
-            ui.painter(),
-            egui::pos2(outer.right() - 24.0, outer.top() + 20.0),
-            150.0,
-            theme.accent2.gamma_multiply(0.35),
-        );
         // 终端内容区域：背景铺满面板，文本/光标在内边距内绘制。
         let inner = outer.shrink(PADDING);
 
