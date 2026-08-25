@@ -2,11 +2,11 @@
 
 pub mod anim;
 mod app;
-pub mod completion;
 mod native;
 pub mod perf;
 pub mod theme;
 pub mod views;
+mod workdir;
 
 use app::{MinoApp, PRODUCT_NAME};
 use eframe::egui;
@@ -97,7 +97,9 @@ fn setup_fonts(ctx: &egui::Context) {
                 .families
                 .get_mut(&FontFamily::Monospace)
                 .unwrap()
-                .push("mino_mono_sym".to_owned());
+                // 符号 fallback 必须先于 egui 默认 Hack/NotoEmoji，
+                // 但排在主等宽字体之后，保证优先使用同宽 Menlo 字形。
+                .insert(if loaded_mono { 1 } else { 0 }, "mino_mono_sym".to_owned());
             log::info!("加载等宽符号 fallback 字体：{path}");
             break;
         }
@@ -179,11 +181,11 @@ fn main() -> eframe::Result {
         .with_title(PRODUCT_NAME)
         // 保留 macOS 的 Titled 窗口样式，避免无边框窗口退出时触发 AppKit 的
         // NSTouchBarFinderObservation 崩溃；标题栏本身仍做成透明并与内容重叠，
-        // 外观继续由应用自绘。
+        // 红绿灯使用 macOS 原生按钮，保证悬浮图标与其他应用一致。
         .with_decorations(true)
         .with_fullsize_content_view(true)
         .with_title_shown(false)
-        .with_titlebar_buttons_shown(false)
+        .with_titlebar_buttons_shown(true)
         .with_titlebar_shown(false);
     // 设置应用图标（macOS Dock 图标由 eframe 运行时写入 NSApp）。
     if let Some(icon) = load_icon() {
@@ -251,9 +253,14 @@ mod font_tests {
                 mono.iter().any(|f| f == "mino_mono_sym"),
                 "Monospace 族应包含 mino_mono_sym，实际：{mono:?}"
             );
-            // 符号 fallback 必须排在中文 fallback 之前（缺字形时优先命中等宽符号）。
+            // 符号 fallback 必须排在中文 fallback 之前，且紧邻主等宽字体，
+            // 不能被 egui 内置 Hack/NotoEmoji 抢先匹配。
             let pos_sym = mono.iter().position(|f| f == "mino_mono_sym");
+            let pos_mono = mono.iter().position(|f| f == "mino_mono");
             let pos_cjk = mono.iter().position(|f| f == "mino_cjk");
+            if let (Some(s), Some(m)) = (pos_sym, pos_mono) {
+                assert_eq!(s, m + 1, "mino_mono_sym 应紧邻主等宽字体，实际：{mono:?}");
+            }
             if let (Some(s), Some(c)) = (pos_sym, pos_cjk) {
                 assert!(s < c, "mino_mono_sym 应排在 mino_cjk 之前，实际：{mono:?}");
             }

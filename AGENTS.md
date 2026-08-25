@@ -31,6 +31,7 @@ crates/
     ├── src/app.rs            # MinoApp：tabs 列表 + 设置弹窗（show_settings）+ 布局/连接管理/对话框/快捷键
     ├── src/perf.rs           # 性能 HUD（帧耗时/FPS/分段打点统计，⌥P 切换）
     ├── src/theme.rs          # 三套深色主题
+    ├── src/workdir.rs        # 根据 PTY 输入跟踪本地/远程 cd 工作目录
     └── src/views/
         ├── terminal_view.rs  # cell 渲染（行级增量 + Galley 缓存）、输入转发、滚动
         └── sftp_view.rs      # 文件面板：列表（show_rows 虚拟化）/导航/传输进度/确认对话框
@@ -42,7 +43,7 @@ crates/
 
 - 本地：`tty::new` 建 PTY → alacritty `EventLoop` 线程读 → vte 解析 → `Term` 网格
 - 远程：后台线程 tokio runtime → SSH channel 读 → `Processor::advance` → 同一 `Term`
-- 统一接口：`Session { term, writer, resizer, shuttor, is_remote }`（Writer/Resizer/Shuttor 闭包抽象）；`Session::is_remote()` 决定本地能力（补全）是否可用
+- 统一接口：`Session { term, writer, resizer, shuttor, is_remote }`（Writer/Resizer/Shuttor 闭包抽象）；本地与远程会话共用同一终端输入与渲染链路
 - 写操作：本地走 `EventLoopSender`，远程走命令队列（UI 线程非阻塞）
 - 渲染：UI 锁 `FairMutex<Term>` → `renderable_content()` → 逐行 hash 缓存 LayoutJob（增量重建）
 
@@ -60,14 +61,11 @@ crates/
 - **Wakeup 单次 repaint**：drain_events 不再对 Wakeup 二次 request（mino-core `Listener::send_event` 已直接调 on_event=request_repaint）
 - 性能验证：idle 帧（无内容变化）构建耗时 0.03ms（此前全量扫描 0.5-2ms，降 15-60 倍）
 
-### 基础补全（`mino-app/src/completion.rs`，Warp 风格）
+### 工作目录跟踪（`mino-app/src/workdir.rs`）
 
-- 仅本地会话启用（远程无本机文件系统对应）；`InputModel` 跟踪输入行（与写入 PTY 的字节同步：可见文本追加、退格删尾、`\r` 执行并解析 `cd` 更新 cwd、Ctrl+C 重置、箭头/编辑键使模型失效、**Tab（shell 自身补全会原地改写输入行）也使模型失效**）
-- **`cd` 解析的前缀判定**：`strip_prefix("cd")` 后必须为空或以空白开头——`cdfoo` 是另一个命令，不能误判为 `cd foo`（回归测试 `cd前缀词不误判`）
-- 候选：命令位置匹配 PATH 可执行文件（`command_index()` OnceLock 懒扫描，只收有执行位的文件）；其余匹配 cwd 文件/目录（含 `~/` 展开与子路径），目录补 `/` 后缀
-- **候选计算去抖（v0.7）**：命令候选是内存索引扫描，按键立即算；路径候选（`read_dir` + 逐项 `metadata()` 同步 syscall，大目录卡顿）**去抖 120ms**——连续打字只重算一次，去抖期间 `recompute_pending` 挂起由 show() 到点执行（`request_repaint_after` 驱动）；另带同输入快照跳过（`last_recompute_text`，退格恢复场景不重复 read_dir）。kittest 的 `step()` 不推进虚拟时间且真实时间 < 120ms，命令候选路径（测试输入 "ca"）不受影响
-- 浮层（`terminal_view.rs::render_completion_popup`）：光标行上方 Area 列表（命令 accent2/目录 accent/文件次要色），Tab 确认（按字符退格替换 word 后写 PTY）、↑/↓ 选择、Esc 关闭；输入变化重算（最多 8 条，命令即时/路径去抖 120ms，见上）。**定位用 `Area::anchor` 锚定（`completion_popup_anchor` 纯函数算锚点/offset）：`cursor_pos` 为光标行底部，上方空间充足时 `LEFT_BOTTOM` 锚定浮层底边 = 光标行顶上方 4px、不足时 `LEFT_TOP` 锚定顶边 = 光标行底下方 4px——锚角固定、内容向另一侧生长，浮层真实渲染高度（行间 item_spacing 等）不再影响定位，绝不遮输入行（回归测试：曾用 fixed_pos + 高度估算，漏算行间距致底边侵入输入行 15px）**
-- 键盘拦截在 `handle_input` 的 Key 分支（菜单打开时 Tab/↑/↓/Esc 不转发 shell）；输入动作用 `InputAction` 枚举在 ui.input 闭包内收集、闭包外统一应用（闭包内 `session` 不可变借用，无法直接改 self）
+- 终端输入仍直接交给 shell；跟踪器只根据 PTY 中可观察到的可见字符、退格、回车和控制键，维护一个尽力而为的当前目录
+- 本地 `cd` 使用 `canonicalize` 校验目录，远程 `cd` 只做 POSIX 路径词法归一化；`cdfoo` 不会被误判为 `cd foo`
+- SFTP 面板读取 `TerminalView::current_directory()`，用于从终端当前目录快捷定位
 - **egui 0.36 焦点坑：Text/Key 事件帧后终端焦点可能被清除（`Memory::end_pass` dead-man-switch，kittest 必现）**——`TerminalView` 维护 `had_focus`，曾聚焦且当前 `focused().is_none()` 时每帧 `request_focus` 恢复（对话框输入框后渲染覆盖，不冲突）
 
 ### SFTP
@@ -116,7 +114,7 @@ crates/
 - **"删除键插入空格"**：有两类独立根因——①**微信输入法 wetype**：退格/删除键按下时输入法伴随发送"空格类" Text 事件（ASCII 空格/零宽）→ 已修复：`suppress_next_text` 跨帧标记 + 退格后一帧内的空白类 Text 丢弃（只影响空白字符，不误伤正常输入）；回归测试 `退格伴随空格文本不插入` ②**TERM=dumb**：zle 判定非交互终端，删除回显走「原地空格覆盖」（只发空格缺 `\b`）→ 已修复：env 注入 TERM（见下条）
 - **布局重构（v0.5/v0.6）**：移除了左侧固定主机栏（`Panel::left("hosts")`）与顶部工具栏（`Panel::top("toolbar")`），所有原工具栏入口（主题/更新/品牌 logo）搬入**设置弹窗**（不再用 tab）；标签栏最右侧 `settings_gear_button` **22×22 纯图标齿轮**（无文字 label，**朴素风：⚙ 符号次要色、hover 变主色 + 白 8% 圆角底**（曾为渐变圆底 + accent2 辉光，用户要求朴素化），包装为 `egui::Button` 以便被 kittest `Role::Button` 找到），click → `show_settings = true`；`⌘,` toggle 设置弹窗（macOS 标准"应用偏好设置"快捷键，取代原 `⌘B` 折叠侧栏）。**`MinoApp::new` 启动仅创建本地终端 tab**（`Vec<Box<TerminalTab>>`），`active_tab = 0`（不打扰用户进入终端）；设置弹窗默认关闭。标签栏图标按钮：**＋（新建本地终端）→ `>_`（快速 SSH 连接）→ ⚙ 齿轮**（复制 tab「⎘」按钮已移除，相关 `duplicate_active_tab`/`new_local_tab_with_label` 一并删除）
 - **快速 SSH 连接按钮**（`ssh_quick_button` + `host_quick_menu`）：标签栏 `>_` 图标（monospace ">_" 终端符号，风格同齿轮），点击弹出 `egui::Popup::menu` 主机菜单——**单击主机行直接发起连接**（与设置弹窗主机行双击不同，快捷入口单击即连，点击后 `ui.close()` 关闭菜单）；行样式：**固定宽 256、行高 40、先 allocate 满宽再绘内容**（hover 白 8% 圆角底贴齐左右内边距 4px，不按内容包围盒 expand——短名称曾只亮一小块）；**渐变圆头像 22px 垂直居中 + 名称/user@host 左对齐截断**（名称 `text_primary` / 地址 `text_secondary`）——**禁止 `add_sized` 放 Label**（其内部 `centered_and_justified` 把短名称水平居中，和长地址错位）；无已保存主机时提示"暂无已保存主机"+ 新建连接按钮（打开 `show_new_conn`）。**`Popup::menu` 的开关状态按按钮 Id 记忆，按钮必须 `ui.push_id("ssh_quick")` 固定 Id**（自动 Id 帧间漂移会让菜单闪断）；Popup::show 只接受 content 闭包（ctx 在构造时绑定，无 ctx 参数）；回归测试 `ssh快捷按钮连接主机`（隔离配置 + 端口 9 立即拒绝，断言 pending_label）/ `ssh快捷按钮无主机提示` / `ssh快捷菜单行左对齐`（短名与长名左缘对齐、名称与地址同一列）
-- **窗口实现现状（v0.7.1）**：macOS 保留透明的全尺寸标题栏并隐藏系统标题/按钮，避免无边框窗口退出时的 AppKit 崩溃；应用仍自绘交通灯和标签栏拖拽区，`native.rs` 负责圆角与透明背景。
+- **窗口实现现状（v0.7.1）**：macOS 保留透明的全尺寸标题栏并隐藏标题文字，保留系统原生交通灯按钮，避免无边框窗口退出时的 AppKit 崩溃；应用自绘标签栏拖拽区，`native.rs` 负责圆角与透明背景。
 - **窗口整体圆角**（`native.rs`，仅 macOS）：`with_decorations(false)` 无边框窗口是方角，通过 AppKit 给 contentView 的 backing layer 设 `cornerRadius=12` + `masksToBounds`，并 `setOpaque(false)` + `backgroundColor=clearColor` 让圆角外侧透明露出桌面（像素验证：四角 RGBA=(0,0,0,0) 全透明）。入口在 `main.rs` 的 app_creator 闭包 `native::apply_rounded_window(cc)`——用 `cc.window_handle()` 拿 `RawWindowHandle::AppKit` → `ns_view` 指针转 `&NSView`（同 eframe 内部写法，指针窗口生命周期内有效）；kittest 测试环境无真实 AppKit 句柄（`window_handle()` 失败/非 AppKit 变体）时静默返回，不 panic。**依赖**：mino-app 直接声明 `objc2-app-kit`（补 `NSColor`/`NSWindow`/`NSView` + `objc2-quartz-core` feature 使 CALayer 可用，features 全局合并不影响 eframe/winit）+ `objc2` + `raw-window-handle`（版本与 eframe 一致 0.6.2）；NSWindow 为 `MainThreadOnly`，必须在 eframe 主线程创建期调用
 - **无边框窗口拖拽**（`tab_bar`）：无系统标题栏，`tab_bar` 开头对**整行**（`ui.max_rect()`，Panel 分配区域非 0x0）注册底层 `Sense::drag()` 背景（id `tab_bar_drag`），`drag_started()` 时发 `ViewportCommand::StartDrag`（egui-winit 转 winit `drag_window()`，需窗口有焦点）。**关键交互顺序**：egui 命中规则是**后注册 widget 在顶层**（`WidgetRects::get_layer` back-to-front，`hit_test` 中 `drag_idx < click_idx` 判定 click 在 drag 之上）——拖拽背景**先注册**（底层），tabs/红绿灯/齿轮**后注册**（顶层），故控件点击/拖拽优先，仅标签栏空白处按下拖动才移窗；`Sense::drag` 的大背景 + 附近小控件会被 hit_test 的 `contains_rect` 帮助逻辑优先给小控件。**实测验证**：CGEvent 模拟标签栏空白处拖拽 → 窗口位置精确移动对应距离；点击齿轮 → 设置弹窗正常打开（kittest 齿轮测试亦通过）；`ui.interact` 不占布局空间不移动 cursor，horizontal 布局不受影响
 - **设置弹窗**（`fn settings_panel(ctx)`，`egui::Window` 居中，标题"设置"）：卡片化三组（`Self::settings_card` helper 渲染 `bg_elevated` 底 + 边框 + 圆角 + 紧凑内边距）：**主机管理**（复用 `host_sidebar`）/ **外观**（主题 ComboBox）/ **关于**（版本号 + 检查更新按钮）。`ScrollArea` 垂直滚动，max_height 420 防止超出视口。**主机管理卡片内不要画细分隔线**——曾用 `hairline()` 画「新建连接」与主机列表的分隔线，但 hairline 取 `ui.max_rect().top()`（卡片内容区**顶部**）而非当前光标位置，线实际出现在"主机管理"标题下方、压在新建连接按钮上方（像素验证 y=266），用户要求去掉；`hairline` 函数已连同删除（`ui.max_rect().top()` 不等于 cursor.y，任何分隔线都应用 `ui.cursor().top()`）
@@ -149,7 +147,7 @@ crates/
 ## 验证
 
 ```bash
-cargo test --workspace         # 75 个测试（单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页 + 双击交互 + 表单默认值 + 补全模型/候选 + 补全浮层交互 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单）；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
+ cargo test --workspace         # 单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页 + 双击交互 + 表单默认值 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
 cargo clippy --workspace --all-targets   # 零警告
 cargo fmt --all
 ```

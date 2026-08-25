@@ -103,43 +103,57 @@ impl EventListener for Listener {
         // 只在锁内更新共享状态；UI 回调可能触发事件循环唤醒，不能在
         // 持有 pending 锁时调用，否则 UI 线程 drain_events 与后台线程
         // 的回调路径会形成不必要的锁竞争，严重时表现为窗口卡死。
-        let notify = {
+        let should_notify = {
             let mut pending = self.shared.pending.lock().unwrap();
             // 非 Wakeup 事件需要保留顺序，但后台标签页可能长时间不可见；
-            // 设置上限，避免标题/写回等异常事件无限增长耗尽内存。
+            // 普通状态事件设置上限，避免异常事件无限增长。PtyWrite 是
+            // 用户数据，不能因状态事件已满而丢弃；相邻写回合并以减少
+            // 队列条目数量，数据本身仍完整保留。
             const MAX_PENDING_EVENTS: usize = 256;
             match event {
                 Event::Title(title) => {
                     *self.shared.title.lock().unwrap() = title.clone();
                     if pending.len() < MAX_PENDING_EVENTS {
                         pending.push(SessionEvent::Title(title));
+                        true
+                    } else {
+                        false
                     }
                 }
                 Event::ChildExit(_) => {
                     *self.shared.exited.lock().unwrap() = true;
                     if pending.len() < MAX_PENDING_EVENTS {
                         pending.push(SessionEvent::ChildExit);
+                        true
+                    } else {
+                        false
                     }
                 }
                 Event::PtyWrite(text) => {
-                    if pending.len() < MAX_PENDING_EVENTS {
+                    if let Some(SessionEvent::PtyWrite(previous)) = pending.last_mut() {
+                        previous.push_str(&text);
+                    } else {
+                        // PtyWrite 不受普通状态事件上限限制，避免粘贴/OSC
+                        // 回写数据在后台标签页积压时被静默丢失。
                         pending.push(SessionEvent::PtyWrite(text));
                     }
+                    true
                 }
-                Event::Bell => {
-                    if pending.len() < MAX_PENDING_EVENTS {
-                        pending.push(SessionEvent::Bell);
-                    }
+                Event::Bell if pending.len() < MAX_PENDING_EVENTS => {
+                    pending.push(SessionEvent::Bell);
+                    true
                 }
-                // 不要用 pending.last() 通知：未处理的 alacritty 事件会
+                Event::Bell => false,
+                // 不要为未入队事件用 pending.last() 通知：队列已满时会
                 // 误重复通知上一次事件，造成无意义的重绘。
-                _ => return,
+                _ => false,
             }
-            pending.last().cloned()
         };
 
-        if let Some(event) = notify {
-            (self.on_event)(&event);
+        // 回调只作为“有事件需要 UI 尽快轮询”的重绘信号；实际事件数据
+        // 统一从 pending 队列读取，避免复制大型 PtyWrite 字符串。
+        if should_notify {
+            (self.on_event)(&SessionEvent::Wakeup);
         }
     }
 }
@@ -448,6 +462,46 @@ mod tests {
         listener.send_event(Event::Wakeup);
         assert!(shared.wakeup.load(Ordering::Acquire));
         assert!(shared.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn 队列已满时保留写回数据且不重复旧事件通知() {
+        let shared = Arc::new(Shared::default());
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count_clone = callback_count.clone();
+        let listener = Listener {
+            shared: shared.clone(),
+            on_event: Arc::new(move |_event| {
+                callback_count_clone.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+
+        // 填满普通状态事件队列。
+        for _ in 0..256 {
+            listener.send_event(Event::Bell);
+        }
+        let callbacks_at_capacity = callback_count.load(Ordering::Relaxed);
+        assert_eq!(callbacks_at_capacity, 256);
+
+        // 队列满时丢弃可合并的 Bell，但不能重复回调上一次 Bell。
+        listener.send_event(Event::Bell);
+        assert_eq!(
+            callback_count.load(Ordering::Relaxed),
+            callbacks_at_capacity
+        );
+
+        // PtyWrite 是用户数据，不受普通事件上限影响；相邻写回合并，
+        // 数据仍须完整保留。
+        listener.send_event(Event::PtyWrite("payload".into()));
+        listener.send_event(Event::PtyWrite("!".into()));
+        assert_eq!(
+            callback_count.load(Ordering::Relaxed),
+            callbacks_at_capacity + 2
+        );
+        let pending = shared.pending.lock().unwrap();
+        assert!(pending
+            .iter()
+            .any(|event| { matches!(event, SessionEvent::PtyWrite(text) if text == "payload!") }));
     }
 
     /// 高频输出只需触发一次唤醒回调，不能按输出块无限追加 Wakeup 事件。

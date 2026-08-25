@@ -9,14 +9,14 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::cell::{Flags, LineLength};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::TermDamage;
 use alacritty_terminal::vte::ansi::{Color as AColor, CursorShape, NamedColor, Rgb};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, Rect, Stroke, TextFormat, Ui, Vec2};
-use mino_core::terminal::keys::{self, Key, Mods};
+use mino_core::terminal::keys::{self, Key, Mods, MouseWheelDirection};
 use mino_core::terminal::{Session, SessionEvent, TermMode};
 
 /// 行缓存：内容 hash 未变时复用已布局文本（Galley），避免每帧重建。
@@ -138,28 +138,16 @@ pub struct TerminalView {
     /// （某些输入法（如微信输入法）退格时会伴随发送空格类文本，
     /// 写入终端表现为"删除键插入空格"；正常字符不受影响）
     suppress_blank_frames: u8,
-    /// 补全输入模型（本地会话启用；远程会话恒失效）。
-    input: crate::completion::InputModel,
+    /// 当前工作目录跟踪器（供 SFTP 面板快捷定位使用）。
+    workdir: crate::workdir::WorkdirTracker,
     /// 远程会话的初始目录（由 SFTP realpath(".") 提供）。
     remote_home: Option<std::path::PathBuf>,
-    /// 当前补全候选。
-    candidates: Vec<crate::completion::Candidate>,
-    /// 候选选中索引。
-    candidate_selected: usize,
-    /// 光标屏幕坐标（补全浮层定位）。
-    cursor_pos: Option<egui::Pos2>,
     /// 上一帧终端是否持有焦点（焦点自动恢复用）。
     had_focus: bool,
     /// 分段耗时打点（性能 HUD 读数；默认不共享，仅本视图内部使用）。
     last_build_ms: f32,
     last_layout_ms: f32,
     last_paint_ms: f32,
-    /// 上次补全候选重算时刻（去抖：连续打字不重复 read_dir/metadata）。
-    last_recompute: std::time::Instant,
-    /// 去抖期间挂起的重算请求（到点后由 show() 执行）。
-    recompute_pending: bool,
-    /// 上次重算时的输入快照（同快照不重算，退格后恢复场景）。
-    last_recompute_text: String,
     /// 会话标题缓存（`SessionEvent::Title` 时更新，避免每帧 Mutex + String clone）。
     cached_title: String,
     /// 当前终端选区（⌘C / Ctrl+Shift+C 复制）。
@@ -174,7 +162,7 @@ impl TerminalView {
     /// 创建终端视图并启动本地会话。
     pub fn new(session: Session) -> Self {
         let is_remote = session.is_remote();
-        // 本地会话初始工作目录：会话启动目录（HOME）；远程不启用补全。
+        // 本地会话初始工作目录：会话启动目录（HOME）。
         let cwd = if is_remote {
             std::path::PathBuf::from("/")
         } else {
@@ -198,18 +186,12 @@ impl TerminalView {
             initialized: false,
             last_mode: TermMode::NONE,
             suppress_blank_frames: 0,
-            input: crate::completion::InputModel::new(cwd),
+            workdir: crate::workdir::WorkdirTracker::new(cwd),
             remote_home: None,
-            candidates: Vec::new(),
-            candidate_selected: 0,
-            cursor_pos: None,
             had_focus: false,
             last_build_ms: 0.0,
             last_layout_ms: 0.0,
             last_paint_ms: 0.0,
-            last_recompute: std::time::Instant::now(),
-            recompute_pending: false,
-            last_recompute_text: String::new(),
             cached_title,
             selection: None,
             selecting: false,
@@ -237,7 +219,7 @@ impl TerminalView {
         if self.session.is_remote() && self.remote_home.is_none() {
             return None;
         }
-        Some(self.input.cwd.to_string_lossy().into_owned())
+        Some(self.workdir.cwd().to_string_lossy().into_owned())
     }
 
     /// 设置远程会话的初始工作目录。
@@ -247,7 +229,7 @@ impl TerminalView {
         }
         let cwd = std::path::PathBuf::from(path);
         self.remote_home = Some(cwd.clone());
-        self.input.set_cwd(cwd);
+        self.workdir.set_cwd(cwd);
     }
 
     /// 轮询后台事件但不渲染终端。
@@ -287,7 +269,7 @@ impl TerminalView {
             0.0,
             Color32::from_rgb(term_bg.r, term_bg.g, term_bg.b),
         );
-        // 低对比网格与右上角柔光：提供科技感的空间层次，但不干扰终端文本。
+        // 低对比网格：提供科技感的空间层次，但不干扰终端文本。
         let grid_step = 32.0;
         let grid_color = crate::theme::tokens::GRID_LINE;
         let first_x = outer.left() - outer.left().rem_euclid(grid_step);
@@ -308,12 +290,6 @@ impl TerminalView {
                 egui::Stroke::new(1.0, grid_color),
             );
         }
-        crate::anim::paint_glow(
-            ui.painter(),
-            egui::pos2(outer.right() - 24.0, outer.top() + 20.0),
-            150.0,
-            theme.accent2.gamma_multiply(0.35),
-        );
         // 终端内容区域：背景铺满面板，文本/光标在内边距内绘制。
         let inner = outer.shrink(PADDING);
 
@@ -327,18 +303,6 @@ impl TerminalView {
         // （app.rs 的 `ctx.request_repaint()`），此处仅处理 PtyWrite 回写
         // 与标题缓存更新。
         self.drain_background_events();
-
-        // 补全去抖：挂起的重算到点后执行（需请求一帧重绘驱动）。
-        if self.recompute_pending {
-            const DEBOUNCE: Duration = Duration::from_millis(120);
-            if self.last_recompute.elapsed() >= DEBOUNCE {
-                self.recompute_candidates();
-                // 重算可能产生候选，浮层渲染依赖本帧，无需额外 repaint；
-                // 若结果为空则关闭浮层，本帧已完成。
-            } else {
-                ctx.request_repaint_after(DEBOUNCE - self.last_recompute.elapsed().min(DEBOUNCE));
-            }
-        }
 
         // ==================== 尺寸计算与 resize ====================
         // cell 尺寸只依赖字体（启动时加载），缓存到字段避免每帧 fonts_mut。
@@ -366,6 +330,9 @@ impl TerminalView {
             // 通知 PTY 并同步终端状态机网格（Session::resize 内部完成锁内 resize）。
             self.session.resize(self.cols, self.rows);
             self.rows_cache.clear();
+            // 选区的 grid_line 是建立时的快照，resize 重排网格后可能悬空
+            // （复制时越界索引在 release 下会 panic），尺寸变化即放弃选区。
+            self.selection = None;
         }
 
         // ==================== 构建渲染数据（锁内，行级增量） ====================
@@ -458,11 +425,6 @@ impl TerminalView {
                         Vec2::new(cell_width, cell_height),
                     ));
                 }
-                // 光标屏幕位置（补全浮层定位：光标行底部）。
-                self.cursor_pos = Some(egui::pos2(
-                    inner.min.x + cursor.point.column.0 as f32 * cell_width,
-                    inner.min.y + (disp_line as f32 + 1.0) * cell_height,
-                ));
             }
         }
         self.last_build_ms = build_start.elapsed().as_secs_f32() * 1000.0;
@@ -577,9 +539,9 @@ impl TerminalView {
         if !has_focus_now && self.had_focus && ui.memory(|m| m.focused().is_none()) {
             ui.memory_mut(|m| m.request_focus(self.focus_id));
         }
-        // 终端是一个整体的键盘控件，Tab/方向键/Esc 都应交给 shell 或补全
-        // 状态处理，不能触发 egui 的控件焦点导航。否则远程 shell 执行
-        // Tab 补全后，终端会失去焦点，紧接的 Ctrl+C 可能被 UI 吞掉。
+        // 终端是一个整体的键盘控件，Tab/方向键/Esc 都应交给 shell 处理，
+        // 不能触发 egui 的控件焦点导航。否则 shell 执行 Tab 后，终端会失去焦点，
+        // 紧接的 Ctrl+C 可能被 UI 吞掉。
         let has_terminal_focus = ui.memory(|m| m.has_focus(self.focus_id));
         if has_terminal_focus {
             ui.memory_mut(|m| {
@@ -647,12 +609,12 @@ impl TerminalView {
             self.selecting = false;
         }
         if ui.memory(|m| m.has_focus(self.focus_id)) {
-            self.handle_input(ui);
+            self.handle_input(ui, inner);
         }
     }
 
     /// 处理键盘与鼠标输入（转发到 PTY / 网格滚动）。
-    fn handle_input(&mut self, ui: &Ui) {
+    fn handle_input(&mut self, ui: &Ui, inner: Rect) {
         let session = &self.session;
         let mode = self.last_mode;
         let cell_height = self.cell_height;
@@ -660,7 +622,7 @@ impl TerminalView {
         // 滚动后需要重绘；不能在 ui.input 闭包内调用 request_repaint
         // （Context 锁已被 input 持有，会自死锁 10 秒后 panic），用 flag 延后。
         let mut need_repaint = false;
-        // 本帧输入动作（闭包内只读 self 写入 PTY，闭包外统一同步补全模型）。
+        // 本帧输入动作（闭包内只读 self 写入 PTY，闭包外统一更新工作目录跟踪器）。
         let mut actions: Vec<InputAction> = Vec::new();
 
         // 检测本帧是否有退格/删除键按下（含上一帧的抑制状态）。
@@ -709,28 +671,6 @@ impl TerminalView {
                                 actions.push(InputAction::CopySelection);
                             }
                             continue;
-                        }
-                        // 补全菜单打开时：Tab 确认、↑/↓ 选择、Esc 关闭（不转发给 shell）。
-                        if !self.candidates.is_empty() {
-                            match key {
-                                egui::Key::Tab => {
-                                    actions.push(InputAction::AcceptCompletion);
-                                    continue;
-                                }
-                                egui::Key::ArrowUp => {
-                                    actions.push(InputAction::SelectUp);
-                                    continue;
-                                }
-                                egui::Key::ArrowDown => {
-                                    actions.push(InputAction::SelectDown);
-                                    continue;
-                                }
-                                egui::Key::Escape => {
-                                    actions.push(InputAction::CloseMenu);
-                                    continue;
-                                }
-                                _ => {}
-                            }
                         }
                         let mods = Mods {
                             shift: modifiers.shift,
@@ -798,35 +738,96 @@ impl TerminalView {
                         modifiers,
                         ..
                     } => {
-                        let lines = match unit {
-                            egui::MouseWheelUnit::Point => (delta.y / (cell_height * 3.0)) as i32,
-                            egui::MouseWheelUnit::Line => delta.y as i32,
-                            egui::MouseWheelUnit::Page => {
-                                let term_arc = session.term();
-                                let mut guard = term_arc.lock();
-                                if delta.y > 0.0 {
-                                    guard.grid_mut().scroll_display(Scroll::PageUp);
-                                } else {
-                                    guard.grid_mut().scroll_display(Scroll::PageDown);
-                                }
-                                need_repaint = true;
-                                0
-                            }
+                        let Some(pointer) =
+                            i.pointer.hover_pos().filter(|pos| inner.contains(*pos))
+                        else {
+                            continue;
                         };
-                        if lines != 0 {
-                            let term_arc = session.term();
-                            let mut guard = term_arc.lock();
-                            let grid = guard.grid_mut();
-                            if modifiers.alt {
-                                if lines > 0 {
-                                    grid.scroll_display(Scroll::PageUp);
-                                } else {
-                                    grid.scroll_display(Scroll::PageDown);
+                        let Some(direction) = mouse_wheel_direction(delta.y) else {
+                            continue;
+                        };
+                        let steps = mouse_wheel_steps(*unit, delta.y, cell_height, self.rows);
+                        if steps == 0 {
+                            continue;
+                        }
+
+                        // 终端应用（如 Vim）先于本地 scrollback 取得滚轮：应用打开
+                        // DECSET 鼠标上报后，必须收到 xterm 鼠标按键序列才能处理滚动。
+                        match wheel_target(mode) {
+                            WheelTarget::ApplicationMouse => {
+                                let (column, row) = terminal_cell_from_screen(
+                                    pointer,
+                                    inner,
+                                    self.cell_width,
+                                    cell_height,
+                                    self.cols as usize,
+                                    self.rows as usize,
+                                );
+                                let mods = Mods {
+                                    shift: modifiers.shift,
+                                    alt: modifiers.alt,
+                                    ctrl: modifiers.ctrl,
+                                    super_: false,
+                                };
+                                let Some(bytes) =
+                                    keys::encode_mouse_wheel(direction, mods, mode, column, row)
+                                else {
+                                    continue;
+                                };
+                                for _ in 0..steps {
+                                    session.write(&bytes);
+                                    actions.push(InputAction::Bytes(bytes.clone()));
                                 }
-                            } else {
-                                grid.scroll_display(Scroll::Delta(lines));
                             }
-                            need_repaint = true;
+                            // 未启用鼠标上报的替代屏应用仍应遵循终端惯例，将滚轮
+                            // 映射为方向键（例如未设 mouse=a 的 Vim 或 less）。
+                            WheelTarget::AlternateScroll => {
+                                let key = match direction {
+                                    MouseWheelDirection::Up => Key::Up,
+                                    MouseWheelDirection::Down => Key::Down,
+                                };
+                                let Some(bytes) = keys::encode_key(key, Mods::default(), mode)
+                                else {
+                                    continue;
+                                };
+                                for _ in 0..steps {
+                                    session.write(&bytes);
+                                    actions.push(InputAction::Bytes(bytes.clone()));
+                                }
+                            }
+                            WheelTarget::Scrollback => {
+                                let lines = match unit {
+                                    egui::MouseWheelUnit::Point => {
+                                        (delta.y / (cell_height * 3.0)) as i32
+                                    }
+                                    egui::MouseWheelUnit::Line => delta.y as i32,
+                                    egui::MouseWheelUnit::Page => {
+                                        let term_arc = session.term();
+                                        let mut guard = term_arc.lock();
+                                        if delta.y > 0.0 {
+                                            guard.scroll_display(Scroll::PageUp);
+                                        } else {
+                                            guard.scroll_display(Scroll::PageDown);
+                                        }
+                                        need_repaint = true;
+                                        0
+                                    }
+                                };
+                                if lines != 0 {
+                                    let term_arc = session.term();
+                                    let mut guard = term_arc.lock();
+                                    if modifiers.alt {
+                                        if lines > 0 {
+                                            guard.scroll_display(Scroll::PageUp);
+                                        } else {
+                                            guard.scroll_display(Scroll::PageDown);
+                                        }
+                                    } else {
+                                        guard.scroll_display(Scroll::Delta(lines));
+                                    }
+                                    need_repaint = true;
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -838,14 +839,9 @@ impl TerminalView {
             ctx.request_repaint();
         }
 
-        // 闭包外统一应用输入动作，同步补全模型。
+        // 闭包外统一应用输入动作，更新工作目录跟踪器。
         for action in actions {
             self.apply_input_action(action, &ctx);
-        }
-        // 渲染补全浮层（本地会话）。
-        if !self.candidates.is_empty() {
-            self.render_completion_ghost(ui);
-            self.render_completion_popup(ui);
         }
         self.render_copy_feedback(ui);
     }
@@ -855,25 +851,11 @@ impl TerminalView {
         match action {
             InputAction::Bytes(bytes) => self.track_input_bytes(&bytes),
             InputAction::Text(text) => {
-                self.input.push_text(&text);
-                self.request_recompute();
+                self.workdir.push_text(&text);
             }
             InputAction::Paste => {
-                // 粘贴内容不可逐字节信任，模型失效禁用补全直到回车。
-                self.input.invalidate();
-                self.candidates.clear();
-            }
-            InputAction::AcceptCompletion => self.accept_completion(),
-            InputAction::SelectUp => {
-                self.candidate_selected = self.candidate_selected.saturating_sub(1);
-            }
-            InputAction::SelectDown => {
-                let n = self.candidates.len().saturating_sub(1);
-                self.candidate_selected = (self.candidate_selected + 1).min(n);
-            }
-            InputAction::CloseMenu => {
-                self.candidates.clear();
-                self.candidate_selected = 0;
+                // 粘贴内容不可逐字节信任（可能包含控制序列），暂停目录跟踪。
+                self.workdir.invalidate();
             }
             InputAction::CopySelection => self.copy_selection(ctx),
         }
@@ -898,33 +880,28 @@ impl TerminalView {
         ctx.request_repaint_after(Duration::from_millis(1200));
     }
 
-    /// 分析写入 PTY 的字节并同步输入模型（本地与远程会话）。
+    /// 分析写入 PTY 的字节并同步工作目录跟踪器（本地与远程会话）。
     fn track_input_bytes(&mut self, bytes: &[u8]) {
         match bytes {
-            // 回车：执行命令（解析 cd），清空输入，模型恢复可靠。
+            // 回车：执行命令并尝试解析 cd，清空当前输入跟踪。
             b"\r" | b"\n" => {
                 if self.session.is_remote() {
-                    self.input.execute_remote(self.remote_home.as_deref());
+                    self.workdir.execute_remote(self.remote_home.as_deref());
                 } else {
-                    self.input.execute();
+                    self.workdir.execute();
                 }
-                self.candidates.clear();
             }
             // Ctrl+C：重置当前行。
             b"\x03" => {
-                self.input.reset();
-                self.candidates.clear();
+                self.workdir.reset();
             }
             // 退格/删除。
             b"\x7f" | b"\x08" => {
-                self.input.backspace();
-                self.request_recompute();
+                self.workdir.backspace();
             }
-            // Tab（shell 自身补全/移动光标）：输入行已被 shell 改写（zsh 菜单
-            // 补全会原地扩展命令），模型无法追踪，失效禁用浮层避免给出错候选。
+            // Tab（shell 自身补全/移动光标）：输入行可能被 shell 改写，暂停目录跟踪。
             b"\t" => {
-                self.input.invalidate();
-                self.candidates.clear();
+                self.workdir.invalidate();
             }
             _ => {
                 // 可见文本（ASCII 可打印 / 空格 / 非 ASCII）。
@@ -932,271 +909,14 @@ impl TerminalView {
                     if s.chars()
                         .all(|c| c.is_ascii_graphic() || c == ' ' || !c.is_ascii())
                     {
-                        self.input.push_text(s);
-                        self.request_recompute();
+                        self.workdir.push_text(s);
                         return;
                     }
                 }
                 // 控制序列/编辑键（箭头、Ctrl+U/W 等）：光标位置不可追踪，模型失效。
-                self.input.invalidate();
-                self.candidates.clear();
+                self.workdir.invalidate();
             }
         }
-    }
-
-    /// 请求重新计算补全候选（路径候选去抖）。
-    ///
-    /// 命令候选是内存索引扫描（`command_index` 进程级缓存），毫秒级，立即算；
-    /// 路径候选每次都要 `read_dir` + 逐项 `metadata()` 同步 syscall
-    /// （大目录下卡顿），连续打字时去抖 120ms 只重算一次，去抖期间挂起
-    /// 由 show() 到点执行。
-    fn request_recompute(&mut self) {
-        if self.session.is_remote() {
-            self.candidates.clear();
-            return;
-        }
-        let (word_start, word) = crate::completion::last_word(&self.input.text);
-        let is_command_pos = word_start == 0 && !word.contains('/');
-        if is_command_pos && !word.is_empty() {
-            self.recompute_candidates();
-            return;
-        }
-        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
-        if self.last_recompute.elapsed() >= DEBOUNCE {
-            self.recompute_candidates();
-        } else {
-            self.recompute_pending = true;
-        }
-    }
-
-    /// 实际执行候选重算（含同输入快照跳过：退格后恢复原文本等场景不重复 read_dir）。
-    fn recompute_candidates(&mut self) {
-        if self.session.is_remote() {
-            self.candidates.clear();
-            return;
-        }
-        self.last_recompute = std::time::Instant::now();
-        self.recompute_pending = false;
-        if self.input.text == self.last_recompute_text {
-            return;
-        }
-        self.last_recompute_text = self.input.text.clone();
-        self.candidates = crate::completion::compute_candidates(
-            &self.input,
-            crate::completion::command_index(),
-            8,
-        );
-        self.candidate_selected = 0;
-    }
-
-    /// 用选中候选替换输入中的当前 word（发送退格 + 候选文本到 PTY）。
-    fn accept_completion(&mut self) {
-        let Some(c) = self.candidates.get(self.candidate_selected).cloned() else {
-            return;
-        };
-        let (word_start, word) = crate::completion::last_word(&self.input.text);
-        // shell 中删除旧 word（按字符退格）再写入补全文本。
-        let mut bytes: Vec<u8> = Vec::new();
-        bytes.extend(std::iter::repeat_n(b'\x7f', word.chars().count()));
-        bytes.extend_from_slice(c.text.as_bytes());
-        self.session.write(&bytes);
-        // 同步模型。
-        self.input.text.truncate(word_start);
-        self.input.text.push_str(&c.text);
-        self.candidates.clear();
-        self.candidate_selected = 0;
-    }
-
-    /// 渲染补全浮层（输入行上方，Warp 风格候选列表）。
-    fn render_completion_popup(&mut self, ui: &Ui) {
-        let theme = crate::theme::current_theme();
-        let Some(cursor_pos) = self.cursor_pos else {
-            return;
-        };
-        let inner = ui.max_rect().shrink(PADDING);
-        let popup_w = 326.0;
-        let row_h = 30.0;
-        let rows = self.candidates.len().min(8) as f32;
-        // 估算高度与实际 header / footer / row 节奏一致，避免浮层定位和真实
-        // 尺寸不一致时出现遮挡输入行或上下跳动。
-        let popup_h = 42.0 + rows * row_h + 30.0 + 20.0;
-        // 锚定：上方空间充足时浮层底边固定在光标行顶上方 4px（实际渲染多高都
-        // 向上生长，绝不遮输入行）；不足时顶边固定在光标行底下方 4px。
-        let (anchor, offset) = completion_popup_anchor(
-            cursor_pos,
-            self.cell_height,
-            egui::vec2(popup_w, popup_h),
-            inner,
-            ui.ctx().content_rect(),
-        );
-        egui::Area::new(egui::Id::new("completion_popup"))
-            .order(egui::Order::Foreground)
-            // Warp 风格浮层允许鼠标点选；接受后重新把焦点交还终端。
-            .interactable(true)
-            .anchor(anchor, offset)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::new()
-                    .fill(theme.bg_panel)
-                    .stroke(egui::Stroke::new(1.0, theme.accent2.gamma_multiply(0.65)))
-                    .corner_radius(10.0)
-                    .inner_margin(egui::Margin::symmetric(10, 10))
-                    .show(ui, |ui| {
-                        ui.set_width(popup_w - 20.0);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 7.0;
-                            ui.label(
-                                egui::RichText::new("SUGGESTIONS")
-                                    .monospace()
-                                    .size(9.0)
-                                    .color(theme.accent),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{:02} MATCHES",
-                                            self.candidates.len().min(8)
-                                        ))
-                                        .monospace()
-                                        .size(9.0)
-                                        .color(theme.text_muted),
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(8.0);
-                        let mut clicked: Option<usize> = None;
-                        for (i, c) in self.candidates.iter().enumerate().take(8) {
-                            let selected = i == self.candidate_selected;
-                            let (color, marker) = match c.kind {
-                                // 标记用 ASCII/常用字符（Proportional 字体无 Menlo fallback，
-                                // ⚙ 等符号有缺字形风险）。
-                                crate::completion::CandidateKind::Command => (theme.accent2, "$"),
-                                crate::completion::CandidateKind::Dir => (theme.accent, ">"),
-                                crate::completion::CandidateKind::File => {
-                                    (theme.text_secondary, "·")
-                                }
-                            };
-                            let (row_rect, row) = ui.allocate_exact_size(
-                                egui::vec2(popup_w - 20.0, row_h),
-                                egui::Sense::click(),
-                            );
-                            if row.hovered() {
-                                self.candidate_selected = i;
-                            }
-                            if selected || row.hovered() {
-                                ui.painter().rect_filled(
-                                    row_rect,
-                                    crate::theme::tokens::RADIUS_ITEM,
-                                    if selected {
-                                        theme.accent_soft
-                                    } else {
-                                        theme.bg_elevated.gamma_multiply(0.85)
-                                    },
-                                );
-                            }
-                            if selected {
-                                ui.painter().rect_filled(
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(row_rect.left(), row_rect.top()),
-                                        egui::pos2(row_rect.left() + 2.0, row_rect.bottom()),
-                                    ),
-                                    1.0,
-                                    theme.accent,
-                                );
-                            }
-                            let mut row_ui = ui.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(row_rect.shrink2(egui::vec2(10.0, 0.0)))
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                            );
-                            row_ui.spacing_mut().item_spacing.x = 9.0;
-                            row_ui.label(
-                                egui::RichText::new(marker).size(12.0).color(if selected {
-                                    theme.text_primary
-                                } else {
-                                    color
-                                }),
-                            );
-                            row_ui.label(
-                                egui::RichText::new(&c.display)
-                                    .size(13.0)
-                                    .color(if selected { theme.text_primary } else { color }),
-                            );
-                            row_ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(match c.kind {
-                                            crate::completion::CandidateKind::Command => "CMD",
-                                            crate::completion::CandidateKind::Dir => "DIR",
-                                            crate::completion::CandidateKind::File => "FILE",
-                                        })
-                                        .monospace()
-                                        .size(8.0)
-                                        .color(theme.text_muted),
-                                    );
-                                },
-                            );
-                            if row.clicked() {
-                                clicked = Some(i);
-                            }
-                        }
-                        ui.add_space(7.0);
-                        ui.painter().line_segment(
-                            [
-                                ui.cursor().left_top(),
-                                egui::pos2(ui.max_rect().right(), ui.cursor().top()),
-                            ],
-                            egui::Stroke::new(1.0, theme.border),
-                        );
-                        ui.add_space(6.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new("↑ ↓ 选择   Tab 补全   Esc 关闭")
-                                    .monospace()
-                                    .size(8.5)
-                                    .color(theme.text_muted),
-                            );
-                        });
-                        if let Some(i) = clicked {
-                            self.candidate_selected = i;
-                            self.accept_completion();
-                            ui.memory_mut(|m| m.request_focus(self.focus_id));
-                        }
-                    });
-            });
-    }
-
-    /// 在真实 shell 光标右侧绘制第一候选的幽灵后缀，减少“只弹一个列表”的
-    /// 鸡肋感；Tab 仍然是明确提交，Enter 继续执行 shell 当前命令。
-    fn render_completion_ghost(&self, ui: &Ui) {
-        let Some(cursor_pos) = self.cursor_pos else {
-            return;
-        };
-        let Some(candidate) = self.candidates.first() else {
-            return;
-        };
-        if candidate.kind != crate::completion::CandidateKind::Command {
-            return;
-        }
-        let (_, word) = crate::completion::last_word(&self.input.text);
-        let Some(suffix) = candidate.text.strip_prefix(word) else {
-            return;
-        };
-        if suffix.is_empty() {
-            return;
-        }
-        ui.painter().text(
-            egui::pos2(cursor_pos.x, cursor_pos.y - self.cell_height),
-            egui::Align2::LEFT_TOP,
-            suffix,
-            FontId::monospace(self.font_size),
-            crate::theme::current_theme()
-                .text_muted
-                .gamma_multiply(0.62),
-        );
     }
 
     /// 复制成功后的非侵入式反馈，不抢终端焦点。
@@ -1234,61 +954,89 @@ impl TerminalView {
     }
 }
 
-/// 计算补全浮层的锚定方式（独立函数便于单测）。
-///
-/// `cursor` 为光标行**底部**坐标。返回 `(anchor, offset)`，供 `Area::anchor` 使用
-/// （offset 相对屏幕内容区 `content` 的对应锚角）：
-/// - 上方空间充足时返回 `LEFT_BOTTOM` 锚定：浮层底边固定在光标行顶上方 4px，
-///   实际渲染多高都向上生长，**与浮层真实尺寸无关，绝不遮挡输入行**；
-/// - 不足时返回 `LEFT_TOP` 锚定：顶边固定在光标行底下方 4px，向下生长。
-///
-/// x 方向以光标为轴向左偏移并限制在终端内容区内。
-fn completion_popup_anchor(
-    cursor: egui::Pos2,
-    cell_height: f32,
-    popup_size: egui::Vec2,
-    inner: egui::Rect,
-    content: egui::Rect,
-) -> (egui::Align2, egui::Vec2) {
-    let x = (cursor.x - popup_size.x * 0.35).clamp(
-        inner.left(),
-        (inner.right() - popup_size.x - 4.0).max(inner.left()),
-    );
-    if cursor.y - cell_height - popup_size.y - 4.0 >= inner.top() {
-        // 上方模式：浮层底边锚定在光标行顶上方 4px。
-        let offset = egui::vec2(
-            x - content.left(),
-            (cursor.y - cell_height - 4.0) - content.bottom(),
-        );
-        (egui::Align2::LEFT_BOTTOM, offset)
-    } else {
-        // 下方模式：浮层顶边锚定在光标行底下方 4px。
-        let offset = egui::vec2(x - content.left(), (cursor.y + 4.0) - content.top());
-        (egui::Align2::LEFT_TOP, offset)
-    }
-}
-
-/// 一帧内的终端输入动作（闭包内收集，闭包外统一应用到补全模型）。
+/// 一帧内的终端输入动作（闭包内收集，闭包外统一应用到工作目录跟踪器）。
 enum InputAction {
     /// 已写入 PTY 的字节。
     Bytes(Vec<u8>),
     /// 已写入的可见文本。
     Text(String),
-    /// 粘贴（模型失效）。
+    /// 粘贴（工作目录跟踪器失效）。
     Paste,
-    /// Tab 确认补全（拦截，不转发 shell）。
-    AcceptCompletion,
-    /// 候选上移。
-    SelectUp,
-    /// 候选下移。
-    SelectDown,
-    /// 关闭补全浮层。
-    CloseMenu,
     /// 复制当前终端选区。
     CopySelection,
 }
 
 // ==================== 辅助函数 ====================
+
+/// 滚轮事件的优先目标：全屏应用的鼠标协议优先于本地 scrollback。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelTarget {
+    ApplicationMouse,
+    AlternateScroll,
+    Scrollback,
+}
+
+fn wheel_target(mode: TermMode) -> WheelTarget {
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        WheelTarget::ApplicationMouse
+    } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        WheelTarget::AlternateScroll
+    } else {
+        WheelTarget::Scrollback
+    }
+}
+
+fn mouse_wheel_direction(delta_y: f32) -> Option<MouseWheelDirection> {
+    if delta_y > 0.0 {
+        Some(MouseWheelDirection::Up)
+    } else if delta_y < 0.0 {
+        Some(MouseWheelDirection::Down)
+    } else {
+        None
+    }
+}
+
+/// 一次 egui 滚轮事件应转换成多少个离散 xterm 滚轮按键。
+fn mouse_wheel_steps(
+    unit: egui::MouseWheelUnit,
+    delta_y: f32,
+    cell_height: f32,
+    rows: u16,
+) -> usize {
+    let magnitude = delta_y.abs();
+    if !magnitude.is_finite() || magnitude == 0.0 {
+        return 0;
+    }
+
+    let max_steps = usize::from(rows).max(1);
+    let steps = match unit {
+        // Point 事件可能小于一个 cell；xterm 滚轮是离散按钮，至少发一次，
+        // 避免触控板的小增量被全部截断。
+        egui::MouseWheelUnit::Point => (magnitude / (cell_height.max(1.0) * 3.0)).ceil(),
+        egui::MouseWheelUnit::Line => magnitude.ceil(),
+        egui::MouseWheelUnit::Page => max_steps as f32,
+    };
+    steps.max(1.0).min(max_steps as f32) as usize
+}
+
+/// 屏幕坐标 → 当前终端视口 cell 坐标（从零开始）。
+fn terminal_cell_from_screen(
+    pos: egui::Pos2,
+    inner: Rect,
+    cell_width: f32,
+    cell_height: f32,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize) {
+    let x = (pos.x - inner.left()).clamp(0.0, inner.width().max(0.0));
+    let y = (pos.y - inner.top()).clamp(0.0, inner.height().max(0.0));
+    let col = (x / cell_width.max(1.0)).floor() as usize;
+    let row = (y / cell_height.max(1.0)).floor() as usize;
+    (
+        col.min(cols.saturating_sub(1)),
+        row.min(rows.saturating_sub(1)),
+    )
+}
 
 /// 屏幕坐标 → 当前视口对应的网格坐标。
 fn selection_point_from_screen(
@@ -1321,6 +1069,14 @@ fn selection_to_text(
     } else {
         (selection.focus, selection.anchor)
     };
+    // 选区是建立时的 grid_line 快照，网格可能因 resize/scrollback 裁剪而缩小；
+    // alacritty 的 Storage 越界防护仅 debug_assert，release 下会直接 panic——
+    // 复制前校验范围（有效网格行号 = [-history_size, screen_lines)），越界放弃复制。
+    let history = grid.history_size() as i32;
+    let screen = grid.screen_lines() as i32;
+    if start.grid_line < -history || end.grid_line >= screen {
+        return String::new();
+    }
     let mut output = String::new();
     for grid_line in start.grid_line..=end.grid_line {
         let Some((mut from, to)) = selection.columns_for_line(grid_line, cols) else {
@@ -1831,69 +1587,6 @@ mod tests {
         }
     }
 
-    /// 渲染级回归：光标在视口底行输入时，浮层实际渲染矩形不得遮挡输入行
-    /// （曾因浮层高度估算漏算行间距，底边侵入输入行约 15px）。
-    #[test]
-    fn 浮层实际渲染不遮输入行() {
-        let session = Session::spawn_local(
-            SessionOptions::default(),
-            80,
-            24,
-            Arc::new(|_ev: &SessionEvent| {}),
-        )
-        .expect("创建本地终端失败");
-        let view = Rc::new(RefCell::new(TerminalView::new(session)));
-        let view_show = view.clone();
-        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
-            view_show.borrow_mut().show(ui);
-        });
-        assert!(
-            wait_text(&view, &mut harness, "mino"),
-            "zsh 未就绪，终端内容：\n{}",
-            grid_text(view.borrow().session())
-        );
-
-        // 输出足够多行让光标到视口底行。
-        view.borrow().session().write(b"seq 40\r");
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            harness.step();
-            if grid_text(view.borrow().session())
-                .lines()
-                .any(|l| l.trim_end() == "40")
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(60));
-        }
-
-        // 输入 "l" 触发补全候选（最多 8 条）。
-        send_key(&mut harness, egui::Key::L, Some("l"));
-        for _ in 0..6 {
-            harness.step();
-        }
-
-        let (n, cursor_pos, cell_height) = {
-            let v = view.borrow();
-            (v.candidates.len(), v.cursor_pos, v.cell_height)
-        };
-        assert!(n > 0, "输入 l 后应有补全候选");
-
-        let popup_rect = harness
-            .ctx
-            .memory(|m| m.area_rect(egui::Id::new("completion_popup")));
-        let cursor = cursor_pos.expect("光标位置未记录");
-        let input_row = egui::Rect::from_min_max(
-            egui::pos2(0.0, cursor.y - cell_height),
-            egui::pos2(5000.0, cursor.y),
-        );
-        let pr = popup_rect.expect("浮层未渲染（area_rect 为 None）");
-        assert!(
-            !pr.intersects(input_row),
-            "浮层盖住输入行：浮层 {pr:?} 与输入行 {input_row:?} 相交"
-        );
-    }
-
     /// 鼠标拖动终端网格应建立稳定的选区（回归：终端曾只有键盘焦点，
     /// 任何拖动都不会产生可复制文本）。
     #[test]
@@ -2024,10 +1717,10 @@ mod tests {
         );
     }
 
-    /// Tab 属于终端输入，不应被 egui 当作焦点导航键；否则 SSH 远端补全后
+    /// Tab 属于终端输入，不应被 egui 当作焦点导航键；否则 shell 处理 Tab 后
     /// 终端会短暂失去焦点，紧接着的 Ctrl+C 可能被吞掉。
     #[test]
-    fn tab补全保持终端焦点() {
+    fn tab保持终端焦点() {
         let session = Session::spawn_local(
             SessionOptions::default(),
             80,
@@ -2167,7 +1860,9 @@ mod deadlock_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        // 注入滚轮事件（Point/Line/Page 三种单位）。
+        // 注入滚轮事件（Point/Line/Page 三种单位）。滚轮只在指针位于终端时处理。
+        harness.event(egui::Event::PointerMoved(egui::pos2(100.0, 100.0)));
+        harness.step();
         for unit in [
             egui::MouseWheelUnit::Point,
             egui::MouseWheelUnit::Line,
@@ -2183,6 +1878,45 @@ mod deadlock_tests {
             harness.step();
         }
         // 若修复失效，此处会在 10 秒死锁后 panic；到达这里说明通过。
+    }
+}
+
+#[cfg(test)]
+mod mouse_wheel_tests {
+    use super::*;
+
+    #[test]
+    fn 鼠标上报优先于替代屏和scrollback() {
+        assert_eq!(
+            wheel_target(
+                TermMode::MOUSE_REPORT_CLICK
+                    | TermMode::SGR_MOUSE
+                    | TermMode::ALT_SCREEN
+                    | TermMode::ALTERNATE_SCROLL,
+            ),
+            WheelTarget::ApplicationMouse
+        );
+        assert_eq!(
+            wheel_target(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL),
+            WheelTarget::AlternateScroll
+        );
+        assert_eq!(wheel_target(TermMode::NONE), WheelTarget::Scrollback);
+    }
+
+    #[test]
+    fn 小幅point滚轮不会被截断() {
+        assert_eq!(
+            mouse_wheel_steps(egui::MouseWheelUnit::Point, 0.25, 16.0, 24),
+            1
+        );
+        assert_eq!(
+            mouse_wheel_steps(egui::MouseWheelUnit::Line, -3.0, 16.0, 24),
+            3
+        );
+        assert_eq!(
+            mouse_wheel_steps(egui::MouseWheelUnit::Page, 1.0, 16.0, 24),
+            24
+        );
     }
 }
 
@@ -2483,6 +2217,18 @@ mod cell_semantics_tests {
     }
 
     #[test]
+    fn 过期选区越界时安全返回空串() {
+        // 选区是建立时的 grid_line 快照；resize/scrollback 裁剪后网格缩小，
+        // 快照可能悬空。alacritty Storage 越界防护仅 debug_assert，
+        // release 下索引越界会 panic——越界时须安全返回空串（放弃复制）。
+        let grid = Grid::<Cell>::new(2, 6, 0);
+        // 网格只有 2 行可视 + 0 行 scrollback，快照却引用第 5 行。
+        assert_eq!(selection_to_text(&grid, selection((5, 0), (5, 1)), 6), "");
+        // 快照引用 scrollback 深处（history=0 时负行号同样越界）。
+        assert_eq!(selection_to_text(&grid, selection((-3, 0), (-3, 1)), 6), "");
+    }
+
+    #[test]
     fn 渲染器保留隐藏与跨行宽字符列位() {
         let theme = crate::theme::current_theme();
         let mut grid = Grid::<Cell>::new(1, 4, 0);
@@ -2636,80 +2382,6 @@ mod ime_backspace_tests {
         assert!(
             !last_line.contains("ab "),
             "退格不应插入空格，最后一行：{last_line:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod completion_popup_tests {
-    use super::completion_popup_anchor;
-
-    /// 内边距后的终端内容区（800x600 面板去 PADDING）。
-    fn inner() -> egui::Rect {
-        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0))
-    }
-
-    /// 屏幕内容区（含标签栏高度，与 ctx.content_rect 同构）。
-    fn content() -> egui::Rect {
-        egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 560.0))
-    }
-
-    /// 3 条候选的浮层尺寸（3 * 22 + 2 * 3 + 12 + 8）。
-    fn popup() -> egui::Vec2 {
-        egui::vec2(260.0, 86.0)
-    }
-
-    /// 输入行在视口中部：上方模式，浮层底边锚定在光标行顶上方 4px。
-    #[test]
-    fn 输入行在中部浮层在上方() {
-        let cursor = egui::pos2(120.0, 160.0); // 光标行底部（第 10 行）
-        let (anchor, offset) = completion_popup_anchor(cursor, 16.0, popup(), inner(), content());
-        assert_eq!(anchor, egui::Align2::LEFT_BOTTOM, "空间充足应用上方模式");
-        assert_eq!(
-            content().bottom() + offset.y,
-            160.0 - 16.0 - 4.0,
-            "浮层底边应锚定在光标行顶上方 4px"
-        );
-    }
-
-    /// 输入行在视口顶部（上方放不下）：下方模式，顶边锚定在光标行底下方 4px。
-    #[test]
-    fn 输入行在顶部浮层在下方() {
-        let cursor = egui::pos2(120.0, 42.0); // 内容区第 1 行底
-        let (anchor, offset) = completion_popup_anchor(cursor, 16.0, popup(), inner(), content());
-        assert_eq!(anchor, egui::Align2::LEFT_TOP, "上方放不下应用下方模式");
-        assert_eq!(
-            content().top() + offset.y,
-            42.0 + 4.0,
-            "浮层顶边应锚定在光标行底下方 4px"
-        );
-    }
-
-    /// 上方空间恰好放得下（浮层顶边 == 终端顶）时仍用上方模式。
-    #[test]
-    fn 上方空间恰好放得下() {
-        // 106 - 16 - 86 - 4 = 0 == inner.top()
-        let cursor = egui::pos2(120.0, 106.0);
-        let (anchor, _) = completion_popup_anchor(cursor, 16.0, popup(), inner(), content());
-        assert_eq!(
-            anchor,
-            egui::Align2::LEFT_BOTTOM,
-            "恰好放得下时应保持上方模式"
-        );
-    }
-
-    /// x 方向限制在终端内容区内（光标靠边时浮层不越界）。
-    #[test]
-    fn 浮层x方向不越界() {
-        let left =
-            completion_popup_anchor(egui::pos2(0.0, 160.0), 16.0, popup(), inner(), content());
-        assert_eq!(content().left() + left.1.x, 0.0, "浮层不得超出内容区左缘");
-        let right =
-            completion_popup_anchor(egui::pos2(800.0, 160.0), 16.0, popup(), inner(), content());
-        assert_eq!(
-            content().left() + right.1.x,
-            800.0 - 260.0 - 4.0,
-            "浮层不得超出内容区右缘"
         );
     }
 }

@@ -75,12 +75,24 @@ pub(crate) fn save_known_hosts(path: &Path, known: &KnownHosts) -> std::io::Resu
         .unwrap_or("known_hosts.toml");
     let tmp = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
     let result = (|| {
-        std::fs::write(&tmp, content)?;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            // 创建时即 0600：避免先按 umask 建文件（常见 0644）再 chmod
+            // 的短暂可读窗口（指纹防本地其他用户读取篡改）。
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::File::create(&tmp)?;
+        use std::io::Write;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, path)
     })();
     if result.is_err() {

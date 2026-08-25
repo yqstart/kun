@@ -7,6 +7,7 @@ use egui::{
     epaint::Vertex, pos2, Color32, Context, CornerRadius, Id, Mesh, Painter, Pos2, Rect, Shape,
     Vec2,
 };
+use std::time::Duration;
 
 /// 指数平滑的收敛速率（1/秒，越大越快）。
 pub const SPEED_FAST: f32 = 34.0;
@@ -82,10 +83,14 @@ pub fn smooth_state(ctx: &Context, id: Id, target: f32, speed: f32, eps: f32) ->
         d.insert_temp(id, value);
         d.insert_temp(id.with("t"), time);
     });
-    AnimValue {
-        value,
-        settling: (value - target).abs() > eps,
+    let settling = (value - target).abs() > eps;
+    if settling {
+        // egui 是事件驱动渲染；没有输入/终端输出时，仅更新临时状态不会
+        // 自动产生下一帧，动画会停在中间值。按收敛过程安排低频下一帧，
+        // 收敛后自动停止，避免像 Spinner 一样常驻 60fps。
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
+    AnimValue { value, settling }
 }
 
 /// `smooth_state` 的简写，仅返回值。
