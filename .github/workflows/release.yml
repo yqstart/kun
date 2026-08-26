@@ -1,5 +1,5 @@
 # ==================== Mino 发布（macOS） ====================
-# 触发：推送 v* 标签（如 v0.1.0），或 Actions 页手动 Run workflow。
+# 触发：推送 v* 标签（如 v1.0.0），或 Actions 页手动 Run workflow。
 # 流程：macOS ARM / Intel 原生构建 → .app + dmg → 上传 GitHub Release。
 # 说明：产物未签名/未公证（可后续配置）；版本号取自 git tag。
 

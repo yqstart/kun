@@ -2167,15 +2167,26 @@ impl MinoApp {
                     selected,
                     anim::SPEED_FAST,
                 );
+                let active_fill = egui::Color32::from_rgba_unmultiplied(
+                    theme.accent.r(),
+                    theme.accent.g(),
+                    theme.accent.b(),
+                    (26.0 * sel_alpha) as u8,
+                );
+                let active_stroke = egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(
+                        theme.accent.r(),
+                        theme.accent.g(),
+                        theme.accent.b(),
+                        (96.0 * sel_alpha) as u8,
+                    ),
+                );
                 let row = ui
                     .scope_builder(egui::UiBuilder::new().id_salt(("tab", i)), |ui| {
                         egui::Frame::new()
-                            .fill(egui::Color32::from_rgba_unmultiplied(
-                                theme.bg_panel.r(),
-                                theme.bg_panel.g(),
-                                theme.bg_panel.b(),
-                                (sel_alpha * 255.0) as u8,
-                            ))
+                            .fill(active_fill)
+                            .stroke(active_stroke)
                             .corner_radius(crate::theme::tokens::RADIUS_ITEM)
                             .inner_margin(egui::Margin::symmetric(2, 3))
                             .show(ui, |ui| {
@@ -2186,7 +2197,7 @@ impl MinoApp {
                                         egui::RichText::new(&prefix)
                                             .size(11.5)
                                             .color(if selected {
-                                                theme.text_muted
+                                                theme.accent2
                                             } else {
                                                 theme.text_muted.gamma_multiply(0.7)
                                             })
@@ -2199,7 +2210,7 @@ impl MinoApp {
                                             egui::Button::new(
                                                 egui::RichText::new(title).size(12.5).color(
                                                     if selected {
-                                                        theme.text_primary
+                                                        theme.accent
                                                     } else {
                                                         theme.text_muted
                                                     },
@@ -2216,11 +2227,17 @@ impl MinoApp {
                                     ui.add_space(1.0);
                                     if ui
                                         .add(
-                                            egui::Button::new("×")
-                                                .fill(egui::Color32::TRANSPARENT)
-                                                .stroke(egui::Stroke::NONE)
-                                                .min_size(egui::vec2(18.0, 18.0))
-                                                .corner_radius(4.0),
+                                            egui::Button::new(egui::RichText::new("×").color(
+                                                if selected {
+                                                    theme.accent.gamma_multiply(0.85)
+                                                } else {
+                                                    theme.text_muted
+                                                },
+                                            ))
+                                            .fill(egui::Color32::TRANSPARENT)
+                                            .stroke(egui::Stroke::NONE)
+                                            .min_size(egui::vec2(18.0, 18.0))
+                                            .corner_radius(4.0),
                                         )
                                         .on_hover_text("关闭标签页")
                                         .clicked()
@@ -2233,8 +2250,8 @@ impl MinoApp {
                     })
                     .response;
 
-                // hover 底（动画过渡）：白色低透明度叠加画在内容之后，只是
-                // 极淡提亮不遮文字；激活 tab 的凸起底已由上方 Frame 先铺好。
+                // hover 底（动画过渡）：使用主题 accent 的低透明度叠加，保持终端
+                // 控制台的色彩语气；激活 tab 的底色和描边已由上方 Frame 先铺好。
                 let hover = row.hovered() && !selected;
                 let hover_alpha = anim::smooth_bool(
                     ui.ctx(),
@@ -2246,11 +2263,16 @@ impl MinoApp {
                     ui.painter().rect_filled(
                         row.rect.expand2(egui::vec2(1.0, 2.0)),
                         crate::theme::tokens::RADIUS_ITEM,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12)
-                            .gamma_multiply(hover_alpha),
+                        egui::Color32::from_rgba_unmultiplied(
+                            theme.accent.r(),
+                            theme.accent.g(),
+                            theme.accent.b(),
+                            (18.0 * hover_alpha) as u8,
+                        ),
                     );
                 }
-                // 底部指示条（宽度随选中状态动画；白色细线，Tabby current-tab-indicator）。
+                // 底部指示条（宽度随选中状态动画）：用 accent 色和短距离辉光
+                // 表示当前焦点，避免白色线条破坏终端配色。
                 let bar_w = anim::smooth(
                     ui.ctx(),
                     egui::Id::new(("tab_bar_w", i)),
@@ -2266,11 +2288,29 @@ impl MinoApp {
                         egui::pos2(row.rect.center().x, row.rect.bottom() - 1.0),
                         egui::vec2(bar_w, 2.0),
                     );
+                    let glow = egui::Rect::from_center_size(
+                        egui::pos2(bar.center().x, bar.center().y),
+                        egui::vec2(bar_w + 8.0, 5.0),
+                    );
+                    ui.painter().rect_filled(
+                        glow,
+                        2.0,
+                        egui::Color32::from_rgba_unmultiplied(
+                            theme.accent.r(),
+                            theme.accent.g(),
+                            theme.accent.b(),
+                            (42.0 * sel_alpha) as u8,
+                        ),
+                    );
                     ui.painter().rect_filled(
                         bar,
                         1.0,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)
-                            .gamma_multiply(sel_alpha.max(0.25)),
+                        egui::Color32::from_rgba_unmultiplied(
+                            theme.accent.r(),
+                            theme.accent.g(),
+                            theme.accent.b(),
+                            (220.0 * sel_alpha.max(0.25)) as u8,
+                        ),
                     );
                 }
             }
@@ -2678,6 +2718,9 @@ impl MinoApp {
     /// 无标签页时的空状态。
     fn empty_state(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let theme = crate::theme::current_theme();
+        // 顶部标签栏与内容区之间保留呼吸空间，避免最后一个 tab 关闭后
+        // 空状态内容紧贴窗口上沿。
+        ui.add_space(32.0);
         ui.centered_and_justified(|ui| {
             ui.vertical_centered(|ui| {
                 draw_logo_mark(ui, 48.0);
@@ -2689,11 +2732,7 @@ impl MinoApp {
                         .color(theme.text_primary),
                 );
                 ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new("⌘T 新建本地终端 · ⌘N 新建连接")
-                        .size(12.0)
-                        .color(theme.text_muted),
-                );
+                shortcut_hint(ui, theme);
                 ui.add_space(14.0);
                 let btn = egui::Button::new(
                     egui::RichText::new("新建本地终端")
@@ -2712,6 +2751,66 @@ impl MinoApp {
 }
 
 // ==================== 绘制辅助 ====================
+
+/// 渲染空状态中的快捷键提示。
+///
+/// 快捷键单独使用等宽字体并放入固定高度的键帽，避免 `⌘` 因字体回退与
+/// `T` 产生不同的字面高度；说明文字继续使用比例界面字体。
+fn shortcut_hint(ui: &mut egui::Ui, theme: &crate::theme::Theme) {
+    const ITEM_SPACING: f32 = 5.0;
+    const KEY_HORIZONTAL_PADDING: f32 = 10.0;
+    let measure = |text: &str, font: egui::FontId| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font, egui::Color32::TRANSPARENT)
+            .size()
+            .x
+    };
+    let key_width =
+        |key: &str| measure(key, egui::FontId::monospace(10.5)) + KEY_HORIZONTAL_PADDING;
+    let label_width = |label: &str| measure(label, egui::FontId::proportional(11.5));
+    let row_width = key_width("⌘T")
+        + label_width("新建本地终端")
+        + label_width("·")
+        + key_width("⌘N")
+        + label_width("新建连接")
+        + ITEM_SPACING * 4.0;
+    // `ui.horizontal` 会占满父布局宽度且默认从左侧排布；根据当前 UI 的
+    // 真实中心坐标补前导空间，避免嵌套布局的 available_width 造成偏移。
+    let leading_space = (ui.max_rect().center().x - ui.cursor().left() - row_width * 0.5).max(0.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = ITEM_SPACING;
+        ui.add_space(leading_space);
+        shortcut_key(ui, theme, "⌘T");
+        ui.label(
+            egui::RichText::new("新建本地终端")
+                .size(11.5)
+                .color(theme.text_muted),
+        );
+        ui.label(egui::RichText::new("·").size(11.5).color(theme.text_muted));
+        shortcut_key(ui, theme, "⌘N");
+        ui.label(
+            egui::RichText::new("新建连接")
+                .size(11.5)
+                .color(theme.text_muted),
+        );
+    });
+}
+
+/// 终端风格的快捷键键帽。
+fn shortcut_key(ui: &mut egui::Ui, theme: &crate::theme::Theme, key: &str) {
+    egui::Frame::new()
+        .fill(theme.bg_elevated)
+        .stroke(egui::Stroke::new(1.0, theme.accent.gamma_multiply(0.45)))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(5, 2))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(key)
+                    .font(egui::FontId::monospace(10.5))
+                    .color(theme.accent),
+            );
+        });
+}
 
 /// 隔离的测试配置路径（每个测试独享一份临时文件）。
 ///
@@ -4197,6 +4296,42 @@ mod tab_tests {
             harness.query_all_by_label("×").count(),
             0,
             "全部关闭后应无 × 按钮"
+        );
+    }
+
+    /// 最后一个标签关闭后，空状态不能紧贴顶部标签栏，且快捷键应作为独立键帽渲染。
+    #[test]
+    fn 无标签页空状态有顶部留白与快捷键键帽() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
+        harness.run_steps(6);
+        harness.event(egui::Event::Key {
+            key: egui::Key::W,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..4 {
+            harness.step();
+        }
+
+        let title = harness.get_by_label(PRODUCT_NAME);
+        assert!(
+            title.rect().top() > 110.0,
+            "空状态标题应与顶部标签栏保持距离，实际 top={}",
+            title.rect().top()
+        );
+        assert!(harness.get_by_label("⌘T").rect().height() > 0.0);
+        assert!(harness.get_by_label("⌘N").rect().height() > 0.0);
+        let shortcut_left = harness.get_by_label("⌘T").rect().left();
+        let shortcut_right = harness.get_by_label("新建连接").rect().right();
+        let shortcut_center = (shortcut_left + shortcut_right) * 0.5;
+        let title_center = title.rect().center().x;
+        assert!(
+            (shortcut_center - title_center).abs() < 10.0,
+            "快捷键行应与标题居中，shortcut_center={shortcut_center}, title_center={title_center}"
         );
     }
 

@@ -36,6 +36,26 @@ fn setup_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
     ];
 
+    // ==================== 比例界面字体（按平台） ====================
+    // egui 默认比例字体的中英文与符号容易来自不同字体，尤其是 `⌘T` 这类
+    // 快捷键提示会出现字面高度和视觉重量不一致。优先使用系统 UI 字体，
+    // 让普通界面文字拥有稳定的字形与字距。
+    #[cfg(target_os = "macos")]
+    let ui_candidates = [
+        "/System/Library/Fonts/SFNS.ttf", // SF Pro 系统界面字体
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+    ];
+    #[cfg(target_os = "windows")]
+    let ui_candidates = [
+        "C:\\Windows\\Fonts\\segoeui.ttf", // Segoe UI
+        "C:\\Windows\\Fonts\\segoeuil.ttf",
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let ui_candidates = [
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ];
+
     #[cfg(target_os = "macos")]
     let cjk_candidates = [
         "/System/Library/Fonts/PingFang.ttc",
@@ -72,6 +92,27 @@ fn setup_fonts(ctx: &egui::Context) {
     }
     if !loaded_mono {
         log::warn!("未找到系统等宽字体，使用默认字体");
+    }
+
+    let mut loaded_ui = false;
+    for path in ui_candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "mino_ui".to_owned(),
+                std::sync::Arc::new(FontData::from_owned(bytes)),
+            );
+            fonts
+                .families
+                .get_mut(&FontFamily::Proportional)
+                .unwrap()
+                .insert(0, "mino_ui".to_owned());
+            loaded_ui = true;
+            log::info!("加载界面字体：{path}");
+            break;
+        }
+    }
+    if !loaded_ui {
+        log::warn!("未找到系统界面字体，使用默认比例字体");
     }
 
     // ==================== 等宽符号 fallback（Menlo） ====================
@@ -245,6 +286,17 @@ mod font_tests {
             mono.iter().any(|f| f == "mino_mono"),
             "Monospace 族应包含主等宽字体 mino_mono，实际：{mono:?}"
         );
+        #[cfg(target_os = "macos")]
+        {
+            let proportional = definitions
+                .families
+                .get(&FontFamily::Proportional)
+                .expect("Proportional 族缺失");
+            assert!(
+                proportional.iter().any(|f| f == "mino_ui"),
+                "macOS 比例字体应包含 mino_ui，实际：{proportional:?}"
+            );
+        }
         // Menlo 符号 fallback 仅 macOS 加载（SF Mono 缺 ➜/❯ 等字形）；
         // Linux/Windows 使用自带等宽字体，不适用该断言。
         #[cfg(target_os = "macos")]
