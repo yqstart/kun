@@ -113,20 +113,55 @@ impl EventListener for Listener {
             match event {
                 Event::Title(title) => {
                     *self.shared.title.lock().unwrap() = title.clone();
-                    if pending.len() < MAX_PENDING_EVENTS {
+                    // 标题是最新状态，不能像 Bell 一样在队列满时直接丢弃：
+                    // TerminalView 只从队列更新缓存，丢弃后窗口标题会永久停留
+                    // 在旧值。已有标题直接就地替换；队列满时优先回收一个
+                    // 可丢弃的 Bell，仍保持普通状态事件队列有界。
+                    if let Some(existing) = pending
+                        .iter_mut()
+                        .find(|event| matches!(event, SessionEvent::Title(_)))
+                    {
+                        *existing = SessionEvent::Title(title);
+                        true
+                    } else if pending.len() < MAX_PENDING_EVENTS {
                         pending.push(SessionEvent::Title(title));
                         true
+                    } else if let Some(index) = pending
+                        .iter()
+                        .position(|event| matches!(event, SessionEvent::Bell))
+                    {
+                        pending[index] = SessionEvent::Title(title);
+                        true
                     } else {
-                        false
+                        // 仅剩用户写回数据/不可丢弃状态时允许多出一个标题槽位，
+                        // 不能为了维持计数上限而丢失标题或破坏输入数据。
+                        pending.push(SessionEvent::Title(title));
+                        true
                     }
                 }
                 Event::ChildExit(_) => {
                     *self.shared.exited.lock().unwrap() = true;
-                    if pending.len() < MAX_PENDING_EVENTS {
+                    // 子进程退出是生命周期状态，不能像 Bell 一样在队列满时
+                    // 静默丢弃：否则状态栏可能一直显示“已连接”，直到下一次
+                    // 无关输入才被动刷新。相同事件只保留一份；队列满时优先
+                    // 回收一个可丢弃的 Bell，必要时允许重要状态暂时超出上限。
+                    if pending
+                        .iter()
+                        .any(|event| matches!(event, SessionEvent::ChildExit))
+                    {
+                        true
+                    } else if pending.len() < MAX_PENDING_EVENTS {
                         pending.push(SessionEvent::ChildExit);
                         true
+                    } else if let Some(index) = pending
+                        .iter()
+                        .position(|event| matches!(event, SessionEvent::Bell))
+                    {
+                        pending[index] = SessionEvent::ChildExit;
+                        true
                     } else {
-                        false
+                        pending.push(SessionEvent::ChildExit);
+                        true
                     }
                 }
                 Event::PtyWrite(text) => {
@@ -307,7 +342,10 @@ impl Session {
             },
             Listener {
                 shared: shared.clone(),
-                on_event: Arc::new(|_| {}),
+                // Term 自身负责解析 VT 后产生 Title/PtyWrite/Bell 等事件；
+                // 不能使用空监听器，否则本地终端虽然能显示字符，却会静默
+                // 丢失终端能力应答、标题变化和响铃。
+                on_event: on_event.clone(),
             },
         )));
 
@@ -396,10 +434,12 @@ impl Session {
 
     /// 取出所有待处理事件（UI 每帧轮询）。
     pub fn drain_events(&self) -> Vec<SessionEvent> {
-        let mut pending = self.shared.pending.lock().unwrap();
-        let events = std::mem::take(&mut *pending);
+        // 必须先清除通知标记，再取得队列。若先 take 队列、最后才清除标记，
+        // 后台线程可能在两步之间发出 Wakeup，看到旧的 true 而跳过回调，
+        // 随后又被这里的 store(false) 覆盖，导致终端内容已经更新却没有下一帧。
         self.shared.wakeup.store(false, Ordering::Release);
-        events
+        let mut pending = self.shared.pending.lock().unwrap();
+        std::mem::take(&mut *pending)
     }
 
     /// 当前窗口标题。
@@ -490,18 +530,59 @@ mod tests {
             callbacks_at_capacity
         );
 
+        // 标题是最新状态，队列满时也必须保留，不能让窗口标题永久停在旧值。
+        listener.send_event(Event::Title("新标题".into()));
+        assert_eq!(
+            callback_count.load(Ordering::Relaxed),
+            callbacks_at_capacity + 1
+        );
+        {
+            let pending = shared.pending.lock().unwrap();
+            assert_eq!(pending.len(), 256);
+            assert!(pending
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Title(title) if title == "新标题")));
+        }
+
         // PtyWrite 是用户数据，不受普通事件上限影响；相邻写回合并，
         // 数据仍须完整保留。
         listener.send_event(Event::PtyWrite("payload".into()));
         listener.send_event(Event::PtyWrite("!".into()));
         assert_eq!(
             callback_count.load(Ordering::Relaxed),
-            callbacks_at_capacity + 2
+            callbacks_at_capacity + 3
         );
         let pending = shared.pending.lock().unwrap();
         assert!(pending
             .iter()
             .any(|event| { matches!(event, SessionEvent::PtyWrite(text) if text == "payload!") }));
+    }
+
+    #[test]
+    fn 队列已满时仍通知子进程退出() {
+        let shared = Arc::new(Shared::default());
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count_clone = callback_count.clone();
+        let listener = Listener {
+            shared: shared.clone(),
+            on_event: Arc::new(move |_event| {
+                callback_count_clone.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+
+        for _ in 0..256 {
+            listener.send_event(Event::Bell);
+        }
+        listener.send_event(Event::ChildExit(std::process::ExitStatus::default()));
+
+        assert!(shared.exited.lock().unwrap().to_owned());
+        assert_eq!(callback_count.load(Ordering::Relaxed), 257);
+        assert!(shared
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ChildExit)));
     }
 
     /// 高频输出只需触发一次唤醒回调，不能按输出块无限追加 Wakeup 事件。

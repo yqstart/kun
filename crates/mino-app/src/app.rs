@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use mino_core::config::{Auth, HostConfig, HostProfile};
-use mino_core::ssh::sftp::{connect_sftp, SftpEvent, SftpHandle};
-use mino_core::ssh::{connect_remote, ConnectResult};
+use mino_core::ssh::sftp::{connect_sftp_with_handler, SftpEvent, SftpHandle};
+use mino_core::ssh::{connect_remote_with_cancel, ConnectCancel, ConnectResult};
 use mino_core::terminal::{Session, SessionEvent, SessionOptions};
 use mino_core::updater::{check_for_update, UpdateInfo};
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
@@ -170,8 +170,12 @@ pub struct MinoApp {
     /// 原配置无法读取且备份也失败时，禁止用空配置覆盖原文件。
     config_write_blocked: bool,
     show_new_conn: bool,
+    /// 新建连接弹窗关闭后是否恢复此前被其遮住的设置窗口。
+    settings_before_new_conn: bool,
     form: ConnectForm,
     pending: Option<UnboundedReceiver<ConnectResult>>,
+    /// 当前 SSH 连接建立阶段的取消句柄；替换或销毁等待中的连接时立即取消。
+    pending_connect_cancel: Option<ConnectCancel>,
     pending_label: String,
     toast: Option<Toast>,
     /// 进行中的 SFTP 连接（句柄 + 事件流 + 主机名——主机名随连接绑定，
@@ -196,6 +200,8 @@ pub struct MinoApp {
     restart_at: Option<f64>,
     /// 安装脚本状态文件路径（原子写入后由 UI 轮询）。
     install_result_path: Option<PathBuf>,
+    /// 安装脚本仍在使用的 DMG；安装失败/超时时由 UI 清理。
+    install_dmg_path: Option<PathBuf>,
     /// 安装脚本启动时间，用于检测脚本无响应。
     install_started_at: Option<f64>,
     /// 性能 HUD 是否显示（`⌥P` 切换；默认展示）。
@@ -376,31 +382,41 @@ fn backup_config(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// 时间戳不可预测。此前固定使用 `/tmp/mino-update`：/tmp 的 sticky 位
 /// 不保护子目录内容，其他本地用户可预建该目录（0777）后替换 install.sh
 /// 或预放符号链接，随后被本应用以当前用户权限执行/写入。
-fn update_dir() -> PathBuf {
+fn update_dir() -> Result<PathBuf, String> {
     use std::sync::OnceLock;
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    static DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     DIR.get_or_init(|| {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir =
-            std::env::temp_dir().join(format!("mino-update-{}-{nanos:x}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        // 写入任何内容之前收紧为 0700，隔离其他本地用户。
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let base = std::env::temp_dir();
+        for attempt in 0..32u32 {
+            let dir = base.join(format!(
+                "mino-update-{}-{nanos:x}-{attempt}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            // 目录必须在创建时就是 0700；先 create_dir_all 再 chmod 会留下
+            // 可被其他本地用户抢先写入的窗口，而且还会把预先存在的目录当成成功。
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(&dir) {
+                Ok(()) => return Ok(dir),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!("创建安全更新目录失败：{error}"));
+                }
+            }
         }
-        dir
+        Err("创建安全更新目录失败：临时目录名冲突".into())
     })
     .clone()
 }
 
 /// 下载缓存目录下的 dmg 路径。
-fn temp_dmg_path(file_name: &str, sequence: u64) -> PathBuf {
-    update_dir().join(format!("{file_name}.{sequence}.part"))
+fn temp_dmg_path(file_name: &str, sequence: u64) -> Result<PathBuf, String> {
+    Ok(update_dir()?.join(format!("{file_name}.{sequence}.part")))
 }
 
 /// 安装脚本：挂载 dmg → 与应用握手 → 等待主程序退出 → 替换 .app → 重启。
@@ -554,8 +570,10 @@ impl MinoApp {
             config_path,
             config_write_blocked,
             show_new_conn: false,
+            settings_before_new_conn: false,
             form: ConnectForm::default(),
             pending: None,
+            pending_connect_cancel: None,
             pending_label: String::new(),
             toast: None,
             pending_sftp: None,
@@ -570,6 +588,7 @@ impl MinoApp {
             manual_update: false,
             restart_at: None,
             install_result_path: None,
+            install_dmg_path: None,
             install_started_at: None,
             show_perf_hud: true,
             perf: crate::perf::PerfStats::new(),
@@ -744,7 +763,14 @@ impl MinoApp {
         let url = info.asset_url.clone();
         let sequence = self.download_sequence;
         self.download_sequence = self.download_sequence.wrapping_add(1);
-        let dest = temp_dmg_path(&info.asset_name, sequence);
+        let dest = match temp_dmg_path(&info.asset_name, sequence) {
+            Ok(path) => path,
+            Err(error) => {
+                self.update_state = UpdateState::Error(error);
+                ctx.request_repaint();
+                return;
+            }
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
         let thread_dest = dest.clone();
@@ -851,7 +877,14 @@ impl MinoApp {
             return;
         };
         let info = info.clone();
-        let dir = update_dir();
+        let dir = match update_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                let _ = std::fs::remove_file(&dmg_path);
+                self.update_state = UpdateState::Error(error);
+                return;
+            }
+        };
         let sequence = self.download_sequence;
         self.download_sequence = self.download_sequence.wrapping_add(1);
         let mount = dir.join(format!("mount-{}-{sequence}", std::process::id()));
@@ -864,13 +897,22 @@ impl MinoApp {
             Ok(()) => {
                 self.update_state = UpdateState::Installing(info);
                 self.install_result_path = Some(result_path);
+                self.install_dmg_path = Some(dmg_path);
                 self.install_started_at = Some(anim::now(ctx));
                 self.restart_at = None;
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
             Err(e) => {
+                let _ = std::fs::remove_file(&dmg_path);
                 self.update_state = UpdateState::Error(format!("启动安装脚本失败：{e}"));
             }
+        }
+    }
+
+    /// 清理安装失败后不再会被脚本使用的 DMG。
+    fn cleanup_install_dmg(&mut self) {
+        if let Some(path) = self.install_dmg_path.take() {
+            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -880,6 +922,7 @@ impl MinoApp {
             return;
         }
         let Some(result_path) = self.install_result_path.clone() else {
+            self.cleanup_install_dmg();
             self.update_state = UpdateState::Error("安装脚本缺少状态文件".into());
             return;
         };
@@ -887,6 +930,7 @@ impl MinoApp {
             Ok(status) => status.trim().to_string(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => {
+                self.cleanup_install_dmg();
                 self.update_state = UpdateState::Error(format!("读取安装状态失败：{e}"));
                 self.install_result_path = None;
                 self.install_started_at = None;
@@ -902,6 +946,7 @@ impl MinoApp {
             return;
         }
         if let Some(message) = status.strip_prefix("error:") {
+            self.cleanup_install_dmg();
             self.update_state = UpdateState::Error(format!("安装失败：{message}"));
             self.install_result_path = None;
             self.install_started_at = None;
@@ -911,6 +956,7 @@ impl MinoApp {
             .install_started_at
             .is_some_and(|started| anim::now(ctx) - started > 120.0)
         {
+            self.cleanup_install_dmg();
             self.update_state = UpdateState::Error("安装脚本 120 秒内未返回状态".into());
             self.install_result_path = None;
             self.install_started_at = None;
@@ -941,6 +987,11 @@ impl MinoApp {
     /// 口令；关闭对话框后再次打开也必须回到默认值。
     fn open_new_connection(&mut self) {
         self.form = ConnectForm::default();
+        self.last_row_click = None;
+        // 新建连接弹窗和设置弹窗都是居中的模态窗口；从设置里的入口
+        // 打开时必须先收起设置，否则设置层会盖住新建连接表单。
+        self.settings_before_new_conn = self.show_settings;
+        self.show_settings = false;
         self.show_new_conn = true;
     }
 
@@ -954,6 +1005,8 @@ impl MinoApp {
         }
         if let Some(result) = result {
             self.pending = None;
+            // 结果已经到达，连接建立阶段结束；不要再保留取消句柄。
+            self.pending_connect_cancel = None;
             match result {
                 ConnectResult::Connected(session) => {
                     let connection_id = self
@@ -990,11 +1043,15 @@ impl MinoApp {
 
     /// 发起远程连接（同时启动 SFTP 连接）。
     fn start_connect(&mut self, ctx: &egui::Context, profile: HostProfile) {
+        self.last_row_click = None;
         if let Some(connection) = self.pending_sftp.take() {
             connection.handle.close();
         }
         if let Some(connection) = self.ready_sftp.take() {
             connection.handle.close();
+        }
+        if let Some(cancel) = self.pending_connect_cancel.take() {
+            cancel.cancel();
         }
         self.pending = None;
         self.pending_tab = None;
@@ -1002,15 +1059,21 @@ impl MinoApp {
         self.pending_connection_id = Some(connection_id);
         // 标签展示新建连接时填写的名称，不把用户名和远程当前路径带进来。
         let label = profile.name.clone();
-        let ctx = ctx.clone();
+        let terminal_ctx = ctx.clone();
         let on_event = Arc::new(move |_ev: &SessionEvent| {
-            ctx.request_repaint();
+            terminal_ctx.request_repaint();
         });
-        let (_thread, rx) = connect_remote(&profile, 80, 24, on_event);
+        let (_thread, rx, connect_cancel) = connect_remote_with_cancel(&profile, 80, 24, on_event);
         self.pending = Some(rx);
+        self.pending_connect_cancel = Some(connect_cancel);
         self.pending_label = label.clone();
 
-        let (_sftp_thread, sftp_handle, sftp_rx) = connect_sftp(&profile);
+        let sftp_ctx = ctx.clone();
+        let on_sftp_event = Arc::new(move || {
+            sftp_ctx.request_repaint();
+        });
+        let (_sftp_thread, sftp_handle, sftp_rx) =
+            connect_sftp_with_handler(&profile, on_sftp_event);
         // 主机名随本连接绑定，避免与并发连接串台。
         self.pending_sftp = Some(SftpConnection {
             connection_id,
@@ -1049,6 +1112,9 @@ impl MinoApp {
                 &home,
             ));
         }
+        // SFTP 已经挂载到目标标签；保留 pending_tab 会让后续关闭标签或
+        // 无关连接结果继续把它误当成“等待挂载”的目标。
+        self.pending_tab = None;
     }
 
     /// 处理 SFTP 连接结果。
@@ -1066,6 +1132,17 @@ impl MinoApp {
                     SftpEvent::Failed(e) => failed = Some(e),
                     // 连接中途关闭（如被服务器断开）：不能继续等待，
                     // 否则状态栏会永远停在"SFTP 连接中…"。
+                    SftpEvent::Closed => closed = true,
+                    _ => {}
+                }
+            }
+        }
+        // SFTP 可能先于 SSH 终端就绪；在等待终端连接结果期间仍要轮询
+        // ready_sftp，否则服务器随后断开时该连接会被遗留到挂载阶段。
+        if let Some(connection) = &mut self.ready_sftp {
+            while let Ok(ev) = connection.rx.try_recv() {
+                match ev {
+                    SftpEvent::Failed(e) => failed = Some(e),
                     SftpEvent::Closed => closed = true,
                     _ => {}
                 }
@@ -1350,6 +1427,9 @@ impl MinoApp {
                                                     | UpdateState::Error(_)
                                             )
                                         {
+                                            // 更新弹窗在设置弹窗之后渲染；先关闭设置，
+                                            // 否则检查结果出来后更新弹窗会被设置盖住。
+                                            self.show_settings = false;
                                             self.start_update_check(false, ctx);
                                         }
                                     });
@@ -1863,11 +1943,13 @@ impl MinoApp {
             let profile = self.config.hosts[i].clone();
             // 从设置弹窗双击连接成功后关闭弹窗，直接进入终端。
             self.show_settings = false;
+            self.last_row_click = None;
             self.start_connect(ui.ctx(), profile);
         }
         if let Some(i) = remove_idx {
             let removed = self.config.hosts.remove(i);
             self.selected_host = None;
+            self.last_row_click = None;
             if !self.save_config() {
                 self.config.hosts.insert(i, removed);
             }
@@ -2080,6 +2162,12 @@ impl MinoApp {
                             self.show_toast("端口必须是 1-65535 的数字", true);
                             return;
                         }
+                        if self.form.auth_kind == 1 && self.form.key_path.trim().is_empty() {
+                            self.show_toast("请填写私钥文件路径", true);
+                            return;
+                        }
+                        let host = self.form.host.trim().to_string();
+                        let user = self.form.user.trim().to_string();
                         let auth = if self.form.auth_kind == 0 {
                             Auth::Password(self.form.password.clone())
                         } else {
@@ -2094,13 +2182,13 @@ impl MinoApp {
                         };
                         let profile = HostProfile {
                             name: if self.form.name.trim().is_empty() {
-                                self.form.host.clone()
+                                host.clone()
                             } else {
                                 self.form.name.trim().to_string()
                             },
-                            host: self.form.host.trim().to_string(),
+                            host,
                             port,
-                            user: self.form.user.trim().to_string(),
+                            user,
                             auth,
                         };
                         if !profile.host.is_empty() && !profile.user.is_empty() {
@@ -2122,10 +2210,15 @@ impl MinoApp {
             }
             self.show_new_conn = false;
             self.show_settings = false;
+            self.settings_before_new_conn = false;
             self.form.name_focused = false;
             self.start_connect(ctx, profile);
         } else if canceled || !open {
             self.show_new_conn = false;
+            if self.settings_before_new_conn {
+                self.show_settings = true;
+            }
+            self.settings_before_new_conn = false;
             self.form.name_focused = false;
         } else {
             self.show_new_conn = true;
@@ -2336,7 +2429,7 @@ impl MinoApp {
 
             // 顶到右侧：设置齿轮（设置弹窗入口）。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if settings_gear_button(ui) {
+                if settings_gear_button(ui) && !self.show_new_conn {
                     self.show_settings = true;
                 }
             });
@@ -2352,6 +2445,10 @@ impl MinoApp {
 
     /// 切换设置弹窗开关状态。
     fn toggle_settings(&mut self) {
+        // 新建连接是前台模态窗口，不能让快捷键把设置窗口叠到它上面。
+        if self.show_new_conn {
+            return;
+        }
         self.show_settings = !self.show_settings;
     }
 
@@ -2629,7 +2726,14 @@ impl MinoApp {
             });
 
         match action {
-            Some(UpdateAction::Dismiss) => self.update_state = UpdateState::Idle,
+            Some(UpdateAction::Dismiss) => {
+                // 下载完成后“稍后/取消”也必须删除私有临时目录中的 DMG；
+                // 否则状态回到 Idle 后路径丢失，文件会一直残留。
+                if let UpdateState::Downloaded { dmg_path, .. } = &self.update_state {
+                    let _ = std::fs::remove_file(dmg_path);
+                }
+                self.update_state = UpdateState::Idle;
+            }
             Some(UpdateAction::StartDownload(info)) => self.start_download(info, ctx),
             Some(UpdateAction::CancelDownload) => {
                 self.cancel_download();
@@ -3012,8 +3116,7 @@ fn fmt_bytes(n: u64) -> String {
 fn launch_installer(dmg: &Path, mount: &Path, result_path: &Path) -> Result<(), String> {
     // 私有 0700 目录（见 update_dir）：install.sh 与其他文件均不可被
     // 其他本地用户预建/替换。
-    let dir = update_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir = update_dir()?;
     let script = dir.join("install.sh");
     std::fs::write(&script, INSTALL_SCRIPT).map_err(|e| e.to_string())?;
     let log_path = dir.join(format!("install-{}.log", std::process::id()));
@@ -3034,6 +3137,33 @@ fn launch_installer(dmg: &Path, mount: &Path, result_path: &Path) -> Result<(), 
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+impl Drop for MinoApp {
+    fn drop(&mut self) {
+        // 窗口关闭时停止未完成的下载并清理私有临时文件；安装阶段的 DMG
+        // 不能在这里删除，因为独立安装脚本仍可能正在使用它。
+        self.cancel_download();
+        if let UpdateState::Downloaded { dmg_path, .. } = &self.update_state {
+            let _ = std::fs::remove_file(dmg_path);
+        }
+        // eframe 关闭窗口后应用实例会先于进程退出；取消尚未完成的 SSH
+        // 连接，避免后台 runtime 因等待 TCP 超时而让进程额外存活十几秒。
+        if let Some(cancel) = self.pending_connect_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(connection) = self.pending_sftp.take() {
+            connection.handle.close();
+        }
+        if let Some(connection) = self.ready_sftp.take() {
+            connection.handle.close();
+        }
+        for tab in &self.tabs {
+            if let Some(sftp) = &tab.sftp {
+                sftp.close();
+            }
+        }
+    }
 }
 
 impl eframe::App for MinoApp {
@@ -3103,6 +3233,10 @@ impl eframe::App for MinoApp {
             if self.show_new_conn {
                 self.show_new_conn = false;
                 self.form.name_focused = false;
+                if self.settings_before_new_conn {
+                    self.show_settings = true;
+                }
+                self.settings_before_new_conn = false;
             } else if self.show_settings {
                 self.show_settings = false;
             }
@@ -3169,7 +3303,9 @@ impl eframe::App for MinoApp {
         // 大窗口下偏窄；用户要求默认 40%、上限 50%）。
         let viewport_w = ui.ctx().viewport_rect().width();
         let sftp_default_w = viewport_w * 0.40;
-        let max_sftp_w = viewport_w * 0.50;
+        // Panel 的 max_size 会把 min_size 一并压低；小窗口下 50% 可能
+        // 小于 260，导致面板虽然“有最小宽度”却仍被布局压窄。
+        let max_sftp_w = (viewport_w * 0.50).max(260.0);
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             if let Some(sftp) = &mut tab.sftp {
                 let terminal_cwd = tab.terminal.current_directory();
@@ -4574,6 +4710,29 @@ mod settings_tests {
         });
         harness.run_steps(3);
         assert!(harness.state().show_settings);
+
+        // 从设置打开新建连接后，Esc 关闭前台对话框并恢复设置窗口。
+        harness.event(egui::Event::Key {
+            key: egui::Key::N,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run_steps(3);
+        assert!(harness.state().show_new_conn);
+        assert!(!harness.state().show_settings);
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(3);
+        assert!(!harness.state().show_new_conn, "Esc 应关闭新建连接对话框");
+        assert!(harness.state().show_settings, "Esc 后应恢复设置弹窗");
 
         harness.event(egui::Event::Key {
             key: egui::Key::Escape,

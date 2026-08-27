@@ -10,6 +10,13 @@ pub struct WorkdirTracker {
     text: String,
     valid: bool,
     cwd: PathBuf,
+    /// 是否已经由终端输入显式改变过目录。
+    ///
+    /// 远程 SFTP 连接与 SSH 终端并行建立；SFTP 返回 home 时，只能覆盖
+    /// 尚未被用户操作过的初始值，不能把用户已经输入的 `cd` 重置回 home。
+    cwd_dirty: bool,
+    /// 远程 home 尚未返回时暂存的 cd 命令，收到 home 后按输入顺序补算。
+    pending_remote_cds: Vec<String>,
 }
 
 impl WorkdirTracker {
@@ -18,6 +25,8 @@ impl WorkdirTracker {
             text: String::new(),
             valid: true,
             cwd,
+            cwd_dirty: false,
+            pending_remote_cds: Vec::new(),
         }
     }
 
@@ -39,11 +48,15 @@ impl WorkdirTracker {
         }
     }
 
-    /// 覆盖当前工作目录（远程会话由 SFTP 连接建立时提供初始目录）。
-    pub fn set_cwd(&mut self, cwd: PathBuf) {
-        self.cwd = cwd;
-        self.text.clear();
-        self.valid = true;
+    /// 设置初始目录，但不覆盖用户已经通过终端输入跟踪到的目录。
+    pub fn set_cwd_if_unmodified(&mut self, cwd: PathBuf) {
+        if !self.cwd_dirty {
+            self.cwd = cwd.clone();
+        }
+        let pending = std::mem::take(&mut self.pending_remote_cds);
+        for arg in pending {
+            self.apply_remote_cd(&arg, Some(&cwd));
+        }
     }
 
     /// 回车：执行当前命令，尝试解析 `cd` 后清空输入。
@@ -132,6 +145,7 @@ impl WorkdirTracker {
         };
         if let Ok(canonical) = std::fs::canonicalize(target) {
             self.cwd = canonical;
+            self.cwd_dirty = true;
         }
     }
 
@@ -140,10 +154,17 @@ impl WorkdirTracker {
         if arg == "-" {
             return;
         }
+        if home.is_none() {
+            // 连接建立顺序不固定；在拿到真实 home 前保留完整 cd 序列，
+            // 避免把相对路径错误地套在占位目录 "/" 上。
+            self.pending_remote_cds.push(arg.to_string());
+            return;
+        }
+        let home = home.expect("home 已在上方检查");
         let target = if arg.is_empty() || arg == "~" {
-            home.unwrap_or(&self.cwd).to_path_buf()
+            home.to_path_buf()
         } else if let Some(rest) = arg.strip_prefix("~/") {
-            home.unwrap_or(&self.cwd).join(rest)
+            home.join(rest)
         } else {
             let path = Path::new(arg);
             if path.is_absolute() {
@@ -153,6 +174,7 @@ impl WorkdirTracker {
             }
         };
         self.cwd = normalize_remote_path(&target);
+        self.cwd_dirty = true;
     }
 }
 
@@ -238,5 +260,25 @@ mod tests {
         tracker.push_text("cd \"/tmp/work space\"");
         tracker.execute_remote(Some(Path::new("/home/demo")));
         assert_eq!(tracker.cwd, PathBuf::from("/srv/app"));
+    }
+
+    #[test]
+    fn sftp初始目录不覆盖已跟踪的远程目录() {
+        let mut tracker = WorkdirTracker::new(PathBuf::from("/"));
+        tracker.push_text("cd /srv/project");
+        tracker.execute_remote(None);
+
+        tracker.set_cwd_if_unmodified(PathBuf::from("/root"));
+        assert_eq!(tracker.cwd, PathBuf::from("/srv/project"));
+    }
+
+    #[test]
+    fn 远程home未就绪时保留相对cd() {
+        let mut tracker = WorkdirTracker::new(PathBuf::from("/"));
+        tracker.push_text("cd workspace");
+        tracker.execute_remote(None);
+
+        tracker.set_cwd_if_unmodified(PathBuf::from("/root"));
+        assert_eq!(tracker.cwd, PathBuf::from("/root/workspace"));
     }
 }

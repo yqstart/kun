@@ -59,7 +59,20 @@ pub fn check_for_update(
     let Some(latest) = parse_latest_entry(&body) else {
         return Ok(None);
     };
-    let latest_version = latest.tag_name.trim_start_matches('v').to_string();
+    let latest_version = latest
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&latest.tag_name)
+        .to_string();
+    // 发布流水线只接受严格的 v<主>.<次>.<补丁> 标签。不要把远程标签
+    // 原样拼进本地文件名，否则异常标签可能生成包含路径分隔符的下载路径，
+    // 也会让版本比较的“宽松解析”把无效发布误当成可安装更新。
+    if !is_release_version(&latest_version) {
+        return Err(format!(
+            "GitHub Release 版本标签格式无效：{}",
+            latest.tag_name
+        ));
+    }
 
     if version_newer(&latest_version, current_version) {
         let asset_name = asset_name_for(&latest_version, arch);
@@ -116,6 +129,17 @@ fn asset_url_for(repo: &str, tag: &str, version: &str, arch: &str) -> String {
         tag,
         asset_name_for(version, arch)
     )
+}
+
+/// 发布版本必须是三个非空数字段，且每段能安全表示为 u32。
+fn is_release_version(version: &str) -> bool {
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.chars().all(|c| c.is_ascii_digit())
+                && part.parse::<u32>().is_ok()
+        })
 }
 
 /// 下载资产到本地文件，并持续回调 `(已下载字节, 总字节)`。
@@ -492,5 +516,15 @@ mod tests {
         assert_eq!(parse_version("1.2"), [1, 2, 0]);
         assert_eq!(parse_version("1.2.3.4"), [1, 2, 3]);
         assert_eq!(parse_version("abc"), [0, 0, 0]);
+    }
+
+    #[test]
+    fn 发布版本标签必须是安全的三段数字() {
+        assert!(is_release_version("0.2.0"));
+        assert!(is_release_version("2026.8.27"));
+        assert!(!is_release_version("0.2"));
+        assert!(!is_release_version("0.2.0-beta"));
+        assert!(!is_release_version("0.2.0/../../tmp"));
+        assert!(!is_release_version("4294967296.0.0"));
     }
 }

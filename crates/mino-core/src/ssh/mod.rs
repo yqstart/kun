@@ -7,7 +7,10 @@ pub(crate) mod known_hosts;
 pub mod sftp;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use alacritty_terminal::sync::FairMutex;
@@ -16,7 +19,10 @@ use alacritty_terminal::vte::ansi::Processor;
 use russh::client;
 use russh::keys::{decode_secret_key, HashAlg, PrivateKeyWithHashAlg};
 use russh::{Channel, ChannelMsg};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver},
+    Notify,
+};
 
 use crate::config::Auth;
 use crate::terminal::{EventHandler, Listener, Session, SessionEvent, Shared, TermSize};
@@ -39,6 +45,29 @@ pub enum ConnectResult {
     Connected(Session),
     /// 连接失败，返回错误信息。
     Failed(String),
+}
+
+/// 取消尚未完成的 SSH 连接尝试。
+///
+/// 连接失败或用户发起下一次连接时，必须取消旧的 TCP/认证 future；否则
+/// 丢弃 receiver 只会丢掉结果，后台线程仍可能继续占用连接和 runtime，
+/// 直到超时才退出。
+#[derive(Clone)]
+pub struct ConnectCancel {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl ConnectCancel {
+    /// 取消连接尝试；重复调用安全。
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
 }
 
 /// 统一的 SSH 客户端配置：30 秒无数据发 keepalive，3 次无响应断开
@@ -107,7 +136,31 @@ pub fn connect_remote(
     std::thread::JoinHandle<()>,
     UnboundedReceiver<ConnectResult>,
 ) {
+    let (thread, rx, _cancel) = connect_remote_with_cancel(profile, cols, rows, on_event);
+    (thread, rx)
+}
+
+/// 发起可取消的远程会话连接。
+///
+/// 返回的取消句柄只影响 TCP、认证和 shell 建立阶段；连接成功后，终端
+/// 会话由 `Session` 自己的关闭逻辑管理。应用在替换/销毁 pending receiver
+/// 前应调用 `ConnectCancel::cancel()`。
+pub fn connect_remote_with_cancel(
+    profile: &crate::config::HostProfile,
+    cols: u16,
+    rows: u16,
+    on_event: EventHandler,
+) -> (
+    std::thread::JoinHandle<()>,
+    UnboundedReceiver<ConnectResult>,
+    ConnectCancel,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
+    let cancel = ConnectCancel {
+        cancelled: Arc::new(AtomicBool::new(false)),
+        notify: Arc::new(Notify::new()),
+    };
+    let thread_cancel = cancel.clone();
     let profile = profile.clone();
     let handle = std::thread::spawn(move || {
         // runtime 创建失败（资源耗尽等极端情况）也必须回传失败事件，
@@ -128,19 +181,28 @@ pub fn connect_remote(
         runtime.block_on(async move {
             // ============ 1. TCP 连接与认证（含主机密钥 TOFU 校验） ============
             let config = Arc::new(ssh_config());
-            let mut handle = match connect_verified(config, &profile).await {
-                Ok(h) => h,
-                Err(e) => {
-                    let _ = tx.send(ConnectResult::Failed(format!(
-                        "连接 {}:{} 失败：{e}",
-                        profile.host, profile.port
-                    )));
-                    return;
-                }
-            };
+            let mut handle =
+                match cancellable_connect(&thread_cancel, connect_verified(config, &profile)).await
+                {
+                    Ok(h) => h,
+                    Err(e) if e == CONNECT_CANCELLED => return,
+                    Err(e) => {
+                        let _ = tx.send(ConnectResult::Failed(format!(
+                            "连接 {}:{} 失败：{e}",
+                            profile.host, profile.port
+                        )));
+                        return;
+                    }
+                };
 
-            let authed = match authenticate(&mut handle, &profile).await {
+            let authed = match cancellable_connect(
+                &thread_cancel,
+                authenticate(&mut handle, &profile),
+            )
+            .await
+            {
                 Ok(ok) => ok,
+                Err(e) if e == CONNECT_CANCELLED => return,
                 Err(e) => {
                     let _ = tx.send(ConnectResult::Failed(e));
                     return;
@@ -154,22 +216,36 @@ pub fn connect_remote(
             }
 
             // ============ 2. 打开 shell channel ============
-            let channel = match handle.channel_open_session().await {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(ConnectResult::Failed(format!("打开会话失败：{e}")));
+            let channel =
+                match cancellable_connect(&thread_cancel, handle.channel_open_session()).await {
+                    Ok(c) => c,
+                    Err(e) if e == CONNECT_CANCELLED => return,
+                    Err(e) => {
+                        let _ = tx.send(ConnectResult::Failed(format!("打开会话失败：{e}")));
+                        return;
+                    }
+                };
+            if let Err(e) = cancellable_connect(
+                &thread_cancel,
+                channel.request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[]),
+            )
+            .await
+            {
+                if e == CONNECT_CANCELLED {
                     return;
                 }
-            };
-            if let Err(e) = channel
-                .request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
-                .await
-            {
                 let _ = tx.send(ConnectResult::Failed(format!("申请 PTY 失败：{e}")));
                 return;
             }
-            if let Err(e) = channel.request_shell(true).await {
+            if let Err(e) = cancellable_connect(&thread_cancel, channel.request_shell(true)).await {
+                if e == CONNECT_CANCELLED {
+                    return;
+                }
                 let _ = tx.send(ConnectResult::Failed(format!("启动 shell 失败：{e}")));
+                return;
+            }
+
+            if thread_cancel.is_cancelled() {
                 return;
             }
 
@@ -194,6 +270,8 @@ pub fn connect_remote(
             let remote_term = term.clone();
             let remote_shared = shared.clone();
             let remote_on_event = on_event.clone();
+            let session_cancel = Arc::new(tokio::sync::Notify::new());
+            let session_cancel_loop = session_cancel.clone();
             tokio::spawn(async move {
                 remote_loop(
                     channel,
@@ -202,6 +280,7 @@ pub fn connect_remote(
                     remote_shared,
                     remote_on_event,
                     handle,
+                    session_cancel_loop,
                 )
                 .await;
                 session_done_loop.notify_one();
@@ -217,7 +296,12 @@ pub fn connect_remote(
             let resizer = crate::terminal::Resizer::new(move |cols: u16, rows: u16| {
                 let _ = resizer_tx.send(SessionCmd::Resize(cols, rows));
             });
+            let shuttor_cancel = session_cancel.clone();
             let shuttor = crate::terminal::Shuttor::new(move || {
+                // 关闭时先唤醒可能正在等待 SSH channel 流控窗口的写操作，
+                // 再发送 Shutdown；否则命令循环可能卡在 channel.data().await，
+                // 永远处理不到队列里的关闭命令。
+                shuttor_cancel.notify_one();
                 let _ = shuttor_tx.send(SessionCmd::Shutdown);
             });
 
@@ -229,7 +313,30 @@ pub fn connect_remote(
             session_done.notified().await;
         });
     });
-    (handle, rx)
+    (handle, rx, cancel)
+}
+
+const CONNECT_CANCELLED: &str = "连接已取消";
+
+/// 让连接建立阶段的任意异步操作响应取消句柄。
+async fn cancellable_connect<T, E, F>(cancel: &ConnectCancel, future: F) -> Result<T, String>
+where
+    E: std::fmt::Display,
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    if cancel.is_cancelled() {
+        return Err(CONNECT_CANCELLED.to_string());
+    }
+    let notified = cancel.notify.notified();
+    tokio::pin!(notified);
+    if cancel.is_cancelled() {
+        return Err(CONNECT_CANCELLED.to_string());
+    }
+    tokio::select! {
+        biased;
+        result = future => result.map_err(|error| error.to_string()),
+        _ = &mut notified => Err(CONNECT_CANCELLED.to_string()),
+    }
 }
 
 /// 远程终端后台循环：读 channel 数据喂解析器，消费命令队列。
@@ -240,24 +347,49 @@ async fn remote_loop(
     shared: Arc<Shared>,
     on_event: EventHandler,
     _handle: client::Handle<HostKeyVerifier>,
+    cancel: Arc<tokio::sync::Notify>,
 ) {
     log::info!("remote_loop 启动");
     let mut parser: alacritty_terminal::vte::ansi::Processor = Processor::new();
 
     loop {
         tokio::select! {
+            // 关闭句柄时无论命令队列是否还能入队，都要退出读循环并释放
+            // channel/SSH handle，避免远程连接线程泄漏。
+            _ = cancel.notified() => {
+                break;
+            }
             // 命令队列：UI 线程写入/缩放。
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(SessionCmd::Write(bytes)) => {
                         log::debug!("远程写入 {} 字节", bytes.len());
-                        if let Err(e) = channel.data(&bytes[..]).await {
-                            log::warn!("写入远程终端失败：{e}");
-                            break;
+                        let result = tokio::select! {
+                            biased;
+                            result = channel.data_bytes(bytes) => Some(result),
+                            _ = cancel.notified() => None,
+                        };
+                        match result {
+                            Some(Err(e)) => {
+                                log::warn!("写入远程终端失败：{e}");
+                                break;
+                            }
+                            Some(Ok(())) => {}
+                            None => break,
                         }
                     }
                     Some(SessionCmd::Resize(cols, rows)) => {
-                        let _ = channel.window_change(cols as u32, rows as u32, 0, 0).await;
+                        let result = tokio::select! {
+                            biased;
+                            result = channel.window_change(cols as u32, rows as u32, 0, 0) =>
+                                Some(result),
+                            _ = cancel.notified() => None,
+                        };
+                        match result {
+                            Some(Err(e)) => log::debug!("调整远程终端尺寸失败：{e}"),
+                            Some(Ok(())) => {}
+                            None => break,
+                        }
                     }
                     Some(SessionCmd::Shutdown) | None => {
                         break;

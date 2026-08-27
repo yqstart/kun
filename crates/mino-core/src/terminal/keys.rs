@@ -218,24 +218,26 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
         // 功能键：F1-F4 用 SS3，F5-F12 用 CSI；带修饰键时用 CSI 修饰形式。
         // 修饰形式末尾字母按 xterm 规范随键递增（P/Q/R/S = F1-F4）——
         // 曾固定发 'P'，导致 F2-F4 带修饰键时被终端识别为 F1。
-        Key::F(n) => Some(match n {
-            1..=4 if has_xterm_mods(mods) => {
-                format!("\x1b[1;{}{}", mods.csi_modifier(), (b'P' + (n - 1)) as char).into_bytes()
-            }
-            1 => b"\x1bOP".to_vec(),
-            2 => b"\x1bOQ".to_vec(),
-            3 => b"\x1bOR".to_vec(),
-            4 => b"\x1bOS".to_vec(),
-            5 => csi_tilde_with_mods(15, mods),
-            6 => csi_tilde_with_mods(17, mods),
-            7 => csi_tilde_with_mods(18, mods),
-            8 => csi_tilde_with_mods(19, mods),
-            9 => csi_tilde_with_mods(20, mods),
-            10 => csi_tilde_with_mods(21, mods),
-            11 => csi_tilde_with_mods(23, mods),
-            12 => csi_tilde_with_mods(24, mods),
-            _ => b"".to_vec(),
-        }),
+        // egui 可能提供 F13-F35，但本编码器没有可靠的 xterm 映射；返回
+        // None，避免把“不支持的按键”伪装成一次空写入。
+        Key::F(n) => match n {
+            1..=4 if has_xterm_mods(mods) => Some(
+                format!("\x1b[1;{}{}", mods.csi_modifier(), (b'P' + (n - 1)) as char).into_bytes(),
+            ),
+            1 => Some(b"\x1bOP".to_vec()),
+            2 => Some(b"\x1bOQ".to_vec()),
+            3 => Some(b"\x1bOR".to_vec()),
+            4 => Some(b"\x1bOS".to_vec()),
+            5 => Some(csi_tilde_with_mods(15, mods)),
+            6 => Some(csi_tilde_with_mods(17, mods)),
+            7 => Some(csi_tilde_with_mods(18, mods)),
+            8 => Some(csi_tilde_with_mods(19, mods)),
+            9 => Some(csi_tilde_with_mods(20, mods)),
+            10 => Some(csi_tilde_with_mods(21, mods)),
+            11 => Some(csi_tilde_with_mods(23, mods)),
+            12 => Some(csi_tilde_with_mods(24, mods)),
+            _ => None,
+        },
     }
 }
 
@@ -513,6 +515,7 @@ mod tests {
             encode_key(Key::F(5), no_mods(), TermMode::NONE).unwrap(),
             b"\x1b[15~"
         );
+        assert!(encode_key(Key::F(13), no_mods(), TermMode::NONE).is_none());
     }
 
     #[test]

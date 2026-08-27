@@ -222,14 +222,14 @@ impl TerminalView {
         Some(self.workdir.cwd().to_string_lossy().into_owned())
     }
 
-    /// 设置远程会话的初始工作目录。
+    /// 设置远程会话的初始工作目录，不覆盖已经由终端输入跟踪到的目录。
     pub fn set_remote_current_directory(&mut self, path: &str) {
         if path.is_empty() {
             return;
         }
         let cwd = std::path::PathBuf::from(path);
         self.remote_home = Some(cwd.clone());
-        self.workdir.set_cwd(cwd);
+        self.workdir.set_cwd_if_unmodified(cwd);
     }
 
     /// 轮询后台事件但不渲染终端。
@@ -640,7 +640,22 @@ impl TerminalView {
                 )
             })
         });
-        let suppress_blank_text = self.suppress_blank_frames > 0 || backspace_this_frame;
+        // 正常的空格也会同时产生 Key::Space + Text(" ")。退格后若用户立刻
+        // 输入空格，不能因为抑制输入法伪事件而把这个真实空格吞掉。
+        let explicit_space_this_frame = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Space,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        });
+        let suppress_blank_text =
+            (self.suppress_blank_frames > 0 || backspace_this_frame) && !explicit_space_this_frame;
         self.suppress_blank_frames = if backspace_this_frame {
             2
         } else {
@@ -678,10 +693,21 @@ impl TerminalView {
                             ctrl: modifiers.ctrl,
                             super_: false,
                         };
+                        if let Some(scroll) = scrollback_key(key, *modifiers) {
+                            // Shift+PageUp/PageDown 不应发送给 shell，而是作为
+                            // 终端窗口的本地 scrollback 翻页。编码层为这两个
+                            // 组合返回 None；这里必须真正执行滚动，否则按键
+                            // 会变成“既不发数据也不滚动”的无操作。
+                            let term_arc = session.term();
+                            let mut guard = term_arc.lock();
+                            guard.scroll_display(scroll);
+                            need_repaint = true;
+                            continue;
+                        }
                         // Ctrl/Alt 修饰的字母与符号键：直接编码为控制字符/转义前缀
                         // （egui 0.36 的 Text 事件与 Key 事件独立，这里处理并让 Text 事件跳过）。
                         if mods.ctrl || mods.alt {
-                            if let Some(k) = map_char_key(key) {
+                            if let Some(k) = map_char_key(key, modifiers.shift) {
                                 if let Some(bytes) = keys::encode_key(k, mods, mode) {
                                     session.write(&bytes);
                                     actions.push(InputAction::Bytes(bytes));
@@ -797,10 +823,14 @@ impl TerminalView {
                             }
                             WheelTarget::Scrollback => {
                                 let lines = match unit {
-                                    egui::MouseWheelUnit::Point => {
-                                        (delta.y / (cell_height * 3.0)) as i32
+                                    egui::MouseWheelUnit::Point | egui::MouseWheelUnit::Line => {
+                                        let steps = steps as i32;
+                                        if delta.y > 0.0 {
+                                            steps
+                                        } else {
+                                            -steps
+                                        }
                                     }
-                                    egui::MouseWheelUnit::Line => delta.y as i32,
                                     egui::MouseWheelUnit::Page => {
                                         let term_arc = session.term();
                                         let mut guard = term_arc.lock();
@@ -1074,7 +1104,9 @@ fn selection_to_text(
     // 复制前校验范围（有效网格行号 = [-history_size, screen_lines)），越界放弃复制。
     let history = grid.history_size() as i32;
     let screen = grid.screen_lines() as i32;
-    if start.grid_line < -history || end.grid_line >= screen {
+    // cols 来自渲染器的快照；在 resize 或测试/异常调用下可能为 0，或大于当前网格宽度。
+    // 后续会访问 Column(cols - 1)，因此必须在索引前拒绝不一致的快照。
+    if cols == 0 || cols > grid.columns() || start.grid_line < -history || end.grid_line >= screen {
         return String::new();
     }
     let mut output = String::new();
@@ -1430,40 +1462,123 @@ fn build_job(segments: &[Segment], font_size: f32) -> LayoutJob {
     job
 }
 
-/// 判断字符是否可安全写入终端（过滤控制符/私有区/零宽字符）。
+/// 判断字符是否可安全写入终端。
+///
+/// Text 事件本身已经是用户输入文本；只过滤 ASCII 控制字符，以及输入法
+/// 在退格等按键中偶尔附带的零宽空格/BOM。不能把整个 Unicode 格式字符区
+/// 都丢掉：变体选择符和零宽连接符是 emoji、部分文字系统的有效组成部分。
 fn is_printable_text_char(c: char) -> bool {
-    !c.is_ascii_control()
-        && !('\u{e000}'..='\u{f8ff}').contains(&c) // 私有使用区
-        && !('\u{200b}'..='\u{200f}').contains(&c) // 零宽空格/左右连接符
-        && !('\u{2060}'..='\u{2064}').contains(&c) // 单词连接符等
-        && !('\u{fe00}'..='\u{fe0f}').contains(&c) // 变体选择符
-        && c != '\u{feff}' // BOM/零宽不换行空格
+    !c.is_ascii_control() && c != '\u{200b}' && c != '\u{feff}'
 }
 
 /// egui 键 → 终端字符键（仅无文本时兜底使用）。
-fn map_char_key(key: &egui::Key) -> Option<Key> {
+fn map_char_key(key: &egui::Key, shift: bool) -> Option<Key> {
     use egui::Key as E;
     let v = *key as u8;
     // 字母与数字键（枚举判别值连续，按声明顺序）。
     if (E::A as u8..=E::Z as u8).contains(&v) {
-        return Some(Key::Char((v - E::A as u8 + b'a') as char));
+        let c = (v - E::A as u8 + b'a') as char;
+        return Some(Key::Char(if shift { c.to_ascii_uppercase() } else { c }));
     }
     if (E::Num0 as u8..=E::Num9 as u8).contains(&v) {
-        return Some(Key::Char((v - E::Num0 as u8 + b'0') as char));
+        let c = if shift {
+            match key {
+                E::Num0 => ')',
+                E::Num1 => '!',
+                E::Num2 => '@',
+                E::Num3 => '#',
+                E::Num4 => '$',
+                E::Num5 => '%',
+                E::Num6 => '^',
+                E::Num7 => '&',
+                E::Num8 => '*',
+                E::Num9 => '(',
+                _ => unreachable!("数字键范围内只能出现 Num0..Num9"),
+            }
+        } else {
+            (v - E::Num0 as u8 + b'0') as char
+        };
+        return Some(Key::Char(c));
     }
-    Some(Key::Char(match key {
+    let c = match key {
         E::Space => ' ',
-        E::Minus => '-',
-        E::Equals => '=',
-        E::Comma => ',',
-        E::Period => '.',
-        E::Slash => '/',
-        E::Semicolon => ';',
-        E::Quote => '\'',
-        E::Backtick => '`',
-        E::Backslash => '\\',
-        E::OpenBracket => '[',
-        E::CloseBracket => ']',
+        E::Minus => {
+            if shift {
+                '_'
+            } else {
+                '-'
+            }
+        }
+        E::Equals => {
+            if shift {
+                '+'
+            } else {
+                '='
+            }
+        }
+        E::Comma => {
+            if shift {
+                '<'
+            } else {
+                ','
+            }
+        }
+        E::Period => {
+            if shift {
+                '>'
+            } else {
+                '.'
+            }
+        }
+        E::Slash => {
+            if shift {
+                '?'
+            } else {
+                '/'
+            }
+        }
+        E::Semicolon => {
+            if shift {
+                ':'
+            } else {
+                ';'
+            }
+        }
+        E::Quote => {
+            if shift {
+                '"'
+            } else {
+                '\''
+            }
+        }
+        E::Backtick => {
+            if shift {
+                '~'
+            } else {
+                '`'
+            }
+        }
+        E::Backslash => {
+            if shift {
+                '|'
+            } else {
+                '\\'
+            }
+        }
+        E::OpenBracket => {
+            if shift {
+                '{'
+            } else {
+                '['
+            }
+        }
+        E::CloseBracket => {
+            if shift {
+                '}'
+            } else {
+                ']'
+            }
+        }
         E::Colon => ':',
         E::Plus => '+',
         E::Pipe => '|',
@@ -1472,7 +1587,8 @@ fn map_char_key(key: &egui::Key) -> Option<Key> {
         E::OpenCurlyBracket => '{',
         E::CloseCurlyBracket => '}',
         _ => return None,
-    }))
+    };
+    Some(Key::Char(c))
 }
 
 /// 构造括号粘贴载荷。
@@ -1512,6 +1628,21 @@ fn map_special_key(key: &egui::Key) -> Option<Key> {
                 None
             }
         }
+    }
+}
+
+/// 终端窗口本地处理的翻页组合。
+///
+/// 只接受纯 Shift，避免拦截 Shift+Alt/Ctrl 等应继续交给终端程序的
+/// 修饰键序列；Command 组合也留给应用级快捷键处理。
+fn scrollback_key(key: &egui::Key, modifiers: egui::Modifiers) -> Option<Scroll> {
+    if !modifiers.shift || modifiers.alt || modifiers.ctrl || modifiers.command {
+        return None;
+    }
+    match key {
+        egui::Key::PageUp => Some(Scroll::PageUp),
+        egui::Key::PageDown => Some(Scroll::PageDown),
+        _ => None,
     }
 }
 
@@ -2226,6 +2357,9 @@ mod cell_semantics_tests {
         assert_eq!(selection_to_text(&grid, selection((5, 0), (5, 1)), 6), "");
         // 快照引用 scrollback 深处（history=0 时负行号同样越界）。
         assert_eq!(selection_to_text(&grid, selection((-3, 0), (-3, 1)), 6), "");
+        // 列快照为空或大于当前网格宽度时，同样放弃复制，避免 Column(cols - 1) 越界。
+        assert_eq!(selection_to_text(&grid, selection((0, 0), (0, 1)), 0), "");
+        assert_eq!(selection_to_text(&grid, selection((0, 0), (0, 1)), 7), "");
     }
 
     #[test]
@@ -2383,5 +2517,17 @@ mod ime_backspace_tests {
             !last_line.contains("ab "),
             "退格不应插入空格，最后一行：{last_line:?}"
         );
+    }
+
+    #[test]
+    fn 修饰键回退映射保留移位符号() {
+        assert_eq!(map_char_key(&egui::Key::Num1, true), Some(Key::Char('!')));
+        assert_eq!(map_char_key(&egui::Key::Minus, true), Some(Key::Char('_')));
+        assert_eq!(
+            map_char_key(&egui::Key::OpenBracket, true),
+            Some(Key::Char('{'))
+        );
+        assert_eq!(map_char_key(&egui::Key::Slash, true), Some(Key::Char('?')));
+        assert_eq!(map_char_key(&egui::Key::Num1, false), Some(Key::Char('1')));
     }
 }
