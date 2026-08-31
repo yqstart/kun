@@ -1,7 +1,8 @@
 //! 终端工作目录跟踪。
 //!
-//! 终端本身仍由 shell 负责命令编辑和补全；这里仅根据已经写入 PTY 的字节，
-//! 尝试追踪常见的 `cd` 命令，为 SFTP 面板提供终端当前目录的快捷定位。
+//! 终端本身仍由 shell 负责命令编辑和补全；这里根据已经写入 PTY 的字节，
+//! 并结合终端中 `pwd` 的实际输出，尽力追踪终端当前目录，为 SFTP 面板
+//! 提供快捷定位。
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,8 @@ pub struct WorkdirTracker {
     cwd_dirty: bool,
     /// 远程 home 尚未返回时暂存的 cd 命令，收到 home 后按输入顺序补算。
     pending_remote_cds: Vec<String>,
+    /// 最近一次执行的 `pwd` 尚未从终端输出中得到结果。
+    awaiting_pwd_output: bool,
 }
 
 impl WorkdirTracker {
@@ -27,11 +30,17 @@ impl WorkdirTracker {
             cwd,
             cwd_dirty: false,
             pending_remote_cds: Vec::new(),
+            awaiting_pwd_output: false,
         }
     }
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// 是否正在等待最近一次 `pwd` 的终端输出。
+    pub fn awaiting_pwd_output(&self) -> bool {
+        self.awaiting_pwd_output
     }
 
     /// 追加可见文本（写入 PTY 后同步）。
@@ -61,6 +70,7 @@ impl WorkdirTracker {
 
     /// 回车：执行当前命令，尝试解析 `cd` 后清空输入。
     pub fn execute(&mut self) {
+        let is_pwd = self.valid && is_pwd_command(&self.text);
         if self.valid {
             if let Some(arg) = self.cd_argument() {
                 self.apply_local_cd(&arg);
@@ -68,6 +78,7 @@ impl WorkdirTracker {
         }
         self.text.clear();
         self.valid = true;
+        self.awaiting_pwd_output = is_pwd;
     }
 
     /// 回车：在远程会话中按 POSIX 路径规则追踪常用的 `cd` 命令。
@@ -75,6 +86,7 @@ impl WorkdirTracker {
     /// 远程目录无法用本地文件系统 `canonicalize`，因此只做词法归一化；
     /// 未覆盖的 shell 函数、别名或 `cd -` 仍会保留上一次已知目录。
     pub fn execute_remote(&mut self, home: Option<&Path>) {
+        let is_pwd = self.valid && is_pwd_command(&self.text);
         if self.valid {
             if let Some(arg) = self.cd_argument() {
                 self.apply_remote_cd(&arg, home);
@@ -82,17 +94,55 @@ impl WorkdirTracker {
         }
         self.text.clear();
         self.valid = true;
+        self.awaiting_pwd_output = is_pwd;
     }
 
     /// 控制键/编辑序列后无法可靠追踪当前输入，暂停目录更新。
     pub fn invalidate(&mut self) {
         self.valid = false;
+        self.awaiting_pwd_output = false;
     }
 
     /// 重置当前输入跟踪。
     pub fn reset(&mut self) {
         self.text.clear();
         self.valid = true;
+        self.awaiting_pwd_output = false;
+    }
+
+    /// 从终端前后两帧的可见行中读取 `pwd` 的实际结果。
+    ///
+    /// 只检查发生变化的行，避免把历史输出中的任意绝对路径误当成当前
+    /// 目录。终端输入被粘贴、使用别名/函数，或跟踪器曾因编辑序列失效时，
+    /// 这个结果可以把推测值校正为 shell 真正所在的目录。
+    pub fn observe_local_output(&mut self, previous: &[String], current: &[String]) -> bool {
+        if !self.awaiting_pwd_output {
+            return false;
+        }
+        let Some(path) = changed_pwd_path(previous, current) else {
+            return false;
+        };
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        self.cwd = canonical;
+        self.cwd_dirty = true;
+        self.awaiting_pwd_output = false;
+        true
+    }
+
+    /// 从终端前后两帧的可见行中读取远程 `pwd` 的实际结果。
+    pub fn observe_remote_output(&mut self, previous: &[String], current: &[String]) -> bool {
+        if !self.awaiting_pwd_output {
+            return false;
+        }
+        let Some(path) = changed_pwd_path(previous, current) else {
+            return false;
+        };
+        self.cwd = normalize_remote_path(Path::new(path));
+        self.cwd_dirty = true;
+        self.awaiting_pwd_output = false;
+        true
     }
 
     /// 提取当前输入中的 `cd` 参数。
@@ -176,6 +226,31 @@ impl WorkdirTracker {
         self.cwd = normalize_remote_path(&target);
         self.cwd_dirty = true;
     }
+}
+
+/// 判断当前输入是否是可以从下一次输出中读取结果的 pwd 命令。
+fn is_pwd_command(text: &str) -> bool {
+    let mut parts = text.split_whitespace();
+    if parts.next() != Some("pwd") {
+        return false;
+    }
+    parts.all(|part| matches!(part, "-P" | "-L" | "--physical" | "--logical"))
+}
+
+/// 从终端屏幕变化的行中提取绝对路径。
+fn changed_pwd_path<'a>(previous: &[String], current: &'a [String]) -> Option<&'a str> {
+    current
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| previous.get(*index) != Some(*line))
+        .filter_map(|(_, line)| {
+            let path = line.trim();
+            (!path.is_empty()
+                && path.starts_with('/')
+                && !path.chars().any(|character| character.is_control()))
+            .then_some(path)
+        })
+        .next_back()
 }
 
 /// 归一化远程 POSIX 路径，至少保证根目录不会被 `..` 越过。
@@ -280,5 +355,44 @@ mod tests {
 
         tracker.set_cwd_if_unmodified(PathBuf::from("/root"));
         assert_eq!(tracker.cwd, PathBuf::from("/root/workspace"));
+    }
+
+    #[test]
+    fn pwd输出可校正远程目录() {
+        let mut tracker = WorkdirTracker::new(PathBuf::from("/root"));
+
+        // 模拟此前粘贴命令导致跟踪器失效；回车后输入模型应恢复可用。
+        tracker.invalidate();
+        tracker.execute_remote(Some(Path::new("/root")));
+        tracker.push_text("pwd");
+        tracker.execute_remote(Some(Path::new("/root")));
+
+        let previous = vec!["[root@host ~]#".to_string(), "旧输出".to_string()];
+        let current = vec![
+            "[root@host ~]# pwd".to_string(),
+            "/home/tracsys/soft/front".to_string(),
+            "[root@host front]#".to_string(),
+        ];
+        assert!(tracker.observe_remote_output(&previous, &current));
+        assert_eq!(tracker.cwd, PathBuf::from("/home/tracsys/soft/front"));
+
+        // 没有新的 pwd 请求时，屏幕里的其它绝对路径不能再次改目录。
+        assert!(!tracker.observe_remote_output(&previous, &["/tmp/other".into()]));
+        assert_eq!(tracker.cwd, PathBuf::from("/home/tracsys/soft/front"));
+    }
+
+    #[test]
+    fn pwd输出可校正本地目录() {
+        let base = std::env::temp_dir().join(format!("mino-pwd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut tracker = WorkdirTracker::new(PathBuf::from("/"));
+        tracker.push_text("pwd -P");
+        tracker.execute();
+
+        let previous = vec!["$ pwd -P".to_string()];
+        let current = vec!["$ pwd -P".to_string(), base.display().to_string()];
+        assert!(tracker.observe_local_output(&previous, &current));
+        assert_eq!(tracker.cwd, std::fs::canonicalize(&base).unwrap());
+        std::fs::remove_dir_all(base).ok();
     }
 }

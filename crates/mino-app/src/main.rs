@@ -234,6 +234,9 @@ fn main() -> eframe::Result {
     }
     let native_options = eframe::NativeOptions {
         viewport,
+        // 每次新建应用窗口时由 eframe 在主显示器上计算居中位置。
+        // 不设置时 macOS/winit 可能沿用系统默认的左侧摆放位置。
+        centered: true,
         // macOS 15/26 在退出阶段保存 NSWindow 的位置和尺寸时，可能触发
         // AppKit 的 NSTouchBarFinderObservation 重复移除观察者，最终以
         // SIGABRT 退出。mino 没有依赖 eframe 的窗口位置持久化，关闭它可

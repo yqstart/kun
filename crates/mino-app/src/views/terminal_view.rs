@@ -140,6 +140,8 @@ pub struct TerminalView {
     suppress_blank_frames: u8,
     /// 当前工作目录跟踪器（供 SFTP 面板快捷定位使用）。
     workdir: crate::workdir::WorkdirTracker,
+    /// 执行 `pwd` 前的终端可见行，用于从后续屏幕变化中提取实际目录。
+    pwd_output_rows: Option<Vec<String>>,
     /// 远程会话的初始目录（由 SFTP realpath(".") 提供）。
     remote_home: Option<std::path::PathBuf>,
     /// 上一帧终端是否持有焦点（焦点自动恢复用）。
@@ -187,6 +189,7 @@ impl TerminalView {
             last_mode: TermMode::NONE,
             suppress_blank_frames: 0,
             workdir: crate::workdir::WorkdirTracker::new(cwd),
+            pwd_output_rows: None,
             remote_home: None,
             had_focus: false,
             last_build_ms: 0.0,
@@ -303,6 +306,42 @@ impl TerminalView {
         // （app.rs 的 `ctx.request_repaint()`），此处仅处理 PtyWrite 回写
         // 与标题缓存更新。
         self.drain_background_events();
+
+        // ==================== 工作目录校正 ====================
+        // 目录跟踪通常只需处理键盘输入；只有执行 pwd、等待其输出时才读取
+        // 可见网格，避免为了一个低频兜底路径让每个空闲帧都扫描整个终端。
+        let has_enter = ui.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        });
+        let should_observe_output = self.workdir.awaiting_pwd_output() || has_enter;
+        let output_rows = should_observe_output.then(|| visible_terminal_rows(&self.session));
+        if self.workdir.awaiting_pwd_output() {
+            if let Some(current) = output_rows.as_deref() {
+                if let Some(previous) = self.pwd_output_rows.take() {
+                    let corrected = if self.session.is_remote() {
+                        self.workdir.observe_remote_output(&previous, current)
+                    } else {
+                        self.workdir.observe_local_output(&previous, current)
+                    };
+                    if !corrected && self.workdir.awaiting_pwd_output() {
+                        // 命令回显和命令输出可能跨多个帧到达；每次继续
+                        // 以前一帧作为基线，避免漏掉后续被改写的行。
+                        self.pwd_output_rows = Some(current.to_vec());
+                    }
+                } else {
+                    self.pwd_output_rows = Some(current.to_vec());
+                }
+            }
+        }
 
         // ==================== 尺寸计算与 resize ====================
         // cell 尺寸只依赖字体（启动时加载），缓存到字段避免每帧 fonts_mut。
@@ -609,12 +648,12 @@ impl TerminalView {
             self.selecting = false;
         }
         if ui.memory(|m| m.has_focus(self.focus_id)) {
-            self.handle_input(ui, inner);
+            self.handle_input(ui, inner, output_rows);
         }
     }
 
     /// 处理键盘与鼠标输入（转发到 PTY / 网格滚动）。
-    fn handle_input(&mut self, ui: &Ui, inner: Rect) {
+    fn handle_input(&mut self, ui: &Ui, inner: Rect, output_rows: Option<Vec<String>>) {
         let session = &self.session;
         let mode = self.last_mode;
         let cell_height = self.cell_height;
@@ -873,6 +912,15 @@ impl TerminalView {
         for action in actions {
             self.apply_input_action(action, &ctx);
         }
+        if self.workdir.awaiting_pwd_output() {
+            // `output_rows` 是处理本帧 Enter 之前的屏幕快照，正好作为
+            // pwd 输出的基线；这样即使 shell 很快返回，也不会把新结果
+            // 误当成旧输出。
+            self.pwd_output_rows =
+                Some(output_rows.unwrap_or_else(|| visible_terminal_rows(&self.session)));
+        } else {
+            self.pwd_output_rows = None;
+        }
         self.render_copy_feedback(ui);
     }
 
@@ -997,6 +1045,39 @@ enum InputAction {
 }
 
 // ==================== 辅助函数 ====================
+
+/// 读取终端当前视口的纯文本行（去除 VT 属性与尾随空格）。
+///
+/// 这里只在 `pwd` 输出校正期间调用；正常渲染仍使用行级损坏缓存，避免
+/// 每帧遍历全部 cell。
+fn visible_terminal_rows(session: &Session) -> Vec<String> {
+    let term_arc = session.term();
+    let guard = term_arc.lock();
+    let content = guard.renderable_content();
+    let mut rows = Vec::new();
+    let mut current_line: Option<i32> = None;
+    let mut current = String::new();
+
+    for item in content.display_iter {
+        let line = item.point.line.0;
+        if current_line != Some(line) {
+            if current_line.is_some() {
+                rows.push(current.trim_end().to_string());
+            }
+            current_line = Some(line);
+            current.clear();
+        }
+        let cell = item.cell;
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
+            continue;
+        }
+        current.push(cell.c);
+    }
+    if current_line.is_some() {
+        rows.push(current.trim_end().to_string());
+    }
+    rows
+}
 
 /// 滚轮事件的优先目标：全屏应用的鼠标协议优先于本地 scrollback。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2178,6 +2259,92 @@ mod enter_tests {
             "回车未执行命令，终端内容：\n{}",
             grid_text(view.borrow().session())
         );
+    }
+
+    /// 回归：粘贴 cd 会让输入模型失效，随后执行 pwd 仍应以终端实际输出
+    /// 校正当前目录，不能继续把 SFTP 定位在启动目录。
+    #[test]
+    fn pwd输出校正粘贴cd后的目录() {
+        let base =
+            std::env::temp_dir().join(format!("mino-terminal-pwd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let session = Session::spawn_local(
+            SessionOptions {
+                working_directory: Some(std::env::temp_dir()),
+                ..Default::default()
+            },
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        harness.run_steps(12);
+
+        // 用独立输出确认 shell 已经可以接收输入，不能用目录名中的
+        // “mino”作为就绪条件（测试临时目录本身也可能含有该字符串）。
+        harness.event(egui::Event::Text("printf __MINO_TERMINAL_READY__".into()));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let ready_deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < ready_deadline {
+            harness.step();
+            if grid_text(view.borrow().session()).contains("__MINO_TERMINAL_READY__") {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(ready, "zsh 未就绪");
+
+        // 粘贴 cd，模拟截图中的“跟踪器此前已经失效”场景。
+        harness.event(egui::Event::Paste(format!("cd {}", base.display())));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run_steps(6);
+
+        // 只依赖 pwd 输出恢复，不依赖输入模型重新推导 cd。
+        harness.event(egui::Event::Text("pwd".into()));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let expected = std::fs::canonicalize(&base).unwrap();
+        let expected_text = expected.to_string_lossy().into_owned();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut corrected = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if view.borrow().current_directory().as_deref() == Some(expected_text.as_str()) {
+                corrected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            corrected,
+            "pwd 输出后目录未校正，当前目录：{:?}",
+            view.borrow().current_directory()
+        );
+        std::fs::remove_dir_all(base).ok();
     }
 }
 
