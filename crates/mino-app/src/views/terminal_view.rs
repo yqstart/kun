@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -251,6 +252,14 @@ impl TerminalView {
 
     /// 每帧渲染入口。
     pub fn show(&mut self, ui: &mut Ui) {
+        self.show_with_input(ui, true);
+    }
+
+    /// 渲染终端，并按需禁用键盘、鼠标与滚轮输入。
+    ///
+    /// 前台弹窗打开时终端仍需持续渲染后台输出，但不能直接读取
+    /// egui 全局输入事件，否则位于终端坐标范围内的弹窗滚轮会穿透。
+    pub fn show_with_input(&mut self, ui: &mut Ui, input_enabled: bool) {
         let ctx = ui.ctx().clone();
         let term_arc = self.session.term();
 
@@ -310,18 +319,19 @@ impl TerminalView {
         // ==================== 工作目录校正 ====================
         // 目录跟踪通常只需处理键盘输入；只有执行 pwd、等待其输出时才读取
         // 可见网格，避免为了一个低频兜底路径让每个空闲帧都扫描整个终端。
-        let has_enter = ui.input(|input| {
-            input.events.iter().any(|event| {
-                matches!(
-                    event,
-                    egui::Event::Key {
-                        key: egui::Key::Enter,
-                        pressed: true,
-                        ..
-                    }
-                )
-            })
-        });
+        let has_enter = input_enabled
+            && ui.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Enter,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                })
+            });
         let should_observe_output = self.workdir.awaiting_pwd_output() || has_enter;
         let output_rows = should_observe_output.then(|| visible_terminal_rows(&self.session));
         if self.workdir.awaiting_pwd_output() {
@@ -599,6 +609,7 @@ impl TerminalView {
         // 点击/拖拽区域覆盖整个面板：终端文字不是 egui Label，必须自己维护
         // cell 选区，才能实现 Warp/Terminal.app 习惯的拖选后 ⌘C。
         let surface_rect = ui.max_rect();
+        self.handle_dropped_files(ui, surface_rect, input_enabled);
         let response = ui.interact(surface_rect, self.focus_id, egui::Sense::click_and_drag());
         if response.clicked() {
             ui.memory_mut(|m| m.request_focus(self.focus_id));
@@ -647,9 +658,47 @@ impl TerminalView {
         if response.drag_stopped() {
             self.selecting = false;
         }
-        if ui.memory(|m| m.has_focus(self.focus_id)) {
+        if input_enabled && ui.memory(|m| m.has_focus(self.focus_id)) {
             self.handle_input(ui, inner, output_rows);
         }
+    }
+
+    /// 将拖入终端区域的本地文件、目录或应用路径写入当前会话。
+    ///
+    /// egui 的原生后端把这三类对象统一表示为 `dropped_files`；有坐标时
+    /// 沿用本帧的鼠标位置判断是否落在终端区域。部分 macOS 跨窗口拖放
+    /// 不会提供坐标，此时当前窗口的终端是唯一的文本输入区，应接收该路径。
+    fn handle_dropped_files(&mut self, ui: &Ui, surface_rect: Rect, input_enabled: bool) {
+        if !input_enabled {
+            return;
+        }
+
+        let paths = ui.input(|input| {
+            if let Some(pointer) = input.pointer.hover_pos() {
+                if !surface_rect.contains(pointer) {
+                    return Vec::new();
+                }
+            }
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        let Some(text) = dropped_paths_text(&paths) else {
+            return;
+        };
+
+        // 路径已经按 shell 语法转义，不需要执行回车；用户可以继续编辑
+        // 命令，或在需要时手动按 Enter 执行。
+        self.session.write(text.as_bytes());
+        self.workdir.push_text(&text);
+        self.selection = None;
+        ui.memory_mut(|memory| memory.request_focus(self.focus_id));
+        // 某些后端的 PTY 回显不会同步触发下一帧，主动安排一次重绘以便
+        // 拖放后的路径尽快显示出来。
+        ui.ctx().request_repaint();
     }
 
     /// 处理键盘与鼠标输入（转发到 PTY / 网格滚动）。
@@ -1682,6 +1731,49 @@ fn bracketed_paste_payload(text: &str) -> String {
     format!("\x1b[200~{sanitized}\x1b[201~")
 }
 
+/// 将拖入的路径转换为可直接交给 POSIX shell 的文本。
+///
+/// 常见路径保持原样，包含空格、引号或 shell 特殊字符的路径使用单引号；
+/// 单引号本身用 shell 的 `'\''` 组合拆分，确保拖入路径只会作为一个参数，
+/// 不会因为文件名内容被解释成额外的命令或重定向。
+fn shell_escape_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text.chars().all(is_unquoted_shell_path_char) {
+        return text.into_owned();
+    }
+
+    let mut escaped = String::with_capacity(text.len() + 2);
+    escaped.push('\'');
+    for character in text.chars() {
+        if character == '\'' {
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+/// 不需要引号时允许出现在路径中的字符。
+fn is_unquoted_shell_path_char(character: char) -> bool {
+    character.is_alphanumeric()
+        || matches!(
+            character,
+            '/' | '_' | '-' | '.' | '~' | '@' | '%' | '+' | '=' | ':' | ','
+        )
+}
+
+/// 将同一拖放操作中的多个路径拼接为一段终端输入。
+fn dropped_paths_text(paths: &[std::path::PathBuf]) -> Option<String> {
+    let text = paths
+        .iter()
+        .map(|path| shell_escape_path(path))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
 /// egui 键 → 终端特殊键。
 fn map_special_key(key: &egui::Key) -> Option<Key> {
     use egui::Key as E;
@@ -1732,9 +1824,25 @@ mod tests {
     use super::*;
     use mino_core::terminal::{Session, SessionOptions};
     use std::cell::RefCell;
+    use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[derive(Debug)]
+    struct TestDroppedFile {
+        path: PathBuf,
+    }
+
+    impl egui::DroppedFile for TestDroppedFile {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+    }
 
     /// 将终端可见区域转为文本。
     fn grid_text(session: &Session) -> String {
@@ -1797,6 +1905,77 @@ mod tests {
         if let Some(t) = text {
             harness.event(egui::Event::Text(t.to_string()));
         }
+    }
+
+    #[test]
+    fn 拖入路径按shell安全格式化() {
+        assert_eq!(
+            shell_escape_path(Path::new("/tmp/report.txt")),
+            "/tmp/report.txt"
+        );
+        assert_eq!(
+            shell_escape_path(Path::new("/tmp/Project Files/app's.app")),
+            "'/tmp/Project Files/app'\\''s.app'"
+        );
+        assert_eq!(
+            dropped_paths_text(&[
+                PathBuf::from("/tmp/report.txt"),
+                PathBuf::from("/tmp/Project Files"),
+                PathBuf::from("/Applications/Mino.app"),
+            ])
+            .as_deref(),
+            Some("/tmp/report.txt '/tmp/Project Files' /Applications/Mino.app")
+        );
+    }
+
+    /// 回归：Finder 拖入文件、目录或应用时，应把路径写到当前终端，
+    /// 不自动回车执行，并正确处理包含空格的路径。
+    #[test]
+    fn 拖入文件目录应用路径写入终端() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
+
+        // 先让 egui 记录拖放结束时的鼠标位置；原生 dropped_files 本身不携带坐标。
+        let drop_pos = egui::pos2(120.0, 120.0);
+        harness.event(egui::Event::PointerMoved(drop_pos));
+        harness.step();
+        for path in [
+            "/tmp/report.txt",
+            "/tmp/Project Files",
+            "/Applications/Mino.app",
+        ] {
+            harness
+                .input_mut()
+                .dropped_files
+                .push(Arc::new(TestDroppedFile {
+                    path: PathBuf::from(path),
+                }));
+        }
+        harness.step();
+
+        assert!(
+            wait_text(&view, &mut harness, "'/tmp/Project Files'")
+                && grid_text(view.borrow().session()).contains("/Applications/Mino.app"),
+            "拖入路径未写入终端，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+        // 没有发送回车：路径仍在当前输入行中，后续可继续编辑或手动执行。
+        let text = grid_text(view.borrow().session());
+        assert!(
+            text.lines().any(|line| line.contains("/tmp/report.txt")),
+            "拖放不应自动执行命令，终端内容：\n{text}"
+        );
     }
 
     /// 鼠标拖动终端网格应建立稳定的选区（回归：终端曾只有键盘焦点，

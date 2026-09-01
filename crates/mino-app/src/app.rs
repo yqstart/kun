@@ -1427,9 +1427,6 @@ impl MinoApp {
                                                     | UpdateState::Error(_)
                                             )
                                         {
-                                            // 更新弹窗在设置弹窗之后渲染；先关闭设置，
-                                            // 否则检查结果出来后更新弹窗会被设置盖住。
-                                            self.show_settings = false;
                                             self.start_update_check(false, ctx);
                                         }
                                     });
@@ -2968,9 +2965,9 @@ fn form_input(
     ui.add_sized([width, 30.0], edit)
 }
 
-/// 品牌标记：主题强调色渐变圆角底 + 白色极简终端提示符 `>_`。
+/// 品牌标记：黑色哑光底 + 柔和白/磷光绿 `>_` 几何符号。
 ///
-/// 与应用图标（scripts/make-icon.swift）同构图；hover 时带 accent 辉光。
+/// 与应用图标（scripts/make-icon.swift）同构图；仅在 hover 时带主题 accent 辉光。
 fn draw_logo_mark(ui: &mut egui::Ui, size: f32) -> egui::Rect {
     let theme = crate::theme::current_theme();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
@@ -2979,41 +2976,46 @@ fn draw_logo_mark(ui: &mut egui::Ui, size: f32) -> egui::Rect {
         let center = rect.center();
         let tile = egui::Rect::from_center_size(center, egui::vec2(size * 0.80, size * 0.80));
         let radius = tile.width() * 0.22;
-        // 圆角底：accent → accent2 垂直渐变。
-        anim::paint_rounded_gradient(painter, tile, radius, theme.accent, theme.accent2);
+        let black_top = egui::Color32::from_rgb(0x16, 0x18, 0x19);
+        let black_bottom = egui::Color32::from_rgb(0x05, 0x06, 0x07);
+        let primary = egui::Color32::from_rgb(0xe8, 0xef, 0xeb);
+        let accent = egui::Color32::from_rgb(0xb8, 0xf3, 0x4c);
+
+        // 黑色圆角底：保持与应用图标相同的石墨层次。
+        anim::paint_rounded_gradient(painter, tile, radius, black_top, black_bottom);
+        painter.rect_stroke(
+            tile.shrink(0.5),
+            radius,
+            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(46)),
+            egui::StrokeKind::Inside,
+        );
 
         // `>_`：用线条绘制，避免依赖字体字形，在小尺寸下也保持清晰。
-        let stroke = egui::Stroke::new((size * 0.075).max(1.5), egui::Color32::WHITE);
+        let stroke_width = (size * 0.075).max(1.5);
+        let stroke = egui::Stroke::new(stroke_width, primary);
         let chevron_left = tile.left() + tile.width() * 0.29;
         let chevron_tip = tile.left() + tile.width() * 0.44;
-        let chevron_half_height = tile.height() * 0.18;
-        painter.line_segment(
-            [
-                egui::pos2(chevron_left, center.y - chevron_half_height),
-                egui::pos2(chevron_tip, center.y),
-            ],
-            stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(chevron_tip, center.y),
-                egui::pos2(chevron_left, center.y + chevron_half_height),
-            ],
-            stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(
-                    tile.left() + tile.width() * 0.54,
-                    center.y + tile.height() * 0.18,
-                ),
-                egui::pos2(
-                    tile.left() + tile.width() * 0.73,
-                    center.y + tile.height() * 0.18,
-                ),
-            ],
-            stroke,
-        );
+        let chevron_half_height = tile.height() * 0.15;
+        let glyph_y = tile.top() + tile.height() * 0.47;
+        let chevron_points = [
+            egui::pos2(chevron_left, glyph_y - chevron_half_height),
+            egui::pos2(chevron_tip, glyph_y),
+            egui::pos2(chevron_left, glyph_y + chevron_half_height),
+        ];
+        let cursor_points = [
+            egui::pos2(
+                tile.left() + tile.width() * 0.54,
+                glyph_y - tile.height() * 0.13,
+            ),
+            egui::pos2(
+                tile.left() + tile.width() * 0.75,
+                glyph_y - tile.height() * 0.13,
+            ),
+        ];
+
+        painter.line_segment([chevron_points[0], chevron_points[1]], stroke);
+        painter.line_segment([chevron_points[1], chevron_points[2]], stroke);
+        painter.line_segment(cursor_points, egui::Stroke::new(stroke_width, accent));
 
         if response.hovered() {
             anim::paint_glow(painter, center, size * 0.9, theme.accent2);
@@ -3326,6 +3328,9 @@ impl eframe::App for MinoApp {
                     });
             }
         }
+        // 设置弹窗是前台模态内容；终端仍渲染后台输出，
+        // 但禁止它消费键盘、鼠标和滚轮事件，避免输入穿透。
+        let terminal_input_enabled = !self.show_settings;
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(_pending) = &self.pending {
                 ui.centered_and_justified(|ui| {
@@ -3334,7 +3339,7 @@ impl eframe::App for MinoApp {
             } else if self.tabs.is_empty() {
                 self.empty_state(ui, &ctx);
             } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.terminal.show(ui);
+                tab.terminal.show_with_input(ui, terminal_input_enabled);
                 // tabby 风格：远程标签页终端右上角悬浮 SFTP 开关按钮。
                 if tab.sftp.is_some() && sftp_floating_button(ui, tab.sftp_open) {
                     tab.sftp_open = !tab.sftp_open;
@@ -3349,10 +3354,12 @@ impl eframe::App for MinoApp {
             }
         }
         self.connect_dialog(&ctx);
-        self.update_dialog(&ctx);
         if self.show_settings {
             self.settings_panel(&ctx);
         }
+        // 手动检查发现新版本时设置保持打开，更新弹窗后渲染
+        // 以保证它位于设置窗口之上。
+        self.update_dialog(&ctx);
         self.render_toast(&ctx);
 
         // 安装完成 → 关闭应用（脚本会拉起新版本）。
@@ -4658,6 +4665,111 @@ mod settings_tests {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("mino-test-config-default-")));
+    }
+
+    /// 回归：从设置中手动检查更新时，设置窗口应继续保持打开。
+    #[test]
+    fn 检查更新不关闭设置弹窗() {
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
+        harness.run_steps(6);
+        harness.state_mut().show_settings = true;
+        harness.run_steps(3);
+
+        // “关于”卡片在默认高度下可能位于滚动区裁剪边缘，
+        // 用无障碍点击精确触发按钮行为，不受测试视口大小影响。
+        harness.get_by_label("检查更新").click_accesskit();
+        harness.step();
+
+        assert!(
+            harness.state().show_settings,
+            "点击检查更新后设置弹窗不应被关闭"
+        );
+        assert!(matches!(
+            harness.state().update_state,
+            UpdateState::Checking
+        ));
+    }
+
+    /// 回归：设置弹窗覆盖终端时，滚轮只能滚动设置内容，
+    /// 不能同时改变背后终端的 scrollback 偏移。
+    #[test]
+    fn 设置滚轮不传递到终端() {
+        use alacritty_terminal::grid::{Dimensions, Scroll};
+        use alacritty_terminal::index::Line;
+        use alacritty_terminal::vte::ansi::Color as AColor;
+        use kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
+        harness.run_steps(6);
+
+        // 用足够多的主机条目撑高设置内容，确保设置 ScrollArea 可滚动。
+        harness.state_mut().config.hosts = (0..12)
+            .map(|index| HostProfile {
+                name: format!("测试主机 {index}"),
+                host: "127.0.0.1".into(),
+                port: 22,
+                user: "root".into(),
+                auth: Auth::Password(String::new()),
+            })
+            .collect();
+        harness.state_mut().show_settings = true;
+        harness.run_steps(3);
+
+        // 人工构造 scrollback 并先向上滚动；若滚轮穿透，向下滚时该值会变小。
+        {
+            let term = harness.state().tabs[harness.state().active_tab]
+                .terminal
+                .session()
+                .term();
+            let mut guard = term.lock();
+            let lines = guard.grid().screen_lines();
+            guard
+                .grid_mut()
+                .scroll_up::<AColor>(&(Line::from(0)..Line::from(lines)), 12);
+            guard.grid_mut().scroll_display(Scroll::Delta(6));
+        }
+        let terminal_offset_before = {
+            let term = harness.state().tabs[harness.state().active_tab]
+                .terminal
+                .session()
+                .term();
+            let guard = term.lock();
+            guard.grid().display_offset()
+        };
+        let first_host = harness.get_by_label("测试主机 0");
+        let first_host_y_before = first_host.rect().top();
+        let pointer = first_host.rect().center();
+
+        harness.event(egui::Event::PointerMoved(pointer));
+        harness.step();
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -4.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        harness.run_steps(3);
+
+        let terminal_offset_after = {
+            let term = harness.state().tabs[harness.state().active_tab]
+                .terminal
+                .session()
+                .term();
+            let guard = term.lock();
+            guard.grid().display_offset()
+        };
+        let first_host_y_after = harness.get_by_label("测试主机 0").rect().top();
+
+        assert!(
+            first_host_y_after < first_host_y_before,
+            "滚轮应使设置内容向上移动：y={first_host_y_before} -> {first_host_y_after}"
+        );
+        assert_eq!(
+            terminal_offset_after, terminal_offset_before,
+            "设置中的滚轮事件不应传递到背后终端"
+        );
     }
 
     /// ⌘, 快捷键切换设置弹窗（macOS 标准"应用偏好设置"）。

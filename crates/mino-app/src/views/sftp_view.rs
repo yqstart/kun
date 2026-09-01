@@ -15,6 +15,10 @@ struct Transfer {
     failed: bool,
 }
 
+/// 传输行的视觉尺寸：状态文字预留固定宽度，进度轨道保持纤细。
+const TRANSFER_STATUS_WIDTH: f32 = 34.0;
+const TRANSFER_PROGRESS_HEIGHT: f32 = 4.0;
+
 /// 文件操作确认对话框。
 enum ConfirmDialog {
     Delete {
@@ -149,9 +153,8 @@ impl SftpView {
         self.handle.list(&path);
         self.loading = true;
         self.error = None;
-        // 切换目录期间不要继续绘制上一个目录的条目；旧条目会让地址栏、
-        // 加载提示和文件列表在两个异步帧之间上下跳动。
-        self.entries.clear();
+        // 保留原条目数量作为稳定的布局占位；渲染层在加载期间会用静态
+        // 骨架替换旧内容，避免双击目录后 ScrollArea 高度瞬间收缩再弹回。
         self.selected.clear();
         self.selection_anchor = None;
         self.last_primary_click = None;
@@ -383,6 +386,13 @@ impl SftpView {
                     if stale {
                         continue;
                     }
+                    if label == "列出目录" {
+                        // 当前目录加载失败时清掉占位内容；传输失败则保留
+                        // 当前列表，避免一条上传错误把文件面板清空。
+                        self.entries.clear();
+                        self.selected.clear();
+                        self.selection_anchor = None;
+                    }
                     self.error = Some(format!("{label}：{message}"));
                     self.loading = false;
                 }
@@ -471,6 +481,39 @@ impl SftpView {
     ) {
         let (row_rect, _) =
             ui.allocate_exact_size(egui::vec2(table_width, row_h), egui::Sense::hover());
+        // 行的点击区域保持完整高度，视觉底色上下收 2px，给相邻目录留出
+        // 呼吸空间，避免图标、文字和选中底色挤在一起。
+        let visual_rect = row_rect.shrink2(egui::vec2(0.0, 2.0));
+
+        // 双击进入目录后，列表请求是异步的。保留旧行的高度，但先画静态
+        // 骨架，不显示旧目录内容，避免列表瞬间收缩造成整块内容跳动。
+        if self.loading && !self.entries.is_empty() {
+            ui.painter().rect_filled(
+                visual_rect,
+                crate::theme::tokens::RADIUS_ITEM,
+                theme.bg_panel.gamma_multiply(0.45),
+            );
+            let skeleton = theme.text_muted.gamma_multiply(0.22);
+            let name_width = (name_col - icon_pad).clamp(1.0, 150.0);
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(row_rect.left() + icon_pad, row_rect.center().y - 2.0),
+                    egui::vec2(name_width, 4.0),
+                ),
+                2.0,
+                skeleton,
+            );
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(row_rect.right() - time_col - 6.0, row_rect.center().y - 2.0),
+                    egui::vec2(time_col.min(62.0), 4.0),
+                ),
+                2.0,
+                skeleton,
+            );
+            return;
+        }
+
         // hover 用指针位置判定（子 Ui 会抢走 response.hovered()）。
         let pointer_in_row =
             ui.input(|i| i.pointer.hover_pos().is_some_and(|p| row_rect.contains(p)));
@@ -483,20 +526,25 @@ impl SftpView {
                 self.entries[idx - 1].name.as_str(),
             ))
         };
+        let row_sense = if self.loading {
+            egui::Sense::hover()
+        } else {
+            egui::Sense::click()
+        };
 
         // ".." 行：返回上级目录（文件管理器通用习惯，导航更直观）。
         if idx == 0 {
             let selected = self.selected.iter().any(|name| name == "..");
             if selected {
                 ui.painter().rect_filled(
-                    row_rect,
+                    visual_rect,
                     crate::theme::tokens::RADIUS_ITEM,
                     theme.accent_soft,
                 );
                 ui.painter().rect_filled(
                     egui::Rect::from_min_max(
-                        egui::pos2(row_rect.left() + 1.0, row_rect.top() + 4.0),
-                        egui::pos2(row_rect.left() + 3.0, row_rect.bottom() - 4.0),
+                        egui::pos2(visual_rect.left() + 1.0, visual_rect.top() + 4.0),
+                        egui::pos2(visual_rect.left() + 3.0, visual_rect.bottom() - 4.0),
                     ),
                     1.5,
                     theme.accent,
@@ -504,14 +552,14 @@ impl SftpView {
             } else if pointer_in_row {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 ui.painter().rect_filled(
-                    row_rect,
+                    visual_rect,
                     crate::theme::tokens::RADIUS_ITEM,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
                 );
             }
             let icon = egui::Rect::from_center_size(
-                egui::pos2(row_rect.left() + 6.0 + 7.0, row_rect.center().y),
-                egui::vec2(14.0, 14.0),
+                egui::pos2(row_rect.left() + 12.0, row_rect.center().y),
+                egui::vec2(18.0, 16.0),
             );
             paint_entry_icon(ui.painter(), icon, true);
             let mut inner = ui.new_child(
@@ -544,7 +592,7 @@ impl SftpView {
             });
             // 整行点击区：显式 ui.interact + 稳定 Id，且必须在列内容
             // 之后注册（后注册 widget 在顶层；见条目行注释）。
-            let response = ui.interact(row_rect, row_id, egui::Sense::click());
+            let response = ui.interact(row_rect, row_id, row_sense);
             // ".." 行双击返回上级，第一次点击只负责选中/反馈。
             if response.secondary_clicked() {
                 self.last_primary_click = None;
@@ -590,14 +638,14 @@ impl SftpView {
         // 叠加（Tabby 风，先画背景，列内容绘制在其上）。
         if selected {
             ui.painter().rect_filled(
-                row_rect,
+                visual_rect,
                 crate::theme::tokens::RADIUS_ITEM,
                 theme.accent_soft,
             );
             ui.painter().rect_filled(
                 egui::Rect::from_min_max(
-                    egui::pos2(row_rect.left() + 1.0, row_rect.top() + 4.0),
-                    egui::pos2(row_rect.left() + 3.0, row_rect.bottom() - 4.0),
+                    egui::pos2(visual_rect.left() + 1.0, visual_rect.top() + 4.0),
+                    egui::pos2(visual_rect.left() + 3.0, visual_rect.bottom() - 4.0),
                 ),
                 1.5,
                 theme.accent,
@@ -605,15 +653,15 @@ impl SftpView {
         } else if pointer_in_row {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             ui.painter().rect_filled(
-                row_rect,
+                visual_rect,
                 crate::theme::tokens::RADIUS_ITEM,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
             );
         }
-        // 行首矢量图标：文件夹 accent2 填充 / 文件描边轮廓。
+        // 行首矢量图标：文件夹蓝色渐变 / 文件描边轮廓。
         let icon = egui::Rect::from_center_size(
-            egui::pos2(row_rect.left() + 6.0 + 7.0, row_rect.center().y),
-            egui::vec2(14.0, 14.0),
+            egui::pos2(row_rect.left() + 12.0, row_rect.center().y),
+            egui::vec2(18.0, 16.0),
         );
         paint_entry_icon(ui.painter(), icon, entry.is_dir);
         // 三列内容：名称（目录主色/文件次要色）+ 大小/时间定宽右排。
@@ -675,7 +723,7 @@ impl SftpView {
         // 之后注册（后注册 widget 在顶层）——allocate_exact_size
         // 的自动 Id 帧间漂移、new_child 子 Ui 叠加，行点击从未
         // 生效（"点击文件夹进不去"的根因）。
-        let response = ui.interact(row_rect, row_id, egui::Sense::click());
+        let response = ui.interact(row_rect, row_id, row_sense);
         let modifiers = response.ctx.input(|input| input.modifiers);
         if response.secondary_clicked() {
             self.last_primary_click = None;
@@ -975,9 +1023,9 @@ impl SftpView {
             });
         }
         let cell_width = self.cell_width;
-        // 行首图标占位宽度（16px 图标 + 两侧留白），表头与行共用基准。
-        let icon_pad = 22.0;
-        let row_h = 22.0;
+        // 行首图标占位宽度（18px 图标 + 两侧留白），表头与行共用基准。
+        let icon_pad = 28.0;
+        let row_h = 28.0;
         // 固定列宽：名称列占剩余宽度、大小/修改时间右对齐定宽。
         // 曾用"总宽 - 固定字符数"的 add_space 定位：长文件名会把
         // 大小/时间列挤出面板右缘，且各行列位随名称长度漂移错位。
@@ -1054,18 +1102,20 @@ impl SftpView {
         }
         let blank_path = self.current_path.clone();
         let blank_terminal_cwd = terminal_cwd.map(str::to_string);
-        blank_response.context_menu(|ui| {
-            render_blank_context_menu(
-                ui,
-                &blank_path,
-                blank_terminal_cwd.as_deref(),
-                &mut context_action,
-            );
-        });
+        if !self.loading {
+            blank_response.context_menu(|ui| {
+                render_blank_context_menu(
+                    ui,
+                    &blank_path,
+                    blank_terminal_cwd.as_deref(),
+                    &mut context_action,
+                );
+            });
+        }
 
         // 加载提示占用固定高度：加载完成后只清空内容，不让文件列表整体
         // 因提示行的出现/消失而上下跳动。
-        let loading_h = 20.0;
+        let loading_h = 24.0;
         let (loading_rect, _) =
             ui.allocate_exact_size(egui::vec2(table_width, loading_h), egui::Sense::hover());
         if self.loading {
@@ -1309,6 +1359,7 @@ impl SftpView {
             })
             .resizable(false)
             .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| match dialog {
                 ConfirmDialog::Delete { items } => {
                     if items.len() == 1 {
@@ -1455,15 +1506,6 @@ fn render_transfer_row(
     } else {
         (theme.accent2, "进行中")
     };
-    ui.colored_label(color, RichText::new(status).size(11.5));
-    ui.add(
-        egui::Label::new(
-            RichText::new(&transfer.label)
-                .size(11.5)
-                .color(theme.text_secondary),
-        )
-        .truncate(),
-    );
     let progress = if transfer.total == 0 {
         if transfer.finished {
             1.0
@@ -1473,34 +1515,161 @@ fn render_transfer_row(
     } else {
         (transfer.done as f32 / transfer.total as f32).clamp(0.0, 1.0)
     };
-    ui.add(
-        egui::ProgressBar::new(progress)
-            .desired_width(ui.available_width().max(80.0))
-            .text(format!(
-                "{} / {}",
-                SftpView::format_size(transfer.done),
-                SftpView::format_size(transfer.total)
-            )),
+
+    // ==================== 传输标题 ====================
+    // 使用状态点 + 右侧状态，避免默认 ProgressBar 把一整行撑成厚重的
+    // 控件；文件名仍保留为可访问的 Label，并在窄面板中自动截断。
+    let row_width = ui.available_width().max(0.0);
+    let status_text = if transfer.failed || transfer.finished {
+        status.to_string()
+    } else {
+        format!("{:.0}%", progress * 100.0)
+    };
+    let bytes_text = format!(
+        "{} / {}",
+        SftpView::format_size(transfer.done),
+        SftpView::format_size(transfer.total)
     );
+    // 固定预留比每帧重新测量字体更稳定，也避免在高频进度事件期间拿
+    // egui 字体写锁；34px 足够容纳“进行中”和“100%”。
+    let status_width = TRANSFER_STATUS_WIDTH.min(row_width);
+    let left_width = (row_width - 8.0 - 6.0 - status_width - 8.0).max(0.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 16.0), egui::Sense::hover());
+        ui.painter().circle_filled(dot_rect.center(), 3.0, color);
+        ui.add_space(6.0);
+        ui.add_sized(
+            [left_width, 16.0],
+            egui::Label::new(
+                RichText::new(&transfer.label)
+                    .size(11.5)
+                    .color(theme.text_secondary),
+            )
+            .truncate(),
+        );
+        ui.add_space(8.0);
+        ui.add_sized(
+            [status_width, 16.0],
+            egui::Label::new(RichText::new(status_text).size(10.5).color(color))
+                .halign(egui::Align::RIGHT),
+        );
+    });
+
+    // ==================== 纤细渐变进度条 ====================
+    // 高度固定为 4px，轨道与填充都自绘，避免 egui 默认控件的内边距和
+    // 文本布局使进度条看起来像一块厚按钮。
+    ui.add_space(3.0);
+    let (track_rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(0.0), TRANSFER_PROGRESS_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let track_color = theme.bg_panel.gamma_multiply(0.92);
+    ui.painter().rect_filled(track_rect, 2.0, track_color);
+    ui.painter().rect_stroke(
+        track_rect,
+        2.0,
+        egui::Stroke::new(0.6, theme.border),
+        egui::StrokeKind::Inside,
+    );
+    if progress > 0.0 && track_rect.width() > 0.0 {
+        let fill_color = if transfer.failed {
+            theme.danger
+        } else if transfer.finished {
+            theme.success
+        } else {
+            // 上传/下载进行中使用 macOS 风格的蓝色渐变；完成和失败状态
+            // 则切换为主题语义色，用户能快速区分结果。
+            egui::Color32::from_rgb(0x3c, 0x9b, 0xf5)
+        };
+        let fill_end = track_rect.left() + track_rect.width() * progress;
+        let fill_rect = egui::Rect::from_min_max(
+            track_rect.left_top(),
+            egui::pos2(
+                fill_end
+                    .max(track_rect.left() + 3.0)
+                    .min(track_rect.right()),
+                track_rect.bottom(),
+            ),
+        );
+        let fill_top = if transfer.failed || transfer.finished {
+            fill_color
+        } else {
+            egui::Color32::from_rgb(0x8b, 0xd5, 0xff)
+        };
+        crate::anim::paint_rounded_gradient(ui.painter(), fill_rect, 2.0, fill_top, fill_color);
+    }
+
+    // 字节数放在细条下方，既保留精确进度，又不会把文字压进进度轨道。
+    ui.add_space(2.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width().max(0.0), 14.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(bytes_text)
+                        .monospace()
+                        .size(10.0)
+                        .color(theme.text_muted),
+                )
+                .truncate(),
+            );
+        },
+    );
+    ui.add_space(6.0);
 }
 
-/// 行首文件/目录矢量图标：文件夹为 accent2 填充（提手 + 圆角主体），
+/// 行首文件/目录矢量图标：文件夹采用 macOS 风格的蓝色渐变与高光，
 /// 文件为细描边轮廓。矢量绘制避免 emoji 字形随字体变化。
 fn paint_entry_icon(painter: &egui::Painter, rect: egui::Rect, is_dir: bool) {
-    let theme = crate::theme::current_theme();
     if is_dir {
         let h = rect.height();
+        let w = rect.width();
+        let folder_top = egui::Color32::from_rgb(0x9a, 0xd9, 0xff);
+        let folder_mid = egui::Color32::from_rgb(0x5a, 0xb4, 0xf3);
+        let folder_bottom = egui::Color32::from_rgb(0x2d, 0x7f, 0xd1);
+        let folder_border = egui::Color32::from_rgba_unmultiplied(0x1a, 0x63, 0xa8, 0xd0);
+
+        // 轻微底部阴影让小图标从深色列表背景中脱出来，同时保持
+        // macOS Finder 图标那种柔和、偏亮的体积感。
+        let shadow = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 0.5, rect.top() + 1.0),
+            egui::pos2(rect.right() + 0.5, rect.bottom() + 1.0),
+        );
+        painter.rect_filled(
+            shadow,
+            2.8,
+            egui::Color32::from_rgba_unmultiplied(0x04, 0x2b, 0x56, 0x88),
+        );
+
+        // 文件夹提手先画在后面，主体覆盖提手下沿，形成干净的折角。
         let tab = egui::Rect::from_min_size(
-            egui::pos2(rect.left(), rect.top() + h * 0.2),
-            egui::vec2(rect.width() * 0.52, h * 0.26),
+            egui::pos2(rect.left() + 0.7, rect.top() + h * 0.08),
+            egui::vec2(w * 0.56, h * 0.36),
         );
         let body = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), rect.top() + h * 0.3),
-            egui::pos2(rect.right(), rect.bottom()),
+            egui::pos2(rect.left() + 0.3, rect.top() + h * 0.28),
+            egui::pos2(rect.right() - 0.3, rect.bottom() - 0.5),
         );
-        painter.rect_filled(tab, 1.5, theme.accent2);
-        painter.rect_filled(body, 2.0, theme.accent2);
+        crate::anim::paint_rounded_gradient(painter, tab, 2.5, folder_top, folder_mid);
+        crate::anim::paint_rounded_gradient(painter, body, 2.8, folder_top, folder_bottom);
+        painter.rect_stroke(
+            body.shrink(0.35),
+            2.5,
+            egui::Stroke::new(0.65, folder_border),
+            egui::StrokeKind::Inside,
+        );
+        // 顶部一条半透明高光，尺寸很小时仍能读出蓝色文件夹的层次。
+        painter.line_segment(
+            [
+                egui::pos2(body.left() + 2.0, body.top() + 1.0),
+                egui::pos2(body.right() - 2.0, body.top() + 1.0),
+            ],
+            egui::Stroke::new(0.8, egui::Color32::from_white_alpha(92)),
+        );
     } else {
+        let theme = crate::theme::current_theme();
         painter.rect_stroke(
             rect.shrink(1.0),
             2.0,
@@ -1726,6 +1895,23 @@ mod tests {
         harness.run_steps(6);
         harness.get_by_label("确认删除");
         harness.get_by_label("readme.md");
+
+        let dialog_rect = harness
+            .get_by_role_and_label(accesskit::Role::Window, "确认删除")
+            .rect();
+        let viewport = harness.ctx.content_rect();
+        assert!(
+            (dialog_rect.center().x - viewport.center().x).abs() < 1.0,
+            "确认删除窗口应水平居中，窗口中心 x={}，视口中心 x={}",
+            dialog_rect.center().x,
+            viewport.center().x
+        );
+        assert!(
+            (dialog_rect.center().y - viewport.center().y).abs() < 1.0,
+            "确认删除窗口应垂直居中，窗口中心 y={}，视口中心 y={}",
+            dialog_rect.center().y,
+            viewport.center().y
+        );
 
         // 点击取消 → 对话框关闭。
         harness.get_by_label("取消").click();
@@ -2320,7 +2506,7 @@ mod tests {
     }
 
     #[test]
-    fn 导航加载期间清空旧列表并忽略旧结果() {
+    fn 导航加载期间稳定列表并忽略旧结果() {
         let (event_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
@@ -2351,7 +2537,10 @@ mod tests {
 
         view.navigate_to("/home/./workspace/../workspace");
         assert_eq!(view.current_path, "/home/workspace");
-        assert!(view.entries.is_empty());
+        assert_eq!(
+            view.entries[0].name, "old.txt",
+            "加载期间保留旧列表行作为占位"
+        );
         assert!(view.selected.is_empty());
         assert!(view.loading);
         assert!(matches!(
@@ -2386,7 +2575,10 @@ mod tests {
             })
             .unwrap();
         assert!(view.poll_events());
-        assert!(view.entries.is_empty(), "旧目录结果不能回写当前页面");
+        assert_eq!(
+            view.entries[0].name, "old.txt",
+            "旧目录结果不能回写当前页面"
+        );
         assert!(view.loading);
 
         event_tx
