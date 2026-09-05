@@ -141,6 +141,17 @@ fn 远程终端_连接_执行命令_收到输出() {
         }
     };
 
+    // 窗口尺寸变化必须先到达远端 PTY，再执行会读取尺寸的命令。
+    // npm 的动态进度条也依赖这个 window_change 通知来计算换行宽度。
+    let mut session = session;
+    session.resize(42, 13);
+    session.write(b"stty size\n");
+    assert!(
+        wait_for_text(&session, "13 42", Duration::from_secs(10)),
+        "远端 PTY 未同步尺寸，终端内容：\n{}",
+        grid_text(&session)
+    );
+
     // 发送命令并等待输出回显。
     session.write(b"echo MINO_SSH_OK\n");
     assert!(

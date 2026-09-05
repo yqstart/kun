@@ -354,6 +354,10 @@ async fn remote_loop(
 
     loop {
         tokio::select! {
+            // 尺寸/输入命令优先于继续消费输出。npm 等动态进度渲染会根据
+            // PTY 宽度生成回车刷新行；窗口变窄后若先处理多段旧宽度输出，
+            // 这些行会在本地终端中换行成醒目的背景块。
+            biased;
             // 关闭句柄时无论命令队列是否还能入队，都要退出读循环并释放
             // channel/SSH handle，避免远程连接线程泄漏。
             _ = cancel.notified() => {

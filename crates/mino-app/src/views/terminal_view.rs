@@ -117,6 +117,11 @@ impl TerminalSelection {
 /// 终端内容内边距（文本与面板边缘的间距，参照 Terminal.app 观感）。
 const PADDING: f32 = 10.0;
 
+/// SSH 的 `window_change` 是异步发送的。连接刚建立或终端刚改变布局时，
+/// 远端 shell 可能在收到第一次尺寸通知前就开始输出动态内容（例如 npm 的
+/// 进度条）。在尺寸稳定后的几帧内重复发送，避免远端仍按旧宽度换行。
+const REMOTE_RESIZE_SYNC_FRAMES: u8 = 8;
+
 /// 终端视图。
 pub struct TerminalView {
     session: Session,
@@ -153,6 +158,8 @@ pub struct TerminalView {
     last_paint_ms: f32,
     /// 会话标题缓存（`SessionEvent::Title` 时更新，避免每帧 Mutex + String clone）。
     cached_title: String,
+    /// 远程 PTY 尺寸同步重试次数（`window_change` 由 SSH 后台异步发送）。
+    remote_resize_sync_frames: u8,
     /// 当前终端选区（⌘C / Ctrl+Shift+C 复制）。
     selection: Option<TerminalSelection>,
     /// 是否正在进行鼠标拖选。
@@ -181,8 +188,10 @@ impl TerminalView {
             font_size: 13.0,
             cell_width: 8.0,
             cell_height: 16.0,
-            cols: 80,
-            rows: 24,
+            // 真实尺寸要等到首帧布局后才能从 egui 区域计算出来；不要把
+            // SSH 建连时的 80x24 初始值误当成已经同步的窗口尺寸。
+            cols: 0,
+            rows: 0,
             last_ppp: 0.0,
             last_theme_revision: crate::theme::theme_revision(),
             focus_id: egui::Id::new("terminal_view"),
@@ -197,6 +206,11 @@ impl TerminalView {
             last_layout_ms: 0.0,
             last_paint_ms: 0.0,
             cached_title,
+            remote_resize_sync_frames: if is_remote {
+                REMOTE_RESIZE_SYNC_FRAMES
+            } else {
+                0
+            },
             selection: None,
             selecting: false,
             copy_flash_until: None,
@@ -224,6 +238,64 @@ impl TerminalView {
             return None;
         }
         Some(self.workdir.cwd().to_string_lossy().into_owned())
+    }
+
+    /// SFTP 定位前调用：当前输入行为空时向 shell 注入一条 `pwd` 并等待输出。
+    ///
+    /// 返回 true 表示已注入 `pwd`（调用方应等待若干帧后的定位结果，不要
+    /// 立即用旧的推测目录导航）；false 表示此刻不适合自动探测（已有未
+    /// 完成的探测/手输 pwd、全屏应用占用终端、当前有未执行的输入），
+    /// 调用方应直接回退到已知目录。
+    pub fn request_fresh_pwd(&mut self) -> bool {
+        if self.workdir.awaiting_pwd_output() || !self.workdir.begin_auto_pwd() {
+            return false;
+        }
+        if !self.workdir_input_is_idle() || self.is_fullscreen_app() {
+            self.workdir.cancel_auto_pwd();
+            return false;
+        }
+        // 与用户在空提示符下手输 `pwd\r` 的字节流一致；终端随后走已有的
+        // `awaiting_*_pwd_output` 输出校正管线把目录更新到真实值。
+        self.session.write(b"pwd\n");
+        self.workdir.reset();
+        self.workdir.begin_auto_pwd();
+        true
+    }
+
+    /// 自动 `pwd` 探测是否已拿到终端输出（SFTP 定位轮询用）。
+    pub fn auto_pwd_ready(&self) -> bool {
+        !self.workdir.awaiting_auto_pwd_output()
+    }
+
+    /// 取消未完成的自动 `pwd` 探测（定位超时 / 面板切到无终端上下文时）。
+    pub fn cancel_fresh_pwd(&mut self) {
+        self.workdir.cancel_auto_pwd();
+    }
+
+    /// 测试用：向工作目录跟踪器注入可见文本（模拟用户正在编辑命令行）。
+    #[cfg(test)]
+    pub fn push_workdir_text_for_test(&mut self, text: &str) {
+        self.workdir.push_text(text);
+    }
+
+    /// 当前输入行是否为空（没有任何等待执行的字符）。
+    ///
+    /// 定位注入 `pwd` 必须在空提示符下进行，否则会污染用户正在编辑的
+    /// 命令行。跟踪器只记录“可观察到的输入”，Tab/粘贴/方向键等已让它
+    /// 失效——失效本身不代表输入行为空，这里只能做保守判断：
+    /// 跟踪器有效且文本为空时才认为空闲。
+    fn workdir_input_is_idle(&self) -> bool {
+        self.workdir.input_is_idle()
+    }
+
+    /// 终端是否被全屏应用占用（vim/less/top 等）。
+    ///
+    /// 此时注入 `pwd` 会变成应用的按键而不是 shell 命令；SFTP 定位应
+    /// 直接回退到已知目录，等用户退出全屏应用后再定位。
+    fn is_fullscreen_app(&self) -> bool {
+        let term_arc = self.session.term();
+        let guard = term_arc.lock();
+        guard.mode().contains(TermMode::ALT_SCREEN)
     }
 
     /// 设置远程会话的初始工作目录，不覆盖已经由终端输入跟踪到的目录。
@@ -332,9 +404,9 @@ impl TerminalView {
                     )
                 })
             });
-        let should_observe_output = self.workdir.awaiting_pwd_output() || has_enter;
+        let should_observe_output = self.workdir.awaiting_any_pwd_output() || has_enter;
         let output_rows = should_observe_output.then(|| visible_terminal_rows(&self.session));
-        if self.workdir.awaiting_pwd_output() {
+        if self.workdir.awaiting_any_pwd_output() {
             if let Some(current) = output_rows.as_deref() {
                 if let Some(previous) = self.pwd_output_rows.take() {
                     let corrected = if self.session.is_remote() {
@@ -342,7 +414,7 @@ impl TerminalView {
                     } else {
                         self.workdir.observe_local_output(&previous, current)
                     };
-                    if !corrected && self.workdir.awaiting_pwd_output() {
+                    if !corrected && self.workdir.awaiting_any_pwd_output() {
                         // 命令回显和命令输出可能跨多个帧到达；每次继续
                         // 以前一帧作为基线，避免漏掉后续被改写的行。
                         self.pwd_output_rows = Some(current.to_vec());
@@ -360,7 +432,9 @@ impl TerminalView {
             self.last_ppp = ppp;
             let (cell_width, cell_height) = ui.fonts_mut(|f| {
                 let font = FontId::monospace(self.font_size);
-                (f.glyph_width(&font, ' '), f.row_height(&font))
+                // 空格在部分等宽字体中比数字窄；终端列宽按真实等宽
+                // 字符测量，否则本地列数会偏大，远端动态输出会错位换行。
+                (f.glyph_width(&font, '0'), f.row_height(&font))
             });
             self.cell_width = cell_width;
             self.cell_height = cell_height;
@@ -373,15 +447,28 @@ impl TerminalView {
         let avail = inner.size();
         let cols = ((avail.x / cell_width).floor() as usize).max(2);
         let rows = ((avail.y / cell_height).floor() as usize).max(1);
-        if cols as u16 != self.cols || rows as u16 != self.rows {
+        let size_changed = cols as u16 != self.cols || rows as u16 != self.rows;
+        if size_changed {
             self.cols = cols as u16;
             self.rows = rows as u16;
             // 通知 PTY 并同步终端状态机网格（Session::resize 内部完成锁内 resize）。
             self.session.resize(self.cols, self.rows);
+            if self.session.is_remote() {
+                // 布局变化后重新开始短暂重试窗口，确保 SSH 的异步
+                // window_change 在远端下一次动态渲染前到达。
+                self.remote_resize_sync_frames = REMOTE_RESIZE_SYNC_FRAMES;
+            }
             self.rows_cache.clear();
             // 选区的 grid_line 是建立时的快照，resize 重排网格后可能悬空
             // （复制时越界索引在 release 下会 panic），尺寸变化即放弃选区。
             self.selection = None;
+        }
+        if !size_changed && self.remote_resize_sync_frames > 0 {
+            // 连接初始布局可能与 SSH request_pty 的 80x24 不同；即使本帧
+            // 本地尺寸未变，也要把当前尺寸再送几次给远端，覆盖建连/输出
+            // 并发时第一次 window_change 被延后的情况。
+            self.session.resize(self.cols, self.rows);
+            self.remote_resize_sync_frames -= 1;
         }
 
         // ==================== 构建渲染数据（锁内，行级增量） ====================
@@ -961,7 +1048,7 @@ impl TerminalView {
         for action in actions {
             self.apply_input_action(action, &ctx);
         }
-        if self.workdir.awaiting_pwd_output() {
+        if self.workdir.awaiting_any_pwd_output() {
             // `output_rows` 是处理本帧 Enter 之前的屏幕快照，正好作为
             // pwd 输出的基线；这样即使 shell 很快返回，也不会把新结果
             // 误当成旧输出。
@@ -2524,6 +2611,110 @@ mod enter_tests {
             view.borrow().current_directory()
         );
         std::fs::remove_dir_all(base).ok();
+    }
+
+    /// 回归（用户报告“定位只有 pwd 后才好用”）：输入跟踪失效后，
+    /// `request_fresh_pwd` 应自动注入 `pwd` 并把目录校正到真实值，
+    /// 不需要用户先手输一次 `pwd`。
+    #[test]
+    fn 定位自动pwd探测校正目录() {
+        let base =
+            std::env::temp_dir().join(format!("mino-terminal-auto-pwd-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let session = Session::spawn_local(
+            SessionOptions {
+                working_directory: Some(std::env::temp_dir()),
+                ..Default::default()
+            },
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        harness.run_steps(12);
+
+        harness.event(egui::Event::Text("printf __MINO_TERMINAL_READY__".into()));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let ready_deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < ready_deadline {
+            harness.step();
+            if grid_text(view.borrow().session()).contains("__MINO_TERMINAL_READY__") {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(ready, "zsh 未就绪");
+
+        // 粘贴 cd 让跟踪器失效（与线上“别名/函数/补全后定位不准”同根因）。
+        harness.event(egui::Event::Paste(format!("cd {}", base.display())));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run_steps(6);
+
+        // 此时跟踪器仍停在旧目录；定位探测应自动注入 pwd 并校正。
+        let before = view.borrow().current_directory();
+        let expected = std::fs::canonicalize(&base).unwrap();
+        let expected_text = expected.to_string_lossy().into_owned();
+        assert_ne!(before.as_deref(), Some(expected_text.as_str()));
+
+        // 探测注入需要经过一帧终端渲染（输出校正管线在 show 内）。
+        assert!(view.borrow_mut().request_fresh_pwd());
+        assert!(!view.borrow().auto_pwd_ready());
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut corrected = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if view.borrow().auto_pwd_ready()
+                && view.borrow().current_directory().as_deref() == Some(expected_text.as_str())
+            {
+                corrected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            corrected,
+            "自动 pwd 探测后目录未校正，当前目录：{:?}",
+            view.borrow().current_directory()
+        );
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    /// 有未执行输入时不得注入 `pwd`（避免污染用户正在编辑的命令行）。
+    #[test]
+    fn 定位有输入时不注入pwd() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::sync::Arc;
+
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let mut view = TerminalView::new(session);
+        view.workdir.push_text("echo hi");
+        assert!(!view.request_fresh_pwd(), "输入行非空时不应注入 pwd");
+        assert!(view.auto_pwd_ready());
     }
 }
 

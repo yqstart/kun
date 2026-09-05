@@ -225,17 +225,35 @@ fn sftp_完整操作流程() {
     })
     .expect("重命名未完成");
 
-    // ============ 9. 删除（文件 + 目录） ============
+    // 目录删除必须覆盖真实的非空目录，而不是只验证 SFTP 的空目录删除。
+    let nested_dir = format!("{dir_b}/nested");
+    handle.mkdir(&nested_dir);
+    let _ = wait_event(&mut rx, Duration::from_secs(10), |ev| {
+        matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
+    })
+    .expect("新建嵌套目录未完成");
+    let nested_file = format!("{nested_dir}/nested.txt");
+    handle.upload(&local_file, &nested_file);
+    let _ = wait_event(&mut rx, Duration::from_secs(10), |ev| {
+        matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
+    })
+    .expect("上传嵌套文件未完成");
+
+    // ============ 9. 删除（文件 + 非空嵌套目录） ============
     handle.remove(&remote_file, false);
     let _ = wait_event(&mut rx, Duration::from_secs(10), |ev| {
         matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
     })
     .expect("删除文件未完成");
     handle.remove(&dir_b, true);
-    let _ = wait_event(&mut rx, Duration::from_secs(10), |ev| {
+    let seen = wait_event(&mut rx, Duration::from_secs(10), |ev| {
         matches!(ev, SftpEvent::Done { .. } | SftpEvent::Error { .. })
     })
     .expect("删除目录未完成");
+    assert!(
+        seen.iter().any(|ev| matches!(ev, SftpEvent::Done { .. })),
+        "删除非空目录应递归完成，实际事件：{seen:?}"
+    );
 
     // ============ 10. 验证清理干净 ============
     handle.list(&remote_home);

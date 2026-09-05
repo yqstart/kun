@@ -111,6 +111,20 @@ pub struct TerminalTab {
     sftp: Option<SftpView>,
     /// SFTP 面板是否展开（tabby 形式：默认收起，终端右上角悬浮按钮切换）。
     sftp_open: bool,
+    /// SFTP“定位到终端位置”等待中的终端 `pwd` 探测。
+    ///
+    /// 面板只表达“用户想要定位”，真正的目录要等 shell 的 `pwd` 输出把
+    /// 跟踪器校正到真实值后才能导航（输入跟踪在 Tab/粘贴/别名/函数等
+    /// 场景下会失效，直接用旧推测值就是“只有 pwd 后才好用”的根因）。
+    /// 等待期间每帧检查 `TerminalView::auto_pwd_ready()`，拿到结果就
+    /// 导航；超时则取消探测、用已知目录回退并给明确反馈。
+    locate_pending: Option<LocatePending>,
+}
+
+/// 等待中的一次 SFTP 定位探测。
+struct LocatePending {
+    /// 发起定位时的帧时间（egui `input.time`，秒）。
+    started_at: f64,
 }
 
 impl TerminalTab {
@@ -121,6 +135,7 @@ impl TerminalTab {
             terminal,
             sftp: None,
             sftp_open: false,
+            locate_pending: None,
         }
     }
 
@@ -1117,6 +1132,76 @@ impl MinoApp {
         self.pending_tab = None;
     }
 
+    /// SFTP“定位到终端位置”：先对终端做一次 `pwd` 探测，等输出校正
+    /// 后再导航；不适合探测时直接用已知目录回退。
+    ///
+    /// 用户期望“在某一路径下点定位就能到当前目录”，但终端输入跟踪在
+    /// Tab/粘贴/别名/函数/`cd -`/复合命令等场景下会失效或保守放弃，
+    /// 直接用旧推测值导航就是“只有 pwd 后才好用”的根因。定位时在空闲
+    /// 提示符下注入一条 `pwd`（用户无感知的单行命令），用 shell 真正的
+    /// 输出校正后再导航，保证任何路径下点定位都先对准当前目录。
+    fn begin_locate_terminal(tab: &mut TerminalTab, ctx: &egui::Context) {
+        let Some(sftp) = tab.sftp.as_mut() else {
+            return;
+        };
+        // SFTP 面板要求终端上下文才显示定位入口；本地 tab 同样支持
+        // （current_directory 本地恒为 Some）。
+        if tab.terminal.current_directory().is_none() {
+            return;
+        }
+        if tab.terminal.request_fresh_pwd() {
+            // 探测已注入：等待终端输出（见 `poll_locate_pending`），
+            // 这几帧内保持重绘，pwd 回显/输出到达后第一时间导航。
+            tab.locate_pending = Some(LocatePending {
+                started_at: ctx.input(|i| i.time),
+            });
+            ctx.request_repaint();
+        } else {
+            // 不适合探测（全屏应用/有未执行输入/已有探测在途）：直接用
+            // 已知目录回退，行为与此前一致，不让用户觉得“点了没反应”。
+            if let Some(path) = tab.terminal.current_directory() {
+                sftp.locate_terminal_directory(&path);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// 每帧推进等待中的定位探测：拿到 `pwd` 输出就导航，超时则回退。
+    fn poll_locate_pending(&mut self, ctx: &egui::Context) {
+        // 定位超时：远端高延迟/输出被全屏应用吞掉时不能无限等待；
+        // 取消探测、用已知目录回退并给明确反馈。
+        const LOCATE_TIMEOUT_SECS: f64 = 3.0;
+        let now = ctx.input(|i| i.time);
+        // locate_pending 按标签独立保存；SFTP 未挂载的标签直接清理。
+        for tab in &mut self.tabs {
+            let Some(pending) = tab.locate_pending.as_ref() else {
+                continue;
+            };
+            let Some(sftp) = tab.sftp.as_mut() else {
+                tab.locate_pending = None;
+                tab.terminal.cancel_fresh_pwd();
+                continue;
+            };
+            if tab.terminal.auto_pwd_ready() {
+                tab.locate_pending = None;
+                if let Some(path) = tab.terminal.current_directory() {
+                    sftp.locate_terminal_directory(&path);
+                }
+                ctx.request_repaint();
+            } else if now - pending.started_at >= LOCATE_TIMEOUT_SECS {
+                tab.locate_pending = None;
+                tab.terminal.cancel_fresh_pwd();
+                if let Some(path) = tab.terminal.current_directory() {
+                    sftp.locate_terminal_directory(&path);
+                }
+                ctx.request_repaint();
+            } else {
+                // 等待输出期间保持重绘，pwd 结果到达后下一帧即导航。
+                ctx.request_repaint();
+            }
+        }
+    }
+
     /// 处理 SFTP 连接结果。
     fn poll_sftp(&mut self) {
         let mut ready = false;
@@ -1218,7 +1303,7 @@ impl MinoApp {
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 header.add_space(18.0);
-                draw_logo_mark(&mut header, 40.0);
+                draw_logo_mark_static(&mut header, 40.0);
                 header.add_space(11.0);
                 // 显式固定标题区高度，避免 `vertical` 子布局占满头部后把文字贴到顶部。
                 let title_rect = header
@@ -2965,10 +3050,19 @@ fn form_input(
     ui.add_sized([width, 30.0], edit)
 }
 
+/// 设置窗口标题区的静态品牌标记，不响应悬浮视觉效果。
+fn draw_logo_mark_static(ui: &mut egui::Ui, size: f32) -> egui::Rect {
+    draw_logo_mark_impl(ui, size, false)
+}
+
 /// 品牌标记：黑色哑光底 + 柔和白/磷光绿 `>_` 几何符号。
 ///
-/// 与应用图标（scripts/make-icon.swift）同构图；仅在 hover 时带主题 accent 辉光。
+/// 与应用图标（scripts/make-icon.swift）同构图；默认在 hover 时带主题 accent 辉光。
 fn draw_logo_mark(ui: &mut egui::Ui, size: f32) -> egui::Rect {
+    draw_logo_mark_impl(ui, size, true)
+}
+
+fn draw_logo_mark_impl(ui: &mut egui::Ui, size: f32, show_hover_glow: bool) -> egui::Rect {
     let theme = crate::theme::current_theme();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
@@ -3017,7 +3111,7 @@ fn draw_logo_mark(ui: &mut egui::Ui, size: f32) -> egui::Rect {
         painter.line_segment([chevron_points[1], chevron_points[2]], stroke);
         painter.line_segment(cursor_points, egui::Stroke::new(stroke_width, accent));
 
-        if response.hovered() {
+        if show_hover_glow && response.hovered() {
             anim::paint_glow(painter, center, size * 0.9, theme.accent2);
         }
     }
@@ -3260,6 +3354,7 @@ impl eframe::App for MinoApp {
         }
         self.poll_connection(&ctx);
         self.poll_sftp();
+        self.poll_locate_pending(&ctx);
         self.poll_update();
         self.poll_download(&ctx);
         self.poll_install(&ctx);
@@ -3314,6 +3409,7 @@ impl eframe::App for MinoApp {
                 let sftp_frame = egui::Frame::new()
                     .fill(theme.bg_panel)
                     .inner_margin(egui::Margin::symmetric(12, 10));
+                let mut locate_requested = false;
                 egui::Panel::right("sftp_panel")
                     .default_size(sftp_default_w)
                     // 最小宽度保证面板始终可见可操作（此前可被拖到极窄）。
@@ -3324,8 +3420,16 @@ impl eframe::App for MinoApp {
                     .resizable(true)
                     .frame(sftp_frame)
                     .show_collapsible(ui, &mut tab.sftp_open, |ui| {
-                        sftp.show_with_terminal_cwd(ui, terminal_cwd.as_deref())
+                        if sftp
+                            .show_with_terminal_cwd(ui, terminal_cwd.as_deref())
+                            .is_some()
+                        {
+                            locate_requested = true;
+                        }
                     });
+                if locate_requested {
+                    Self::begin_locate_terminal(tab, ui.ctx());
+                }
             }
         }
         // 设置弹窗是前台模态内容；终端仍渲染后台输出，
@@ -3635,6 +3739,57 @@ mod app_tests {
             tab.sftp.as_ref().map(SftpView::host_name),
             Some("稳定身份主机")
         );
+    }
+
+    /// 回归（用户报告“定位只有 pwd 后才好用”）：定位请求应先触发终端
+    /// `pwd` 探测（`locate_pending`），等输出校正后再导航，而不是直接
+    /// 用跟踪器里的旧推测值；不适合探测时回退到已知目录。
+    #[test]
+    fn 定位请求先探测再导航() {
+        // 场景一：空闲提示符 → 触发探测，等待输出，不立即导航。
+        let mut tab = {
+            let session = Session::spawn_local(
+                SessionOptions::default(),
+                80,
+                24,
+                Arc::new(|_ev: &SessionEvent| {}),
+            )
+            .expect("创建本地终端失败");
+            let mut tab = TerminalTab::new(1, "定位测试".into(), TerminalView::new(session));
+            let (_tx, rx) = tokio::sync::mpsc::channel(128);
+            let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            tab.sftp = Some(SftpView::new(
+                "定位测试",
+                SftpHandle::from_raw(handle_tx),
+                rx,
+            ));
+            tab
+        };
+        let ctx = egui::Context::default();
+        // 首帧让终端完成布局（request_fresh_pwd 依赖真实尺寸的全屏判断）。
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            tab.terminal.show(ui);
+        });
+        harness.run_steps(6);
+        // 借用已结束（harness 只在闭包内借 tab）；后续直接操作 tab。
+        drop(harness);
+        MinoApp::begin_locate_terminal(&mut tab, &ctx);
+        assert!(
+            tab.locate_pending.is_some(),
+            "空闲提示符下定位应进入 pwd 探测等待"
+        );
+        assert!(!tab.terminal.auto_pwd_ready(), "探测注入后应等待终端输出");
+
+        // 场景二：有未执行输入 → 不注入，直接用已知目录回退。
+        tab.locate_pending = None;
+        tab.terminal.cancel_fresh_pwd();
+        tab.terminal.push_workdir_text_for_test("echo hi");
+        MinoApp::begin_locate_terminal(&mut tab, &ctx);
+        assert!(
+            tab.locate_pending.is_none(),
+            "有未执行输入时不应进入探测等待"
+        );
+        assert!(tab.terminal.auto_pwd_ready());
     }
 
     #[test]
@@ -4577,6 +4732,49 @@ mod dblclick_probe {
 #[cfg(test)]
 mod settings_tests {
     use super::*;
+
+    /// 设置标题区的品牌图标即使被指针悬浮，也不应绘制光晕图元。
+    #[test]
+    fn 设置图标悬浮保持静态() {
+        fn circle_shape_count(draw: fn(&mut egui::Ui, f32) -> egui::Rect) -> usize {
+            let ctx = egui::Context::default();
+            let mut first_output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(100.0, 100.0),
+                    )),
+                    events: vec![egui::Event::PointerMoved(egui::pos2(20.0, 20.0))],
+                    ..Default::default()
+                },
+                |ui| {
+                    draw(ui, 40.0);
+                },
+            );
+            first_output.textures_delta.clear();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                draw(ui, 40.0);
+            });
+            let count = output
+                .shapes
+                .iter()
+                .filter(|clipped| matches!(&clipped.shape, egui::Shape::Circle(_)))
+                .count();
+            output.textures_delta.clear();
+            count
+        }
+
+        assert_eq!(
+            circle_shape_count(draw_logo_mark_static),
+            0,
+            "设置图标悬浮时不应绘制光晕圆形图元"
+        );
+        assert_eq!(
+            circle_shape_count(draw_logo_mark),
+            10,
+            "普通品牌图标仍应保留既有悬浮光晕"
+        );
+    }
 
     /// 设置弹窗默认关闭，tabs 不含设置 tab（设置改弹窗后无 Tab::Settings 概念）。
     #[test]

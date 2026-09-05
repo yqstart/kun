@@ -53,7 +53,15 @@ enum ContextAction {
     Rename(String),
     Delete(Vec<String>),
     Mkdir,
-    Locate(String),
+    /// 定位到终端目录。面板只表达“用户想要定位”，真正的目录解析由
+    /// 应用层在拿到最新终端目录后完成（见
+    /// `SftpView::locate_terminal_directory`）：`show_with_terminal_cwd`
+    /// 遇到它只向上传递定位请求，不在面板内部直接导航。
+    LocateTerminal,
+    /// 定位到一条已经解析好的绝对路径（`apply_context_action` 兜底用，
+    /// 正常路径走 `locate_terminal_directory` 直接导航）。
+    #[allow(dead_code)]
+    LocatePath(String),
 }
 
 /// SFTP 面板状态。
@@ -797,15 +805,14 @@ impl SftpView {
                 *context_action = Some(ContextAction::Upload);
                 ui.close();
             }
-            if let Some(path) = terminal_cwd.as_deref() {
-                if ui
+            if terminal_cwd.is_some()
+                && ui
                     .button("定位到当前终端目录  ⌘⇧L")
-                    .on_hover_text(path)
+                    .on_hover_text(terminal_cwd.as_deref().unwrap_or(""))
                     .clicked()
-                {
-                    *context_action = Some(ContextAction::Locate(path.to_string()));
-                    ui.close();
-                }
+            {
+                *context_action = Some(ContextAction::LocateTerminal);
+                ui.close();
             }
             if ui.button("刷新").clicked() {
                 *context_action = Some(ContextAction::Refresh);
@@ -820,7 +827,15 @@ impl SftpView {
     }
 
     /// 每帧渲染，并接收当前终端已知的远程目录。
-    pub fn show_with_terminal_cwd(&mut self, ui: &mut Ui, terminal_cwd: Option<&str>) {
+    ///
+    /// 返回值语义：`None` 表示本帧没有定位请求；`Some(true)` 表示用户按
+    /// 下了定位（菜单/快捷键），应用层应先对终端做一次 `pwd` 探测再导航；
+    /// `Some(false)` 保留给“探测失败，直接用已知目录回退”的内部路径。
+    pub fn show_with_terminal_cwd(
+        &mut self,
+        ui: &mut Ui,
+        terminal_cwd: Option<&str>,
+    ) -> Option<bool> {
         // 后台事件到达后请求重绘（传输进度/列表刷新不依赖其它重绘源）。
         if self.poll_events() {
             ui.ctx().request_repaint();
@@ -838,8 +853,8 @@ impl SftpView {
                 egui::Key::L,
             )
         });
-        let mut context_action = if locate_shortcut {
-            terminal_cwd.map(|path| ContextAction::Locate(path.to_string()))
+        let mut context_action = if locate_shortcut && terminal_cwd.is_some() {
+            Some(ContextAction::LocateTerminal)
         } else {
             None
         };
@@ -1186,9 +1201,43 @@ impl SftpView {
             self.navigate_to(&path);
         }
 
+        // 定位请求不在面板内部直接消费：终端目录可能是跟踪器里的旧
+        // 推测值，应用层需要先触发 `pwd` 探测、等输出校正后再导航。
+        // 这里只把"用户想要定位"向上传递，返回值见 `show_with_terminal_cwd`。
+        let mut locate_requested = false;
         if let Some(action) = context_action.take() {
-            self.apply_context_action(action);
+            match action {
+                ContextAction::LocateTerminal => {
+                    locate_requested = true;
+                }
+                action => {
+                    self.apply_context_action(action);
+                }
+            }
             ui.ctx().request_repaint();
+        }
+        locate_requested.then_some(true)
+    }
+
+    /// 应用层在终端 `pwd` 探测完成后调用：导航到解析后的最新终端目录。
+    ///
+    /// 与旧的 `ContextAction::Locate(path)` 等价，但路径由应用层在探测
+    /// 完成后提供，保证用的是 shell 真正所在的目录而不是跟踪旧值。
+    pub fn locate_terminal_directory(&mut self, path: &str) {
+        if self.closed {
+            self.error = Some("连接已关闭，无法切换目录".to_string());
+            self.loading = false;
+            return;
+        }
+        // 定位到终端目录：目标与当前相同时不做无谓刷新，
+        // 但必须给明确反馈——曾"点击后无反应"（实际是定位到
+        // 了同一个目录，列表原地刷新看不出任何变化）。
+        let resolved = self.resolve_path(path);
+        if resolved == self.current_path {
+            self.set_notice(format!("已在终端目录 {resolved}"));
+        } else {
+            self.navigate_to(path);
+            self.set_notice(format!("定位到终端目录 {resolved}"));
         }
     }
 
@@ -1201,17 +1250,16 @@ impl SftpView {
         self.last_primary_click = None;
         match action {
             ContextAction::Open(path) => self.navigate_to(&path),
-            ContextAction::Locate(path) => {
-                // 定位到终端目录：目标与当前相同时不做无谓刷新，
-                // 但必须给明确反馈——曾"点击后无反应"（实际是定位到
-                // 了同一个目录，列表原地刷新看不出任何变化）。
-                let resolved = self.resolve_path(&path);
-                if resolved == self.current_path {
-                    self.set_notice(format!("已在终端目录 {resolved}"));
-                } else {
-                    self.navigate_to(&path);
-                    self.set_notice(format!("定位到终端目录 {resolved}"));
-                }
+            // 面板内部不再直接消费定位请求（见 `show_with_terminal_cwd`
+            // 尾部的 `locate_requested`）：`LocateTerminal` 由应用层在
+            // `pwd` 探测完成后经 `locate_terminal_directory` 导航。
+            // 这里保留兜底分支，避免该动作在其它路径被调用时静默丢失。
+            ContextAction::LocateTerminal => {
+                let path = self.current_path.clone();
+                self.locate_terminal_directory(&path);
+            }
+            ContextAction::LocatePath(path) => {
+                self.locate_terminal_directory(&path);
             }
             ContextAction::Refresh => {
                 let path = self.current_path.clone();
@@ -1365,12 +1413,20 @@ impl SftpView {
                     if items.len() == 1 {
                         let item = &items[0];
                         ui.label(format!(
-                            "确定删除{} {}？此操作不可恢复。",
+                            "确定删除{} {}{}？此操作不可恢复。",
                             if item.is_dir { "目录" } else { "文件" },
-                            item.name
+                            item.name,
+                            if item.is_dir {
+                                "及其全部内容"
+                            } else {
+                                ""
+                            }
                         ));
                     } else {
-                        ui.label(format!("确定删除 {} 个项目？此操作不可恢复。", items.len()));
+                        ui.label(format!(
+                            "确定删除 {} 个项目（目录会连同其中内容一起删除）？此操作不可恢复。",
+                            items.len()
+                        ));
                     }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -1481,15 +1537,14 @@ fn render_blank_context_menu(
         *action = Some(ContextAction::Open(parent));
         ui.close();
     }
-    if let Some(path) = terminal_cwd {
-        if ui
+    if terminal_cwd.is_some()
+        && ui
             .button("定位到当前终端目录  ⌘⇧L")
-            .on_hover_text(path)
+            .on_hover_text(terminal_cwd.unwrap_or(""))
             .clicked()
-        {
-            *action = Some(ContextAction::Locate(path.to_string()));
-            ui.close();
-        }
+    {
+        *action = Some(ContextAction::LocateTerminal);
+        ui.close();
     }
 }
 
@@ -2136,11 +2191,12 @@ mod tests {
         assert!(!second.finished && second.failed && second.done == 20);
     }
 
-    /// ⌘⇧L 应直接发出当前终端目录的列表请求。
+    /// ⌘⇧L 只表达定位意图：面板向上传递请求，真正的目录导航由应用层
+    /// 在终端 `pwd` 探测完成后经 `locate_terminal_directory` 完成。
+    /// 回归：曾直接用跟踪器里的旧推测值导航，输入跟踪失效时（Tab/粘贴/
+    /// 别名/函数）定位到的一直是旧目录，“只有 pwd 后才好用”。
     #[test]
     fn 快捷键定位终端目录() {
-        use mino_core::ssh::sftp::SftpCmd;
-
         let (_tx, rx) = tokio::sync::mpsc::channel(128);
         let (handle_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SftpHandle::from_raw(handle_tx);
@@ -2162,8 +2218,15 @@ mod tests {
             cell_width: 0.0,
             last_primary_click: None,
         };
+        let locate_requested = std::rc::Rc::new(std::cell::Cell::new(false));
+        let locate_flag = locate_requested.clone();
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
-            view.show_with_terminal_cwd(ui, Some("/srv/project"));
+            if view
+                .show_with_terminal_cwd(ui, Some("/srv/project"))
+                .is_some()
+            {
+                locate_flag.set(true);
+            }
         });
         harness.run_steps(2);
         harness.event(egui::Event::Key {
@@ -2179,12 +2242,18 @@ mod tests {
         });
         harness.run_steps(2);
 
-        let cmd = cmd_rx.try_recv().expect("快捷键应发出目录定位请求");
-        assert!(matches!(cmd, SftpCmd::List { path } if path == "/srv/project"));
+        assert!(
+            locate_requested.get(),
+            "快捷键应向上传递定位请求，由应用层探测后导航"
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "面板自身不应再直接发出列表请求，避免用旧推测值导航"
+        );
     }
 
-    /// 定位到终端目录必须给明确反馈：目标与当前目录不同时立即导航并
-    /// 提示"定位到…"；相同时不再刷新、提示"已在终端目录"。
+    /// `locate_terminal_directory` 负责真正的目录导航：目标与当前目录
+    /// 不同时导航并提示"定位到…"；相同时不再刷新、提示"已在终端目录"。
     /// 回归：曾只做静默导航，路径相同时列表原地刷新看不出任何变化，
     /// 用户感觉"点击后无反应"。
     #[test]
@@ -2213,55 +2282,42 @@ mod tests {
             cell_width: 0.0,
             last_primary_click: None,
         };
-        let mut harness = egui_kittest::Harness::new_ui(|ui| {
-            view.show_with_terminal_cwd(ui, Some("/srv/project"));
-        });
-        harness.run_steps(2);
-        harness.event(egui::Event::Key {
-            key: egui::Key::L,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers {
-                command: true,
-                shift: true,
-                ..egui::Modifiers::NONE
-            },
-        });
-        harness.run_steps(2);
-
         // 场景一：目标与当前不同 → 导航 + 提示。
+        // 应用层在终端 `pwd` 探测完成后调用本方法（此处直接模拟调用）。
+        view.locate_terminal_directory("/srv/project");
         let cmd = cmd_rx.try_recv().expect("定位应发出目录列表请求");
         assert!(matches!(&cmd, SftpCmd::List { path } if path == "/srv/project"));
-        harness.get_by_label("定位到终端目录 /srv/project");
 
-        // 模拟导航完成（面板当前目录变为 /srv/project）。
-        event_tx
-            .try_send(SftpEvent::Listed {
-                path: "/srv/project".into(),
-                entries: Vec::new(),
-            })
-            .unwrap();
-        harness.run_steps(2);
+        {
+            let mut harness = egui_kittest::Harness::new_ui(|ui| {
+                view.show(ui);
+            });
+            harness.run_steps(2);
+            harness.get_by_label("定位到终端目录 /srv/project");
+
+            // 模拟导航完成（面板当前目录变为 /srv/project）。
+            event_tx
+                .try_send(SftpEvent::Listed {
+                    path: "/srv/project".into(),
+                    entries: Vec::new(),
+                })
+                .unwrap();
+            harness.run_steps(2);
+        }
 
         // 场景二：目标与当前相同 → 不刷新，只提示"已在"。
-        harness.event(egui::Event::Key {
-            key: egui::Key::L,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers {
-                command: true,
-                shift: true,
-                ..egui::Modifiers::NONE
-            },
-        });
-        harness.run_steps(2);
-        assert!(
-            cmd_rx.try_recv().is_err(),
-            "定位到相同目录不应重新发出列表请求"
-        );
-        harness.get_by_label("已在终端目录 /srv/project");
+        view.locate_terminal_directory("/srv/project");
+        {
+            let mut harness = egui_kittest::Harness::new_ui(|ui| {
+                view.show(ui);
+            });
+            harness.run_steps(2);
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "定位到相同目录不应重新发出列表请求"
+            );
+            harness.get_by_label("已在终端目录 /srv/project");
+        }
     }
 
     /// 目录列表空白区域右键应提供新建文件夹等操作。

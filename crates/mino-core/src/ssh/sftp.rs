@@ -666,11 +666,7 @@ async fn sftp_main(
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.clone())
                 );
-                let result = if is_dir {
-                    cancellable(&shutdown, &cancel, sftp.remove_dir(&path)).await
-                } else {
-                    cancellable(&shutdown, &cancel, sftp.remove_file(&path)).await
-                };
+                let result = remove_remote_path(&sftp, &path, is_dir, &shutdown, &cancel).await;
                 let parent = remote_parent_path(&path);
                 match result {
                     Ok(()) => {
@@ -834,6 +830,86 @@ async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>, St
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(entries)
+}
+
+/// 判断远程路径是否词法上指向根目录或当前目录。
+fn is_remote_root_path(path: &str) -> bool {
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                // 继续向上越过当前路径的顶层时，目标可能已经是根目录；
+                // 保守拒绝这类路径，避免递归删除范围超出用户选择的条目。
+                if components.pop().is_none() {
+                    return true;
+                }
+            }
+            _ => components.push(component),
+        }
+    }
+    components.is_empty()
+}
+
+/// 删除远程文件或目录。
+///
+/// SFTP 的 `rmdir` 只能删除空目录，因此目录需要先深度优先删除其内容，
+/// 再删除目录本身。目录项类型直接使用 SFTP 返回的 `file_type`：符号链接
+/// 不会被当成目录递归跟随，只会删除链接自身，避免误删链接目标。
+async fn remove_remote_path(
+    sftp: &SftpSession,
+    path: &str,
+    is_dir: bool,
+    shutdown: &AtomicBool,
+    cancel: &Notify,
+) -> Result<(), String> {
+    if is_dir && is_remote_root_path(path) {
+        return Err("拒绝删除远程根目录".to_string());
+    }
+
+    enum Work {
+        Entry { path: String, is_dir: bool },
+        RemoveDir(String),
+    }
+
+    let mut work = vec![Work::Entry {
+        path: path.to_string(),
+        is_dir,
+    }];
+    while let Some(item) = work.pop() {
+        if shutdown.load(Ordering::SeqCst) {
+            return Err(SFTP_CANCELLED.to_string());
+        }
+        match item {
+            Work::Entry { path, is_dir: true } => {
+                let entries = cancellable(shutdown, cancel, sftp.read_dir(&path)).await?;
+                let mut children = Vec::new();
+                for entry in entries {
+                    let name = entry.file_name();
+                    if !is_safe_entry_name(&name) {
+                        return Err(format!("无法安全删除目录：发现异常远程条目名 {name:?}"));
+                    }
+                    children.push(Work::Entry {
+                        path: entry.path(),
+                        is_dir: entry.file_type().is_dir(),
+                    });
+                }
+                // 先压入删除目录动作，再逆序压入子项，形成后序遍历。
+                work.push(Work::RemoveDir(path));
+                work.extend(children.into_iter().rev());
+            }
+            Work::Entry {
+                path,
+                is_dir: false,
+            } => {
+                cancellable(shutdown, cancel, sftp.remove_file(&path)).await?;
+            }
+            Work::RemoveDir(path) => {
+                cancellable(shutdown, cancel, sftp.remove_dir(&path)).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 尽力清理远程半成品。关闭连接时远端请求可能也在收尾，清理不能无限期
@@ -1076,5 +1152,17 @@ mod tests {
         assert_eq!(remote_parent_path("/home/file"), "/home");
         assert_eq!(remote_parent_path("/home/file/"), "/home");
         assert_eq!(remote_parent_path("relative"), ".");
+    }
+
+    #[test]
+    fn 递归删除拒绝根目录路径() {
+        assert!(is_remote_root_path(""));
+        assert!(is_remote_root_path("."));
+        assert!(is_remote_root_path("/"));
+        assert!(is_remote_root_path("//"));
+        assert!(is_remote_root_path("/home/.."));
+        assert!(is_remote_root_path("work/../.."));
+        assert!(!is_remote_root_path("/home/user"));
+        assert!(!is_remote_root_path("/home/../user"));
     }
 }

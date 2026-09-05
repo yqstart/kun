@@ -20,6 +20,10 @@ pub struct WorkdirTracker {
     pending_remote_cds: Vec<String>,
     /// 最近一次执行的 `pwd` 尚未从终端输出中得到结果。
     awaiting_pwd_output: bool,
+    /// 定位到终端目录时自动发送的 `pwd` 尚未从终端输出中得到结果。
+    /// 与用户手输 `pwd` 的 `awaiting_pwd_output` 区分开——两者共享同一份
+    /// 基线/校正管线，但用户行为不能意外消费掉自动探测的状态。
+    awaiting_auto_pwd_output: bool,
 }
 
 impl WorkdirTracker {
@@ -31,6 +35,7 @@ impl WorkdirTracker {
             cwd_dirty: false,
             pending_remote_cds: Vec::new(),
             awaiting_pwd_output: false,
+            awaiting_auto_pwd_output: false,
         }
     }
 
@@ -41,6 +46,33 @@ impl WorkdirTracker {
     /// 是否正在等待最近一次 `pwd` 的终端输出。
     pub fn awaiting_pwd_output(&self) -> bool {
         self.awaiting_pwd_output
+    }
+
+    /// 当前输入行是否为空且跟踪有效（定位注入 `pwd` 的空闲前提）。
+    pub(crate) fn input_is_idle(&self) -> bool {
+        self.valid && self.text.is_empty()
+    }
+
+    /// 是否正在等待定位探测发送的 `pwd` 的终端输出。
+    pub fn awaiting_auto_pwd_output(&self) -> bool {
+        self.awaiting_auto_pwd_output
+    }
+
+    /// SFTP 定位前调用：进入自动 `pwd` 探测等待态。
+    ///
+    /// 返回 false 表示上一次自动探测的输出还没回来（pwd 正在执行中），
+    /// 调用方不应再注入一条新的 `pwd`。
+    pub fn begin_auto_pwd(&mut self) -> bool {
+        if self.awaiting_auto_pwd_output {
+            return false;
+        }
+        self.awaiting_auto_pwd_output = true;
+        true
+    }
+
+    /// 取消未完成的自动 `pwd` 探测（定位超时 / SFTP 无终端上下文 / 会话关闭）。
+    pub fn cancel_auto_pwd(&mut self) {
+        self.awaiting_auto_pwd_output = false;
     }
 
     /// 追加可见文本（写入 PTY 后同步）。
@@ -110,13 +142,20 @@ impl WorkdirTracker {
         self.awaiting_pwd_output = false;
     }
 
+    /// 终端输出一帧：自动 `pwd` 探测与用户手输 `pwd` 复用同一套基线/校正
+    /// 管线。用户正常输入 `pwd` 时只占用手工态，定位探测的结果同样能把
+    /// 推测值校正为 shell 真正所在的目录，两种等待态都要消费。
+    pub fn awaiting_any_pwd_output(&self) -> bool {
+        self.awaiting_pwd_output || self.awaiting_auto_pwd_output
+    }
+
     /// 从终端前后两帧的可见行中读取 `pwd` 的实际结果。
     ///
     /// 只检查发生变化的行，避免把历史输出中的任意绝对路径误当成当前
     /// 目录。终端输入被粘贴、使用别名/函数，或跟踪器曾因编辑序列失效时，
     /// 这个结果可以把推测值校正为 shell 真正所在的目录。
     pub fn observe_local_output(&mut self, previous: &[String], current: &[String]) -> bool {
-        if !self.awaiting_pwd_output {
+        if !self.awaiting_any_pwd_output() {
             return false;
         }
         let Some(path) = changed_pwd_path(previous, current) else {
@@ -128,12 +167,13 @@ impl WorkdirTracker {
         self.cwd = canonical;
         self.cwd_dirty = true;
         self.awaiting_pwd_output = false;
+        self.awaiting_auto_pwd_output = false;
         true
     }
 
     /// 从终端前后两帧的可见行中读取远程 `pwd` 的实际结果。
     pub fn observe_remote_output(&mut self, previous: &[String], current: &[String]) -> bool {
-        if !self.awaiting_pwd_output {
+        if !self.awaiting_any_pwd_output() {
             return false;
         }
         let Some(path) = changed_pwd_path(previous, current) else {
@@ -142,6 +182,7 @@ impl WorkdirTracker {
         self.cwd = normalize_remote_path(Path::new(path));
         self.cwd_dirty = true;
         self.awaiting_pwd_output = false;
+        self.awaiting_auto_pwd_output = false;
         true
     }
 
@@ -394,5 +435,50 @@ mod tests {
         assert!(tracker.observe_local_output(&previous, &current));
         assert_eq!(tracker.cwd, std::fs::canonicalize(&base).unwrap());
         std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn 自动pwd探测状态与手工pwd互不干扰() {
+        let mut tracker = WorkdirTracker::new(PathBuf::from("/srv/stale"));
+        // 定位前进入自动探测等待态；重复进入应被拒绝，避免注入两条 pwd。
+        assert!(tracker.begin_auto_pwd());
+        assert!(!tracker.begin_auto_pwd());
+        assert!(tracker.awaiting_auto_pwd_output());
+        assert!(tracker.awaiting_any_pwd_output());
+
+        // 探测输出到达后，两种等待态一起消费，目录校正到真实值。
+        let previous = vec!["$ pwd".to_string()];
+        let current = vec!["$ pwd".to_string(), "/srv/real".to_string()];
+        assert!(tracker.observe_remote_output(&previous, &current));
+        assert_eq!(tracker.cwd, PathBuf::from("/srv/real"));
+        assert!(!tracker.awaiting_auto_pwd_output());
+        assert!(!tracker.awaiting_any_pwd_output());
+
+        // 没有等待态时输出不能再改目录。
+        assert!(!tracker.observe_remote_output(&previous, &["/tmp/other".into()]));
+        assert_eq!(tracker.cwd, PathBuf::from("/srv/real"));
+
+        // 超时取消后同样回到空闲，可发起下一次探测。
+        assert!(tracker.begin_auto_pwd());
+        tracker.cancel_auto_pwd();
+        assert!(!tracker.awaiting_any_pwd_output());
+        assert!(tracker.begin_auto_pwd());
+    }
+
+    #[test]
+    fn 定位空闲判断只在有效空输入时通过() {
+        let mut tracker = WorkdirTracker::new(PathBuf::from("/srv/app"));
+        assert!(tracker.input_is_idle());
+
+        tracker.push_text("cd /tmp");
+        assert!(!tracker.input_is_idle());
+
+        // Tab/粘贴等让跟踪失效后不能再认为空闲，避免往用户 IN-PROGRESS
+        // 的命令行里注入 `pwd`。
+        tracker.invalidate();
+        assert!(!tracker.input_is_idle());
+
+        tracker.reset();
+        assert!(tracker.input_is_idle());
     }
 }
