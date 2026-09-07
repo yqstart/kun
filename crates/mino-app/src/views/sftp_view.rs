@@ -1391,7 +1391,7 @@ impl SftpView {
         }
     }
 
-    /// 确认对话框渲染。
+    /// 确认对话框渲染（与设置/新建连接/更新共用外壳与按钮）。
     pub fn show_dialog(&mut self, ctx: &egui::Context) {
         if self.closed {
             self.dialog = None;
@@ -1400,6 +1400,13 @@ impl SftpView {
         let mut close = false;
         let mut action: Option<ConfirmDialog> = None;
         if let Some(dialog) = &mut self.dialog {
+            let theme = crate::theme::current_theme();
+            let title = match dialog {
+                ConfirmDialog::Delete { .. } => "确认删除",
+                ConfirmDialog::Rename { .. } => "重命名",
+                ConfirmDialog::Mkdir { .. } => "新建目录",
+            };
+            let destructive = matches!(dialog, ConfirmDialog::Delete { .. });
             egui::Window::new(match dialog {
                 ConfirmDialog::Delete { .. } => "确认删除",
                 ConfirmDialog::Rename { .. } => "重命名",
@@ -1407,66 +1414,211 @@ impl SftpView {
             })
             .resizable(false)
             .collapsible(false)
+            .title_bar(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| match dialog {
-                ConfirmDialog::Delete { items } => {
-                    if items.len() == 1 {
-                        let item = &items[0];
-                        ui.label(format!(
-                            "确定删除{} {}{}？此操作不可恢复。",
-                            if item.is_dir { "目录" } else { "文件" },
-                            item.name,
-                            if item.is_dir {
-                                "及其全部内容"
-                            } else {
-                                ""
-                            }
-                        ));
-                    } else {
-                        ui.label(format!(
-                            "确定删除 {} 个项目（目录会连同其中内容一起删除）？此操作不可恢复。",
-                            items.len()
-                        ));
+            .frame(crate::dialog::confirm_frame(theme))
+            .show(ctx, |ui| {
+                // ==================== 自绘头部 ====================
+                let (header_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), crate::dialog::HEADER_H),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    header_rect,
+                    egui::CornerRadius {
+                        nw: 12,
+                        ne: 12,
+                        sw: 0,
+                        se: 0,
+                    },
+                    theme.bg_header,
+                );
+                ui.painter().line_segment(
+                    [header_rect.left_bottom(), header_rect.right_bottom()],
+                    egui::Stroke::new(1.0, theme.border),
+                );
+                let mut header = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(header_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                header.add_space(14.0);
+                if destructive {
+                    // 删除用 danger 实心圆 + 白色 ×，一眼可辨危险。
+                    let (badge, _) =
+                        header.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                    header
+                        .painter()
+                        .circle_filled(badge.center(), 12.0, theme.danger);
+                    let icon = badge.shrink(8.5);
+                    let stroke = egui::Stroke::new(1.8, egui::Color32::WHITE);
+                    header
+                        .painter()
+                        .line_segment([icon.left_top(), icon.right_bottom()], stroke);
+                    header
+                        .painter()
+                        .line_segment([icon.right_top(), icon.left_bottom()], stroke);
+                } else {
+                    // 重命名/新建目录用单色 accent 圆徽标 + 首字。
+                    let (badge, _) =
+                        header.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                    let initial = title.chars().next().unwrap_or('?');
+                    crate::dialog::paint_avatar(header.painter(), badge, initial, theme, false);
+                }
+                header.add_space(10.0);
+                header.label(
+                    egui::RichText::new(title)
+                        .strong()
+                        .size(14.0)
+                        .color(theme.text_primary),
+                );
+                header.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(12.0);
+                    if crate::dialog::close_icon_button(ui, "关闭（Esc）") {
+                        close = true;
                     }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("删除").clicked() {
-                            action = Some(dialog.clone());
-                            close = true;
-                        }
-                        if ui.button("取消").clicked() {
-                            close = true;
+                });
+
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(18, 14))
+                    .show(ui, |ui| {
+                        ui.set_min_width(320.0);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        match dialog {
+                            ConfirmDialog::Delete { items } => {
+                                if items.len() == 1 {
+                                    let item = &items[0];
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "确定删除{} {} {}？",
+                                            if item.is_dir { "目录" } else { "文件" },
+                                            item.name,
+                                            if item.is_dir {
+                                                "及其全部内容"
+                                            } else {
+                                                ""
+                                            }
+                                        ))
+                                        .size(12.5)
+                                        .color(theme.text_primary),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "确定删除 {} 个项目？",
+                                            items.len()
+                                        ))
+                                        .size(12.5)
+                                        .color(theme.text_primary),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new("目录会连同其中内容一起删除。")
+                                            .size(11.5)
+                                            .color(theme.text_muted),
+                                    );
+                                }
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("此操作不可恢复。")
+                                        .size(11.5)
+                                        .color(theme.danger),
+                                );
+                                ui.add_space(14.0);
+                                crate::dialog::hairline(ui);
+                                ui.add_space(12.0);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        if ui
+                                            .add(crate::dialog::danger_button(theme, "删除"))
+                                            .clicked()
+                                        {
+                                            action = Some(dialog.clone());
+                                            close = true;
+                                        }
+                                        if ui
+                                            .add(crate::dialog::secondary_button(theme, "取消"))
+                                            .clicked()
+                                        {
+                                            close = true;
+                                        }
+                                    },
+                                );
+                            }
+                            ConfirmDialog::Rename { input, .. } => {
+                                crate::dialog::field_label(ui, "新名称");
+                                ui.add_space(4.0);
+                                crate::dialog::form_input(
+                                    ui,
+                                    egui::Id::new("sftp_rename_input"),
+                                    input,
+                                    "输入新名称",
+                                    320.0,
+                                    false,
+                                    false,
+                                );
+                                ui.add_space(14.0);
+                                crate::dialog::hairline(ui);
+                                ui.add_space(12.0);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        if ui
+                                            .add(crate::dialog::primary_button(theme, "确定"))
+                                            .clicked()
+                                        {
+                                            action = Some(dialog.clone());
+                                            close = true;
+                                        }
+                                        if ui
+                                            .add(crate::dialog::secondary_button(theme, "取消"))
+                                            .clicked()
+                                        {
+                                            close = true;
+                                        }
+                                    },
+                                );
+                            }
+                            ConfirmDialog::Mkdir { input, .. } => {
+                                crate::dialog::field_label(ui, "目录名称");
+                                ui.add_space(4.0);
+                                crate::dialog::form_input(
+                                    ui,
+                                    egui::Id::new("sftp_mkdir_input"),
+                                    input,
+                                    "输入目录名称",
+                                    320.0,
+                                    false,
+                                    false,
+                                );
+                                ui.add_space(14.0);
+                                crate::dialog::hairline(ui);
+                                ui.add_space(12.0);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        if ui
+                                            .add(crate::dialog::primary_button(theme, "确定"))
+                                            .clicked()
+                                        {
+                                            action = Some(dialog.clone());
+                                            close = true;
+                                        }
+                                        if ui
+                                            .add(crate::dialog::secondary_button(theme, "取消"))
+                                            .clicked()
+                                        {
+                                            close = true;
+                                        }
+                                    },
+                                );
+                            }
                         }
                     });
-                }
-                ConfirmDialog::Rename { input, .. } => {
-                    ui.label("新名称：");
-                    ui.text_edit_singleline(input);
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("确定").clicked() {
-                            action = Some(dialog.clone());
-                            close = true;
-                        }
-                        if ui.button("取消").clicked() {
-                            close = true;
-                        }
-                    });
-                }
-                ConfirmDialog::Mkdir { input, .. } => {
-                    ui.label("目录名称：");
-                    ui.text_edit_singleline(input);
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("确定").clicked() {
-                            action = Some(dialog.clone());
-                            close = true;
-                        }
-                        if ui.button("取消").clicked() {
-                            close = true;
-                        }
-                    });
-                }
             });
         }
         if close {
@@ -1896,7 +2048,7 @@ mod tests {
     /// 确认对话框流程：选中条目 → 点击删除 → 出现确认框。
     #[test]
     fn 删除确认对话框流程() {
-        use kittest::Queryable;
+        use kittest::{NodeT, Queryable};
 
         // 直接构造带条目的面板（不依赖网络）。
         let (_tx, rx) = tokio::sync::mpsc::channel(128);
@@ -1948,11 +2100,22 @@ mod tests {
         harness.run_steps(6);
         harness.get_by_label("删除").click();
         harness.run_steps(6);
-        harness.get_by_label("确认删除");
+        // 头部标题与关闭按钮共用"确认删除"文案（Window + Button 各一个），
+        // 仅断言标题节点唯一存在。
+        assert!(
+            harness
+                .root()
+                .query_all_by_role(accesskit::Role::Window)
+                .any(|n| n.accesskit_node().label() == Some("确认删除".to_string())),
+            "确认删除窗口应出现"
+        );
         harness.get_by_label("readme.md");
 
         let dialog_rect = harness
-            .get_by_role_and_label(accesskit::Role::Window, "确认删除")
+            .root()
+            .query_all_by_role(accesskit::Role::Window)
+            .find(|n| n.accesskit_node().label() == Some("确认删除".to_string()))
+            .expect("确认删除窗口应存在")
             .rect();
         let viewport = harness.ctx.content_rect();
         assert!(

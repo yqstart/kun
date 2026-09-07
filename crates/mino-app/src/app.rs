@@ -20,6 +20,7 @@ use mino_core::updater::{check_for_update, UpdateInfo};
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 use crate::anim;
+use crate::dialog;
 use crate::views::sftp_view::SftpView;
 use crate::views::terminal_view::TerminalView;
 
@@ -1262,24 +1263,17 @@ impl MinoApp {
         egui::Window::new("settings_panel")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
-            .default_size([640.0, 540.0])
-            .min_size([500.0, 400.0])
-            .max_size([760.0, 600.0])
+            .default_size([600.0, 540.0])
+            .min_size([520.0, 420.0])
+            .max_size([720.0, 620.0])
             .resizable(true)
             .collapsible(false)
             .title_bar(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme.bg_app)
-                    .corner_radius(egui::CornerRadius::same(14))
-                    .stroke(egui::Stroke::new(1.0, theme.border))
-                    .inner_margin(egui::Margin::same(0)),
-            )
+            .frame(dialog::shell_frame(theme))
             .show(ctx, |ui| {
-                // ==================== 对齐的自绘头部 ====================
-                let header_h = 72.0;
+                // ==================== 自绘头部：logo + 标题 / ESC + 关闭 ====================
                 let (header_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), header_h),
+                    egui::vec2(ui.available_width(), dialog::HEADER_H),
                     egui::Sense::hover(),
                 );
                 ui.painter().rect_filled(
@@ -1302,52 +1296,21 @@ impl MinoApp {
                         .max_rect(header_rect)
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
-                header.add_space(18.0);
-                draw_logo_mark_static(&mut header, 40.0);
-                header.add_space(11.0);
-                // 显式固定标题区高度，避免 `vertical` 子布局占满头部后把文字贴到顶部。
-                let title_rect = header
-                    .allocate_exact_size(egui::vec2(220.0, 36.0), egui::Sense::hover())
-                    .0;
-                let mut title = header.new_child(
-                    egui::UiBuilder::new()
-                        .id_salt("settings_header_title")
-                        .max_rect(title_rect)
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                );
-                title.spacing_mut().item_spacing.y = 1.0;
-                title.label(
-                    egui::RichText::new("WORKSPACE / SETTINGS")
-                        .monospace()
-                        .size(8.5)
-                        .color(theme.accent2),
-                );
-                title.label(
-                    egui::RichText::new("设置")
-                        .strong()
-                        .size(18.0)
-                        .color(theme.text_primary),
+                header.add_space(14.0);
+                draw_logo_mark_static(&mut header, dialog::HEADER_LOGO);
+                header.add_space(10.0);
+                dialog::header_title(
+                    &mut header,
+                    "settings_header_title",
+                    "设置",
+                    "主机 · 外观 · 关于",
                 );
                 header.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(14.0);
-                    let close = ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("×")
-                                    .size(19.0)
-                                    .color(theme.text_secondary),
-                            )
-                            .fill(egui::Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::NONE)
-                            .min_size(egui::vec2(28.0, 28.0))
-                            .corner_radius(crate::theme::tokens::RADIUS_ITEM),
-                        )
-                        .on_hover_text("关闭设置（Esc）")
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if close.clicked() {
+                    ui.add_space(12.0);
+                    if dialog::close_icon_button(ui, "关闭设置（Esc）") {
                         close_requested = true;
                     }
-                    ui.add_space(5.0);
+                    ui.add_space(4.0);
                     // 同样固定 ESC 胶囊的尺寸，防止 Frame 在横向布局中纵向填满头部。
                     let esc_rect = ui
                         .allocate_exact_size(egui::vec2(34.0, 24.0), egui::Sense::hover())
@@ -1375,24 +1338,28 @@ impl MinoApp {
                     );
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(12.0);
 
                 egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(16, 0))
+                    .inner_margin(egui::Margin::symmetric(14, 0))
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .id_salt("settings_scroll")
                             .auto_shrink([false, true])
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                            )
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
+                                ui.spacing_mut().item_spacing.y = 0.0;
                                 // ============ 主机管理 ============
-                                Self::settings_card(ui, "主机管理", |ui| {
+                                let host_count = format!("{} 台", self.config.hosts.len());
+                                Self::settings_card(ui, "主机管理", Some(&host_count), |ui| {
                                     self.host_sidebar(ui);
                                 });
-                                ui.add_space(10.0);
 
                                 // ============ 外观 ============
-                                Self::settings_card(ui, "外观", |ui| {
+                                Self::settings_card(ui, "外观", None, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             egui::RichText::new("主题")
@@ -1444,18 +1411,26 @@ impl MinoApp {
                                 ui.add_space(10.0);
 
                                 // ============ 关于 ============
-                                Self::settings_card(ui, "关于", |ui| {
+                                Self::settings_card(ui, "关于", None, |ui| {
                                     ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
                                         ui.label(
                                             egui::RichText::new(format!(
                                                 "{PRODUCT_NAME} v{}",
                                                 env!("CARGO_PKG_VERSION")
                                             ))
-                                            .size(12.0)
-                                            .color(theme.text_secondary),
+                                            .strong()
+                                            .size(12.5)
+                                            .color(theme.text_primary),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("STABLE")
+                                                .monospace()
+                                                .size(9.0)
+                                                .color(theme.accent),
                                         );
                                     });
-                                    ui.add_space(8.0);
+                                    ui.add_space(10.0);
                                     let (label, dot, pulse) = match &self.update_state {
                                         UpdateState::Idle => ("检查更新", None, false),
                                         UpdateState::Checking => {
@@ -1487,9 +1462,9 @@ impl MinoApp {
                                         }
                                     };
                                     ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
                                         if let Some(color) = dot {
                                             status_dot(ui, color, pulse);
-                                            ui.add_space(6.0);
                                         }
                                         if ui
                                             .add(
@@ -1500,7 +1475,8 @@ impl MinoApp {
                                                 )
                                                 .fill(theme.bg_elevated)
                                                 .stroke(egui::Stroke::new(1.0, theme.border))
-                                                .corner_radius(crate::theme::tokens::RADIUS_ITEM),
+                                                .corner_radius(crate::theme::tokens::RADIUS_ITEM)
+                                                .min_size(egui::vec2(88.0, 28.0)),
                                             )
                                             .on_hover_text("检查更新")
                                             .clicked()
@@ -1515,9 +1491,9 @@ impl MinoApp {
                                             self.start_update_check(false, ctx);
                                         }
                                     });
-                                    ui.add_space(8.0);
-                                    ui.separator();
-                                    ui.add_space(4.0);
+                                    ui.add_space(10.0);
+                                    dialog::hairline(ui);
+                                    ui.add_space(10.0);
                                     // 性能 HUD 开关（调试用）。
                                     ui.horizontal(|ui| {
                                         ui.label(
@@ -1551,15 +1527,15 @@ impl MinoApp {
         self.show_settings = open && self.show_settings;
     }
 
-    /// 设置弹窗的统一内容卡片：标题、编号、分隔线和内容使用同一条水平基线。
-    fn settings_card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    /// 设置弹窗的统一内容卡片：标题 + 右侧计数 + 发丝线 + 内容。
+    fn settings_card(
+        ui: &mut egui::Ui,
+        title: &str,
+        count: Option<&str>,
+        body: impl FnOnce(&mut egui::Ui),
+    ) {
         let theme = crate::theme::current_theme();
-        let frame = egui::Frame::new()
-            .fill(theme.bg_panel)
-            .stroke(egui::Stroke::new(1.0, theme.border))
-            .corner_radius(egui::CornerRadius::same(11))
-            .inner_margin(egui::Margin::symmetric(14, 12));
-        frame.show(ui, |ui| {
+        dialog::card_frame(theme).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
@@ -1569,41 +1545,23 @@ impl MinoApp {
                         .size(13.0)
                         .color(theme.text_primary),
                 );
-                ui.label(
-                    egui::RichText::new(match title {
-                        "主机管理" => "HOSTS / SSH",
-                        "外观" => "APPEARANCE",
-                        _ => "SYSTEM",
-                    })
-                    .monospace()
-                    .size(9.0)
-                    .color(theme.accent2),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(match title {
-                            "主机管理" => "01",
-                            "外观" => "02",
-                            _ => "03",
-                        })
-                        .monospace()
-                        .size(10.0)
-                        .color(theme.text_muted),
-                    );
-                });
+                if let Some(count) = count {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(count)
+                                .monospace()
+                                .size(10.0)
+                                .color(theme.text_muted),
+                        );
+                    });
+                }
             });
-            ui.add_space(7.0);
-            ui.painter().line_segment(
-                [
-                    ui.cursor().left_top(),
-                    egui::pos2(ui.max_rect().right(), ui.cursor().top()),
-                ],
-                egui::Stroke::new(1.0, theme.border),
-            );
             ui.add_space(8.0);
+            dialog::hairline(ui);
+            ui.add_space(10.0);
             body(ui);
         });
-        ui.add_space(8.0);
+        ui.add_space(10.0);
     }
 
     /// 标签栏 ">_" 快捷按钮弹出的主机菜单：单击主机行直接发起连接
@@ -1678,21 +1636,8 @@ impl MinoApp {
             inner.add_space(ROW_PAD_X);
             let (avatar_rect, _) =
                 inner.allocate_exact_size(egui::vec2(AVATAR, AVATAR), egui::Sense::hover());
-            anim::paint_rounded_gradient(
-                inner.painter(),
-                avatar_rect,
-                AVATAR * 0.5,
-                theme.accent,
-                theme.accent2,
-            );
             let initial = host.name.chars().next().unwrap_or('?');
-            inner.painter().text(
-                avatar_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                initial.to_string(),
-                egui::FontId::proportional(11.0),
-                egui::Color32::WHITE,
-            );
+            dialog::paint_avatar(inner.painter(), avatar_rect, initial, theme, false);
             inner.add_space(TEXT_GAP);
             let text_rect = inner
                 .allocate_exact_size(
@@ -1745,55 +1690,42 @@ impl MinoApp {
 
     /// 渲染设置里的主机管理区。
     ///
-    /// 每个主机使用独立的 endpoint 卡片：名称、地址、认证方式和操作按钮
-    /// 有明确层级，点击区域覆盖整行，避免只点到文字才有反应。
+    /// 仪器列表风：平时无线无底、行间发丝分隔，认证降级为次要文本；
+    /// 选中行 accent 软底 + 左侧竖条。点击区域覆盖整行。
     fn host_sidebar(&mut self, ui: &mut egui::Ui) {
         let theme = crate::theme::current_theme();
-        let host_count = self.config.hosts.len();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(
-                egui::RichText::new("已保存主机")
-                    .strong()
-                    .size(12.5)
-                    .color(theme.text_primary),
-            );
+            dialog::section_title(ui, "已保存主机");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let new_btn = egui::Button::new(
-                    egui::RichText::new("新建连接")
-                        .color(theme.accent)
-                        .size(11.5),
-                )
-                .fill(theme.accent_soft)
-                .stroke(egui::Stroke::new(1.0, theme.accent.gamma_multiply(0.55)))
-                .corner_radius(egui::CornerRadius::same(6));
-                if ui.add_sized(egui::vec2(82.0, 26.0), new_btn).clicked() {
+                if ui
+                    .add_sized(
+                        egui::vec2(76.0, 26.0),
+                        dialog::primary_button(theme, "新建连接"),
+                    )
+                    .clicked()
+                {
                     self.open_new_connection();
                 }
-                ui.add_space(9.0);
+                ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new(format!("{:02} ENDPOINTS", host_count))
+                    egui::RichText::new(format!("{} 台", self.config.hosts.len()))
                         .monospace()
-                        .size(9.0)
+                        .size(10.0)
                         .color(theme.text_muted),
                 );
             });
         });
-        ui.add_space(12.0);
+        ui.add_space(10.0);
 
         if self.config.hosts.is_empty() {
             let (empty_rect, _) = ui
                 .allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
-            ui.painter().rect_filled(
+            dialog::dashed_rounded_rect(
+                ui,
                 empty_rect,
                 crate::theme::tokens::RADIUS_ITEM,
-                theme.bg_elevated.gamma_multiply(0.55),
-            );
-            ui.painter().rect_stroke(
-                empty_rect,
-                crate::theme::tokens::RADIUS_ITEM,
-                egui::Stroke::new(1.0, theme.border),
-                egui::StrokeKind::Inside,
+                theme.border,
             );
             let mut empty = ui.new_child(
                 egui::UiBuilder::new()
@@ -1814,24 +1746,24 @@ impl MinoApp {
                     .size(10.0)
                     .color(theme.text_muted),
             );
+            return;
         }
 
         let mut remove_idx: Option<usize> = None;
         let mut connect_idx: Option<usize> = None;
-        // 卡片内部使用固定的右侧操作列：认证方式和删除按钮永远在同一条竖线上，
-        // 名称列只占用中间剩余空间，名称过长时截断而不是挤乱布局。
-        const ROW_HEIGHT: f32 = 62.0;
-        const AVATAR_SIZE: f32 = 34.0;
-        const AUTH_WIDTH: f32 = 78.0;
-        const AUTH_HEIGHT: f32 = 22.0;
-        const COLUMN_GAP: f32 = 10.0;
-        const AUTH_GAP: f32 = 14.0;
+        // 右侧操作列固定：认证文本 + 删除按钮永远在同一条竖线上，
+        // 名称列只占用中间剩余空间，过长截断不挤乱布局。
+        const ROW_H: f32 = 56.0;
+        const AVATAR: f32 = 30.0;
+        const AUTH_W: f32 = 72.0;
         const DELETE_SIZE: f32 = 24.0;
+        const GAP: f32 = 10.0;
 
+        let host_count = self.config.hosts.len();
         for (i, host) in self.config.hosts.iter().enumerate() {
             let row_id = egui::Id::new(("host_row", i));
             let (row_rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), ROW_HEIGHT),
+                egui::vec2(ui.available_width(), ROW_H),
                 egui::Sense::hover(),
             );
             let row_response = ui
@@ -1840,40 +1772,43 @@ impl MinoApp {
 
             let hover = row_response.hovered();
             let selected = self.selected_host == Some(i);
-            let fill = if selected {
-                theme.accent_soft
-            } else if hover {
-                theme.bg_elevated.gamma_multiply(1.12)
-            } else {
-                theme.bg_elevated.gamma_multiply(0.72)
-            };
-            ui.painter().rect_filled(row_rect, 9.0, fill);
-            ui.painter().rect_stroke(
-                row_rect,
-                9.0,
-                egui::Stroke::new(1.0, if selected { theme.accent } else { theme.border }),
-                egui::StrokeKind::Inside,
-            );
-            if selected || hover {
+            // 平时无线无底；选中 accent 软底，hover 白 6% 提亮。
+            if selected {
+                ui.painter().rect_filled(
+                    row_rect,
+                    crate::theme::tokens::RADIUS_ITEM,
+                    theme.accent_soft,
+                );
                 ui.painter().rect_filled(
                     egui::Rect::from_min_max(
-                        egui::pos2(row_rect.left(), row_rect.top() + 10.0),
-                        egui::pos2(row_rect.left() + 2.0, row_rect.bottom() - 10.0),
+                        egui::pos2(row_rect.left() + 2.0, row_rect.top() + 10.0),
+                        egui::pos2(row_rect.left() + 4.0, row_rect.bottom() - 10.0),
                     ),
                     1.0,
-                    if selected {
-                        theme.accent
-                    } else {
-                        theme.accent2
-                    },
+                    theme.accent,
+                );
+            } else if hover {
+                ui.painter().rect_filled(
+                    row_rect,
+                    crate::theme::tokens::RADIUS_ITEM,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+                );
+            }
+            // 行间发丝线（末行不画），左右与内容对齐。
+            if i + 1 < host_count {
+                let y = row_rect.bottom();
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(row_rect.left() + 12.0, y),
+                        egui::pos2(row_rect.right() - 12.0, y),
+                    ],
+                    egui::Stroke::new(1.0, theme.border.gamma_multiply(0.5)),
                 );
             }
 
-            let content_rect = row_rect.shrink2(egui::vec2(12.0, 7.0));
-            let auth_left = content_rect.right() - DELETE_SIZE - AUTH_GAP - AUTH_WIDTH;
-            let identity_right = auth_left - COLUMN_GAP;
-            let identity_width =
-                (identity_right - content_rect.left() - AVATAR_SIZE - COLUMN_GAP).max(72.0);
+            let content_rect = row_rect.shrink2(egui::vec2(12.0, 6.0));
+            let right_w = AUTH_W + GAP + DELETE_SIZE;
+            let identity_width = (content_rect.width() - AVATAR - GAP - right_w - GAP).max(72.0);
             let mut inner = ui.new_child(
                 egui::UiBuilder::new()
                     .id_salt(row_id.with("content"))
@@ -1881,30 +1816,14 @@ impl MinoApp {
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
             inner.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            let (avatar_rect, _) = inner
-                .allocate_exact_size(egui::vec2(AVATAR_SIZE, AVATAR_SIZE), egui::Sense::hover());
-            anim::paint_rounded_gradient(
-                inner.painter(),
-                avatar_rect,
-                10.0,
-                theme.accent,
-                theme.accent2,
-            );
+            let (avatar_rect, _) =
+                inner.allocate_exact_size(egui::vec2(AVATAR, AVATAR), egui::Sense::hover());
             let initial = host.name.chars().next().unwrap_or('?');
-            inner.painter().text(
-                avatar_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                initial.to_string(),
-                egui::FontId::proportional(15.0),
-                egui::Color32::WHITE,
-            );
-            inner.add_space(COLUMN_GAP);
+            dialog::paint_avatar(inner.painter(), avatar_rect, initial, theme, selected);
+            inner.add_space(GAP);
 
             let identity_rect = inner
-                .allocate_exact_size(
-                    egui::vec2(identity_width, AVATAR_SIZE),
-                    egui::Sense::hover(),
-                )
+                .allocate_exact_size(egui::vec2(identity_width, AVATAR), egui::Sense::hover())
                 .0;
             let mut identity = inner.new_child(
                 egui::UiBuilder::new()
@@ -1912,13 +1831,13 @@ impl MinoApp {
                     .max_rect(identity_rect)
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
-            identity.spacing_mut().item_spacing.y = 1.0;
+            identity.spacing_mut().item_spacing.y = 2.0;
             identity.add_space(1.0);
             identity.add(
                 egui::Label::new(
                     egui::RichText::new(&host.name)
                         .strong()
-                        .size(12.5)
+                        .size(13.0)
                         .color(theme.text_primary),
                 )
                 .truncate(),
@@ -1927,54 +1846,36 @@ impl MinoApp {
                 egui::Label::new(
                     egui::RichText::new(format!("{}@{}:{}", host.user, host.host, host.port))
                         .monospace()
-                        .size(10.0)
-                        .color(theme.text_secondary),
+                        .size(10.5)
+                        .color(theme.text_muted),
                 )
                 .truncate(),
             );
 
+            // 认证方式降级为次要文本（无胶囊），右对齐固定列。
             let auth_label = if matches!(host.auth, Auth::Key { .. }) {
                 "SSH KEY"
             } else {
                 "PASSWORD"
             };
             let auth_rect = egui::Rect::from_min_size(
-                egui::pos2(auth_left, row_rect.center().y - AUTH_HEIGHT * 0.5),
-                egui::vec2(AUTH_WIDTH, AUTH_HEIGHT),
-            );
-            ui.painter().rect_filled(
-                auth_rect,
-                AUTH_HEIGHT * 0.5,
-                if selected {
-                    theme.accent_soft
-                } else {
-                    theme.accent.gamma_multiply(0.10)
-                },
-            );
-            ui.painter().rect_stroke(
-                auth_rect,
-                AUTH_HEIGHT * 0.5,
-                egui::Stroke::new(1.0, theme.accent.gamma_multiply(0.42)),
-                egui::StrokeKind::Inside,
+                egui::pos2(
+                    content_rect.right() - DELETE_SIZE - GAP - AUTH_W,
+                    row_rect.center().y - 8.0,
+                ),
+                egui::vec2(AUTH_W, 16.0),
             );
             let mut auth = ui.new_child(
                 egui::UiBuilder::new()
                     .id_salt(row_id.with("auth"))
                     .max_rect(auth_rect)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
             );
-            auth.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            auth.add_space(8.0);
-            let (dot_rect, _) =
-                auth.allocate_exact_size(egui::vec2(5.0, 5.0), egui::Sense::hover());
-            auth.painter()
-                .circle_filled(dot_rect.center(), 2.0, theme.accent2);
-            auth.add_space(5.0);
             auth.label(
                 egui::RichText::new(auth_label)
                     .monospace()
-                    .size(8.0)
-                    .color(theme.accent2),
+                    .size(9.0)
+                    .color(theme.text_muted),
             );
 
             // 删除按钮最后注册，覆盖整行点击区，避免点击删除时先触发连接。
@@ -2019,8 +1920,16 @@ impl MinoApp {
                 }
                 self.last_row_click = Some((now, i));
             }
-            ui.add_space(7.0);
         }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("单击选中 · 双击连接")
+                    .size(10.5)
+                    .color(theme.text_muted),
+            );
+        });
         if let Some(i) = connect_idx {
             let profile = self.config.hosts[i].clone();
             // 从设置弹窗双击连接成功后关闭弹窗，直接进入终端。
@@ -2041,248 +1950,238 @@ impl MinoApp {
     /// 渲染新建连接对话框。
     fn connect_dialog(&mut self, ctx: &egui::Context) {
         let theme = crate::theme::current_theme();
-        let field_width = 300.0;
+        let field_width = 308.0;
         let mut port_error = false;
         let mut open = self.show_new_conn;
         let mut to_connect: Option<HostProfile> = None;
         let mut canceled = false;
+        if !self.show_new_conn {
+            return;
+        }
+        // 端口错误态：输入框描红（比 toast 更贴近问题位置）。
+        let port_invalid =
+            !self.form.port.trim().is_empty() && self.form.port.trim().parse::<u16>().is_err();
         egui::Window::new("connect_dialog")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
             .resizable(false)
             .collapsible(false)
             .title_bar(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme.bg_app)
-                    .stroke(egui::Stroke::new(1.0, theme.border))
-                    .corner_radius(egui::CornerRadius::same(14))
-                    .inner_margin(egui::Margin::same(18)),
-            )
+            .frame(dialog::shell_frame(theme))
             .show(ctx, |ui| {
-                // 与设置窗口共用同一套头部基线，标题不再依赖 egui 默认 title bar。
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    draw_logo_mark(ui, 38.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(
-                            egui::RichText::new("NEW CONNECTION")
-                                .monospace()
-                                .size(9.0)
-                                .color(theme.accent),
-                        );
-                        ui.label(
-                            egui::RichText::new("新建连接")
-                                .strong()
-                                .size(17.0)
-                                .color(theme.text_primary),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("×")
-                                        .size(20.0)
-                                        .color(theme.text_secondary),
-                                )
-                                .fill(egui::Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE)
-                                .min_size(egui::vec2(28.0, 28.0))
-                                .corner_radius(crate::theme::tokens::RADIUS_ITEM),
-                            )
-                            .clicked()
-                        {
-                            canceled = true;
-                        }
-                    });
-                });
-                ui.add_space(15.0);
+                // ==================== 自绘头部 ====================
+                let (header_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), dialog::HEADER_H),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    header_rect,
+                    egui::CornerRadius {
+                        nw: 14,
+                        ne: 14,
+                        sw: 0,
+                        se: 0,
+                    },
+                    theme.bg_header,
+                );
                 ui.painter().line_segment(
-                    [
-                        ui.cursor().left_top(),
-                        egui::pos2(ui.max_rect().right(), ui.cursor().top()),
-                    ],
+                    [header_rect.left_bottom(), header_rect.right_bottom()],
                     egui::Stroke::new(1.0, theme.border),
                 );
-                ui.add_space(13.0);
-                ui.label(
-                    egui::RichText::new("连接身份")
-                        .strong()
-                        .color(theme.accent2),
+                let mut header = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(header_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
-                ui.add_space(4.0);
-                let name_id = egui::Id::new("conn_form_name");
-                if !self.form.name_focused {
-                    ui.memory_mut(|m| m.request_focus(name_id));
-                    self.form.name_focused = true;
-                }
-                ui.label(
-                    egui::RichText::new("名称")
-                        .size(11.0)
-                        .color(theme.text_muted),
+                header.add_space(14.0);
+                draw_logo_mark(&mut header, dialog::HEADER_LOGO);
+                header.add_space(10.0);
+                dialog::header_title(
+                    &mut header,
+                    "connect_header_title",
+                    "新建连接",
+                    "保存后可在主机列表中一键连接",
                 );
-                form_input(
-                    ui,
-                    name_id,
-                    &mut self.form.name,
-                    "连接名称（可选）",
-                    field_width,
-                    false,
-                );
-                ui.add_space(5.0);
-                ui.label(
-                    egui::RichText::new("用户名")
-                        .size(11.0)
-                        .color(theme.text_muted),
-                );
-                form_input(
-                    ui,
-                    egui::Id::new("conn_form_user"),
-                    &mut self.form.user,
-                    "用户名，例如 root",
-                    field_width,
-                    false,
-                );
-                ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new("网络地址")
-                        .strong()
-                        .color(theme.accent2),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("主机 / 端口")
-                        .size(11.0)
-                        .color(theme.text_muted),
-                );
-                ui.horizontal(|ui| {
-                    form_input(
-                        ui,
-                        egui::Id::new("conn_form_host"),
-                        &mut self.form.host,
-                        "主机名或 IP",
-                        field_width - 76.0,
-                        false,
-                    );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("端口")
-                            .size(11.0)
-                            .color(theme.text_muted),
-                    );
-                    form_input(
-                        ui,
-                        egui::Id::new("conn_form_port"),
-                        &mut self.form.port,
-                        "22",
-                        68.0,
-                        false,
-                    );
-                });
-                ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new("认证方式")
-                        .strong()
-                        .color(theme.accent2),
-                );
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.form.auth_kind, 0, "密码");
-                    ui.selectable_value(&mut self.form.auth_kind, 1, "私钥");
-                });
-                ui.add_space(5.0);
-                if self.form.auth_kind == 0 {
-                    form_input(
-                        ui,
-                        egui::Id::new("conn_form_password"),
-                        &mut self.form.password,
-                        "密码",
-                        field_width,
-                        true,
-                    );
-                } else {
-                    form_input(
-                        ui,
-                        egui::Id::new("conn_form_key"),
-                        &mut self.form.key_path,
-                        "私钥文件路径",
-                        field_width,
-                        false,
-                    );
-                    ui.add_space(5.0);
-                    form_input(
-                        ui,
-                        egui::Id::new("conn_form_pass"),
-                        &mut self.form.passphrase,
-                        "私钥口令（可选）",
-                        field_width,
-                        true,
-                    );
-                }
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let connect = egui::Button::new(
-                        egui::RichText::new("连接")
-                            .color(crate::theme::tokens::ACCENT_FG)
-                            .size(13.0),
-                    )
-                    .fill(theme.accent)
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(crate::theme::tokens::RADIUS_SM);
-                    if ui.add(connect).clicked() {
-                        let port: u16 = match self.form.port.trim().parse() {
-                            Ok(port @ 1..=65535) => port,
-                            _ => {
-                                port_error = true;
-                                22
-                            }
-                        };
-                        if port_error {
-                            self.show_toast("端口必须是 1-65535 的数字", true);
-                            return;
-                        }
-                        if self.form.auth_kind == 1 && self.form.key_path.trim().is_empty() {
-                            self.show_toast("请填写私钥文件路径", true);
-                            return;
-                        }
-                        let host = self.form.host.trim().to_string();
-                        let user = self.form.user.trim().to_string();
-                        let auth = if self.form.auth_kind == 0 {
-                            Auth::Password(self.form.password.clone())
-                        } else {
-                            Auth::Key {
-                                path: PathBuf::from(self.form.key_path.trim()),
-                                passphrase: if self.form.passphrase.is_empty() {
-                                    None
-                                } else {
-                                    Some(self.form.passphrase.clone())
-                                },
-                            }
-                        };
-                        let profile = HostProfile {
-                            name: if self.form.name.trim().is_empty() {
-                                host.clone()
-                            } else {
-                                self.form.name.trim().to_string()
-                            },
-                            host,
-                            port,
-                            user,
-                            auth,
-                        };
-                        if !profile.host.is_empty() && !profile.user.is_empty() {
-                            to_connect = Some(profile);
-                        } else {
-                            self.show_toast("请填写主机与用户名", true);
-                        }
-                    }
-                    if ui.button("取消").clicked() {
+                header.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(12.0);
+                    if dialog::close_icon_button(ui, "关闭（Esc）") {
                         canceled = true;
                     }
                 });
+
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(18, 14))
+                    .show(ui, |ui| {
+                        ui.set_min_width(field_width);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        dialog::section_title(ui, "连接身份");
+                        ui.add_space(8.0);
+                        let name_id = egui::Id::new("conn_form_name");
+                        if !self.form.name_focused {
+                            ui.memory_mut(|m| m.request_focus(name_id));
+                            self.form.name_focused = true;
+                        }
+                        dialog::field_label(ui, "名称");
+                        ui.add_space(4.0);
+                        dialog::form_input(
+                            ui,
+                            name_id,
+                            &mut self.form.name,
+                            "连接名称（可选）",
+                            field_width,
+                            false,
+                            false,
+                        );
+                        ui.add_space(10.0);
+                        dialog::field_label(ui, "用户名");
+                        ui.add_space(4.0);
+                        dialog::form_input(
+                            ui,
+                            egui::Id::new("conn_form_user"),
+                            &mut self.form.user,
+                            "用户名，例如 root",
+                            field_width,
+                            false,
+                            false,
+                        );
+                        ui.add_space(14.0);
+                        dialog::hairline(ui);
+                        ui.add_space(14.0);
+                        dialog::section_title(ui, "网络地址");
+                        ui.add_space(8.0);
+                        dialog::field_label(ui, "主机");
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            dialog::form_input(
+                                ui,
+                                egui::Id::new("conn_form_host"),
+                                &mut self.form.host,
+                                "主机名或 IP",
+                                218.0,
+                                false,
+                                false,
+                            );
+                            dialog::form_input(
+                                ui,
+                                egui::Id::new("conn_form_port"),
+                                &mut self.form.port,
+                                "22",
+                                82.0,
+                                false,
+                                port_error || port_invalid,
+                            );
+                        });
+                        if port_error || port_invalid {
+                            ui.add_space(3.0);
+                            ui.label(
+                                egui::RichText::new("端口必须是 1–65535 的数字")
+                                    .size(11.0)
+                                    .color(theme.danger),
+                            );
+                        }
+                        ui.add_space(14.0);
+                        dialog::hairline(ui);
+                        ui.add_space(14.0);
+                        dialog::section_title(ui, "认证方式");
+                        ui.add_space(8.0);
+                        dialog::auth_segmented(ui, &mut self.form.auth_kind);
+                        ui.add_space(10.0);
+                        if self.form.auth_kind == 0 {
+                            dialog::field_label(ui, "密码");
+                            ui.add_space(4.0);
+                            dialog::form_input(
+                                ui,
+                                egui::Id::new("conn_form_password"),
+                                &mut self.form.password,
+                                "密码",
+                                field_width,
+                                true,
+                                false,
+                            );
+                        } else {
+                            dialog::field_label(ui, "私钥文件");
+                            ui.add_space(4.0);
+                            dialog::form_input(
+                                ui,
+                                egui::Id::new("conn_form_key"),
+                                &mut self.form.key_path,
+                                "私钥文件路径",
+                                field_width,
+                                false,
+                                false,
+                            );
+                            ui.add_space(10.0);
+                            dialog::field_label(ui, "私钥口令（可选）");
+                            ui.add_space(4.0);
+                            dialog::form_input(
+                                ui,
+                                egui::Id::new("conn_form_pass"),
+                                &mut self.form.passphrase,
+                                "私钥口令（可选）",
+                                field_width,
+                                true,
+                                false,
+                            );
+                        }
+                        ui.add_space(16.0);
+                        dialog::hairline(ui);
+                        ui.add_space(12.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if ui.add(dialog::primary_button(theme, "连接")).clicked() {
+                                let port: u16 = match self.form.port.trim().parse() {
+                                    Ok(port @ 1..=65535) => port,
+                                    _ => {
+                                        port_error = true;
+                                        22
+                                    }
+                                };
+                                if port_error {
+                                    self.show_toast("端口必须是 1-65535 的数字", true);
+                                    return;
+                                }
+                                if self.form.auth_kind == 1 && self.form.key_path.trim().is_empty()
+                                {
+                                    self.show_toast("请填写私钥文件路径", true);
+                                    return;
+                                }
+                                let host = self.form.host.trim().to_string();
+                                let user = self.form.user.trim().to_string();
+                                let auth = if self.form.auth_kind == 0 {
+                                    Auth::Password(self.form.password.clone())
+                                } else {
+                                    Auth::Key {
+                                        path: PathBuf::from(self.form.key_path.trim()),
+                                        passphrase: if self.form.passphrase.is_empty() {
+                                            None
+                                        } else {
+                                            Some(self.form.passphrase.clone())
+                                        },
+                                    }
+                                };
+                                let profile = HostProfile {
+                                    name: if self.form.name.trim().is_empty() {
+                                        host.clone()
+                                    } else {
+                                        self.form.name.trim().to_string()
+                                    },
+                                    host,
+                                    port,
+                                    user,
+                                    auth,
+                                };
+                                if !profile.host.is_empty() && !profile.user.is_empty() {
+                                    to_connect = Some(profile);
+                                } else {
+                                    self.show_toast("请填写主机与用户名", true);
+                                }
+                            }
+                            if ui.add(dialog::secondary_button(theme, "取消")).clicked() {
+                                canceled = true;
+                            }
+                        });
+                    });
             });
         if let Some(profile) = to_connect {
             self.config.hosts.push(profile.clone());
@@ -2310,17 +2209,29 @@ impl MinoApp {
     /// 渲染标签页栏（Warp 风格圆角标签 + 底部指示条）。
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let theme = crate::theme::current_theme();
-        // 无边框窗口拖拽：整行注册底层 drag 背景（先注册，被后注册的控件覆盖）。
+        // 标签栏即窗口拖拽区：整行注册底层 click_and_drag 背景（先注册，
+        // 被后注册的控件覆盖）。
         // egui 命中规则：后注册 widget 在顶层，控件上点击/拖拽优先命中控件，
-        // 标签栏空白处按下拖动则命中此背景 → 发 StartDrag 让系统接管窗口移动。
+        // 标签栏空白处的操作则命中此背景：
+        // - 拖动 → 发 StartDrag 让系统接管窗口移动；
+        // - 双击 → 切换窗口 zoom（最大化/恢复，macOS 标题栏双击标准行为）。
+        // Sense 必须带 CLICK（click_and_drag）：纯 Sense::drag 在按下瞬间就
+        // 被判为 drag_started，必须等指针移动；双击是两次"按下即抬起"的点击，
+        // 指针几乎不动，纯 drag 下第二次按下仍是 drag 状态，double_clicked
+        // 永不为真（官方 custom_window_frame 示例同样用 click_and_drag）。
         let drag_rect = ui.max_rect();
         let drag_resp = ui.interact(
             drag_rect,
             egui::Id::new("tab_bar_drag"),
-            egui::Sense::drag(),
+            egui::Sense::click_and_drag(),
         );
-        if drag_resp.drag_started() {
+        if drag_resp.drag_started_by(egui::PointerButton::Primary) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if drag_resp.double_clicked() {
+            let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
         }
         ui.horizontal(|ui| {
             // macOS 原生红绿灯位于内容视图之上，不参与 egui 布局；
@@ -2643,6 +2554,8 @@ impl MinoApp {
             UpdateState::Available(info) => Some(info.clone()),
             _ => None,
         };
+        let is_installing = matches!(self.update_state, UpdateState::Installing(_));
+        let is_installed = matches!(self.update_state, UpdateState::Installed);
 
         let mut action: Option<UpdateAction> = None;
         egui::Window::new("发现新版本")
@@ -2650,161 +2563,266 @@ impl MinoApp {
             .default_width(460.0)
             .resizable(false)
             .collapsible(false)
+            .title_bar(false)
+            .frame(dialog::shell_frame(theme))
             .show(ctx, |ui| {
-                // 头部。
-                ui.horizontal(|ui| {
-                    draw_logo_mark(ui, 28.0);
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("更新 {PRODUCT_NAME}"))
-                                .strong()
-                                .size(16.0)
-                                .color(theme.text_primary),
-                        );
-                        if let Some(v) = &version {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "v{v} 已发布 · 当前 v{}",
-                                    env!("CARGO_PKG_VERSION")
-                                ))
-                                .size(11.5)
-                                .color(theme.text_secondary),
-                            );
-                        }
-                    });
-                });
-                ui.add_space(10.0);
+                // ==================== 自绘头部 ====================
+                let (header_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), dialog::HEADER_H),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    header_rect,
+                    egui::CornerRadius {
+                        nw: 14,
+                        ne: 14,
+                        sw: 0,
+                        se: 0,
+                    },
+                    theme.bg_header,
+                );
+                ui.painter().line_segment(
+                    [header_rect.left_bottom(), header_rect.right_bottom()],
+                    egui::Stroke::new(1.0, theme.border),
+                );
+                let mut header = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(header_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                header.add_space(14.0);
+                draw_logo_mark_static(&mut header, dialog::HEADER_LOGO);
+                header.add_space(10.0);
+                dialog::header_title(
+                    &mut header,
+                    "update_header_title",
+                    &format!("更新 {PRODUCT_NAME}"),
+                    "版本更新",
+                );
 
-                if let Some(e) = &error {
-                    ui.label(egui::RichText::new(e).color(theme.danger).size(12.5));
-                    ui.add_space(8.0);
-                } else if is_downloading {
-                    // 下载进度。
-                    let fraction = match total {
-                        Some(t) if t > 0 => downloaded.unwrap_or(0) as f32 / t as f32,
-                        _ => f32::NAN,
-                    };
-                    progress_bar(ui, fraction);
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(match total {
-                            Some(t) => format!(
-                                "{} / {}（{:.0}%）",
-                                fmt_bytes(downloaded.unwrap_or(0)),
-                                fmt_bytes(t),
-                                fraction * 100.0
-                            ),
-                            None => fmt_bytes(downloaded.unwrap_or(0)),
-                        })
-                        .size(11.5)
-                        .color(theme.text_secondary),
-                    );
-                    ui.add_space(8.0);
-                } else if is_downloaded {
-                    ui.horizontal(|ui| {
-                        status_dot(ui, theme.success, false);
-                        ui.label(
-                            egui::RichText::new("下载完成，重启后即可生效")
-                                .color(theme.success)
-                                .size(12.5),
-                        );
-                    });
-                    ui.add_space(8.0);
-                } else if matches!(self.update_state, UpdateState::Installing(_)) {
-                    loading_hint(ui, "正在挂载并安装，请稍候…");
-                    ui.add_space(8.0);
-                } else if matches!(self.update_state, UpdateState::Installed) {
-                    ui.horizontal(|ui| {
-                        status_dot(ui, theme.success, false);
-                        ui.label(
-                            egui::RichText::new("安装准备完成，应用即将退出并重启")
-                                .color(theme.success)
-                                .size(12.5),
-                        );
-                    });
-                    ui.add_space(8.0);
-                } else if let Some(notes) = &notes {
-                    if !notes.is_empty() {
-                        egui::ScrollArea::vertical()
-                            .id_salt("update_notes")
-                            .max_height(170.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                // release 说明逐行渲染：空行留段落间距，普通行紧凑排列。
-                                let mut first = true;
-                                let mut blank = false;
-                                for line in notes.lines() {
-                                    let text = line.trim();
-                                    if text.is_empty() {
-                                        blank = true;
-                                        continue;
-                                    }
-                                    if !first {
-                                        ui.add_space(if blank { 8.0 } else { 2.0 });
-                                    }
-                                    first = false;
-                                    blank = false;
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(18, 14))
+                    .show(ui, |ui| {
+                        ui.set_min_width(424.0);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+
+                        if let Some(e) = &error {
+                            dialog::inset_frame(theme).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    status_dot(ui, theme.danger, false);
+                                    ui.add_space(4.0);
                                     ui.label(
-                                        egui::RichText::new(text)
-                                            .size(12.5)
-                                            .color(theme.text_secondary),
+                                        egui::RichText::new(e).size(12.5).color(theme.text_primary),
                                     );
-                                }
-                            });
-                        ui.add_space(8.0);
-                    }
-                }
-
-                ui.separator();
-                ui.add_space(6.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let primary = |label: &str| {
-                        egui::Button::new(
-                            egui::RichText::new(label)
-                                .color(crate::theme::tokens::ACCENT_FG)
-                                .size(13.0),
-                        )
-                        .fill(theme.accent)
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(crate::theme::tokens::RADIUS_SM)
-                    };
-                    if is_downloaded {
-                        if let Some(dmg) = &dmg_path {
-                            if ui.add(primary("安装并重启")).clicked() {
-                                action = Some(UpdateAction::Install {
-                                    dmg_path: dmg.clone(),
                                 });
+                            });
+                            ui.add_space(12.0);
+                        } else if is_downloading {
+                            // ==================== 下载进度 ====================
+                            let fraction = match total {
+                                Some(t) if t > 0 => downloaded.unwrap_or(0) as f32 / t as f32,
+                                _ => f32::NAN,
+                            };
+                            let percent = if fraction.is_finite() {
+                                format!("{:.0}%", fraction.clamp(0.0, 1.0) * 100.0)
+                            } else {
+                                String::new()
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("正在下载安装包")
+                                        .strong()
+                                        .size(12.5)
+                                        .color(theme.text_primary),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(&percent)
+                                                .monospace()
+                                                .size(12.0)
+                                                .color(theme.accent),
+                                        );
+                                    },
+                                );
+                            });
+                            ui.add_space(8.0);
+                            progress_bar(ui, fraction);
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(match total {
+                                    Some(t) => format!(
+                                        "{} / {}",
+                                        fmt_bytes(downloaded.unwrap_or(0)),
+                                        fmt_bytes(t)
+                                    ),
+                                    None => fmt_bytes(downloaded.unwrap_or(0)),
+                                })
+                                .monospace()
+                                .size(11.0)
+                                .color(theme.text_muted),
+                            );
+                            ui.add_space(12.0);
+                        } else if is_downloaded {
+                            ui.horizontal(|ui| {
+                                status_dot(ui, theme.success, false);
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("下载完成，重启后即可生效")
+                                        .strong()
+                                        .size(12.5)
+                                        .color(theme.text_primary),
+                                );
+                            });
+                            ui.add_space(12.0);
+                        } else if is_installing {
+                            ui.horizontal(|ui| {
+                                loading_hint(ui, "正在挂载并安装，请稍候…");
+                            });
+                            ui.add_space(12.0);
+                        } else if is_installed {
+                            ui.horizontal(|ui| {
+                                status_dot(ui, theme.success, false);
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("安装准备完成，应用即将退出并重启")
+                                        .strong()
+                                        .size(12.5)
+                                        .color(theme.text_primary),
+                                );
+                            });
+                            ui.add_space(12.0);
+                        } else if let Some(notes) = &notes {
+                            if !notes.is_empty() {
+                                // 版本徽标行：新版本 + 当前版本并排，用户一眼看清跨度。
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    if let Some(v) = &version {
+                                        let (pill, _) = ui.allocate_exact_size(
+                                            egui::vec2(64.0, 22.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(pill, 11.0, theme.accent_soft);
+                                        ui.painter().rect_stroke(
+                                            pill,
+                                            11.0,
+                                            egui::Stroke::new(
+                                                1.0,
+                                                theme.accent.gamma_multiply(0.55),
+                                            ),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        let mut badge = ui.new_child(
+                                            egui::UiBuilder::new().max_rect(pill).layout(
+                                                egui::Layout::centered_and_justified(
+                                                    egui::Direction::LeftToRight,
+                                                ),
+                                            ),
+                                        );
+                                        badge.label(
+                                            egui::RichText::new(format!("v{v}"))
+                                                .strong()
+                                                .size(11.0)
+                                                .color(theme.accent),
+                                        );
+                                        ui.add_space(2.0);
+                                        ui.label(
+                                            egui::RichText::new("→")
+                                                .size(11.0)
+                                                .color(theme.text_muted),
+                                        );
+                                        ui.add_space(2.0);
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "当前 v{}",
+                                            env!("CARGO_PKG_VERSION")
+                                        ))
+                                        .size(11.0)
+                                        .color(theme.text_muted),
+                                    );
+                                });
+                                ui.add_space(10.0);
+                                dialog::inset_frame(theme).show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("update_notes")
+                                        .max_height(150.0)
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            // release 说明逐行渲染：空行留段落间距，普通行紧凑排列。
+                                            let mut first = true;
+                                            let mut blank = false;
+                                            for line in notes.lines() {
+                                                let text = line.trim();
+                                                if text.is_empty() {
+                                                    blank = true;
+                                                    continue;
+                                                }
+                                                if !first {
+                                                    ui.add_space(if blank { 8.0 } else { 2.0 });
+                                                }
+                                                first = false;
+                                                blank = false;
+                                                ui.label(
+                                                    egui::RichText::new(text)
+                                                        .size(12.5)
+                                                        .color(theme.text_secondary),
+                                                );
+                                            }
+                                        });
+                                });
+                                ui.add_space(12.0);
                             }
                         }
-                        if ui.button("取消").clicked() {
-                            action = Some(UpdateAction::Dismiss);
-                        }
-                    } else if is_downloading {
-                        if ui.button("取消").clicked() {
-                            action = Some(UpdateAction::CancelDownload);
-                        }
-                    } else if error.is_some() {
-                        if ui.add(primary("重试")).clicked() {
-                            action = Some(UpdateAction::Retry);
-                        }
-                        if ui.button("关闭").clicked() {
-                            action = Some(UpdateAction::Dismiss);
-                        }
-                    } else if let Some(info) = &available_info {
-                        if ui.add(primary("下载并安装")).clicked() {
-                            action = Some(UpdateAction::StartDownload(info.clone()));
-                        }
-                        if ui.button("稍后").clicked() {
-                            action = Some(UpdateAction::Dismiss);
-                        }
-                        if let Some(url) = &url {
-                            if ui.hyperlink_to("查看完整更新说明", url).clicked() {
-                                action = Some(UpdateAction::Dismiss);
+
+                        dialog::hairline(ui);
+                        ui.add_space(12.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if is_downloaded {
+                                if let Some(dmg) = &dmg_path {
+                                    if ui
+                                        .add(dialog::primary_button(theme, "安装并重启"))
+                                        .clicked()
+                                    {
+                                        action = Some(UpdateAction::Install {
+                                            dmg_path: dmg.clone(),
+                                        });
+                                    }
+                                }
+                                if ui.add(dialog::secondary_button(theme, "取消")).clicked() {
+                                    action = Some(UpdateAction::Dismiss);
+                                }
+                            } else if is_downloading {
+                                if ui.add(dialog::secondary_button(theme, "取消")).clicked() {
+                                    action = Some(UpdateAction::CancelDownload);
+                                }
+                            } else if error.is_some() {
+                                if ui.add(dialog::primary_button(theme, "重试")).clicked() {
+                                    action = Some(UpdateAction::Retry);
+                                }
+                                if ui.add(dialog::secondary_button(theme, "关闭")).clicked() {
+                                    action = Some(UpdateAction::Dismiss);
+                                }
+                            } else if let Some(info) = &available_info {
+                                if ui
+                                    .add(dialog::primary_button(theme, "下载并安装"))
+                                    .clicked()
+                                {
+                                    action = Some(UpdateAction::StartDownload(info.clone()));
+                                }
+                                if ui.add(dialog::secondary_button(theme, "稍后")).clicked() {
+                                    action = Some(UpdateAction::Dismiss);
+                                }
+                                if let Some(url) = &url {
+                                    if ui.hyperlink_to("查看完整更新说明", url).clicked() {
+                                        action = Some(UpdateAction::Dismiss);
+                                    }
+                                }
                             }
-                        }
-                    }
-                });
+                        });
+                    });
             });
 
         match action {
@@ -3012,44 +3030,6 @@ pub(crate) fn test_config_path(tag: &str) -> PathBuf {
     ))
 }
 
-/// 新建连接对话框的输入框统一样式：圆角深色底、垂直居中、焦点 accent 边框。
-///
-/// TextEdit 默认 `Align2::LEFT_TOP`（单行输入框文字偏上），这里改为垂直居中；
-/// 焦点时边框切换 accent 色高亮。
-///
-/// **egui 0.36 坑：提供自定义 frame 时 `.margin()` 被整体丢弃**
-/// （`frame.unwrap_or_else(|| Frame::new().inner_margin(margin))`），
-/// 而 `Frame::new()` 默认 `inner_margin` 为 ZERO——内边距必须挂在自定义 frame 上。
-fn form_input(
-    ui: &mut egui::Ui,
-    id: egui::Id,
-    value: &mut String,
-    hint: &str,
-    width: f32,
-    password: bool,
-) -> egui::Response {
-    let theme = crate::theme::current_theme();
-    let focused = ui.memory(|m| m.has_focus(id));
-    let frame = egui::Frame::new()
-        .fill(theme.bg_elevated)
-        .stroke(egui::Stroke::new(
-            if focused { 1.5 } else { 1.0 },
-            if focused { theme.accent } else { theme.border },
-        ))
-        .corner_radius(crate::theme::tokens::RADIUS_SM)
-        .inner_margin(egui::Margin::symmetric(10, 5));
-    let mut edit = egui::TextEdit::singleline(value)
-        .id(id)
-        .hint_text(hint)
-        .vertical_align(egui::Align::Center)
-        .frame(frame)
-        .text_color(theme.text_primary);
-    if password {
-        edit = edit.password(true);
-    }
-    ui.add_sized([width, 30.0], edit)
-}
-
 /// 设置窗口标题区的静态品牌标记，不响应悬浮视觉效果。
 fn draw_logo_mark_static(ui: &mut egui::Ui, size: f32) -> egui::Rect {
     draw_logo_mark_impl(ui, size, false)
@@ -3155,12 +3135,19 @@ fn loading_hint(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-/// 自定义渐变进度条（未知总量时显示流动光带）。
+/// 自定义进度条：6px 细轨道 + accent 渐变填充（未知总量时显示流动光带）。
 fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
     let theme = crate::theme::current_theme();
     let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 4.0, theme.bg_panel);
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 3.0, theme.bg_panel.gamma_multiply(0.85));
+    ui.painter().rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0, theme.border.gamma_multiply(0.6)),
+        egui::StrokeKind::Inside,
+    );
     let fill_w = if fraction.is_finite() {
         rect.width() * fraction.clamp(0.0, 1.0)
     } else {
@@ -4032,8 +4019,8 @@ mod app_tests {
             "名称字段缺失"
         );
         assert!(
-            harness.query_all_by_label("端口").next().is_some(),
-            "端口字段缺失"
+            harness.query_all_by_label("主机").next().is_some(),
+            "主机字段缺失"
         );
         assert!(
             harness.query_all_by_label("用户名").next().is_some(),
@@ -4633,6 +4620,59 @@ mod tab_tests {
         );
     }
 
+    /// 向标签栏空白点发送一次"移动→按下→抬起"点击序列，每步后累积检查视口命令。
+    /// kittest 说明：`harness.output()` 只保留最后一帧的命令（每帧覆盖），
+    /// 且默认 step_dt=0.25s 会让两次点击间隔 0.75s、永远形不成双击
+    /// （阈值 0.3s）——调用方须用 `with_step_dt(1/60)` 构造 Harness。
+    fn click_titlebar_gap(
+        harness: &mut egui_kittest::Harness<MinoApp>,
+        pos: egui::Pos2,
+        saw: &mut impl FnMut(&egui::ViewportCommand),
+    ) {
+        harness.event(egui::Event::PointerMoved(pos));
+        harness.step();
+        collect_viewport_cmds(harness, saw);
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        collect_viewport_cmds(harness, saw);
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        collect_viewport_cmds(harness, saw);
+    }
+
+    /// 收集最后一帧根视口的全部命令（逐帧调用做累积断言）。
+    fn collect_viewport_cmds(
+        harness: &egui_kittest::Harness<MinoApp>,
+        saw: &mut impl FnMut(&egui::ViewportCommand),
+    ) {
+        if let Some(vp) = harness
+            .output()
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+        {
+            for cmd in &vp.commands {
+                saw(cmd);
+            }
+        }
+    }
+
+    /// 标签栏中部空白点（"＋"按钮右侧 60px，命中 `tab_bar_drag` 背景）。
+    fn titlebar_gap_pos(harness: &mut egui_kittest::Harness<MinoApp>) -> egui::Pos2 {
+        use kittest::Queryable as _;
+        let plus = harness.get_by_label("＋");
+        egui::pos2(plus.rect().right() + 60.0, plus.rect().center().y)
+    }
+
     /// 本地会话默认工作目录为 home（Finder 启动 cwd=/ 时终端应落在 ~）。
     #[test]
     fn 本地会话默认home目录() {
@@ -4649,12 +4689,84 @@ mod tab_tests {
             "本地会话必须注入 TERM=xterm-256color（避免继承 TERM=dumb）"
         );
     }
+
+    /// 标题栏拖拽区双击应切换 zoom（回归：曾用 Sense::drag，双击永不触发）。
+    ///
+    /// 在标签栏空白处连击两次，断言根视口输出出现 `Maximized(true)`。
+    /// `ViewportInfo::maximized` 在 eframe 注释里写明 macOS 运行时读取会
+    /// 死锁、测试桩里恒为 None——取反后必为 `Maximized(true)`，不断言
+    /// false 分支（恢复逻辑与标准行为一致，由同一行代码覆盖）。
+    #[test]
+    fn 标题栏空白处双击切换zoom() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(1.0 / 60.0)
+            .build_eframe(|cc| MinoApp::new(cc));
+        harness.run_steps(6);
+        let dbl_pos = titlebar_gap_pos(&mut harness);
+        let mut saw_maximized = false;
+        for _ in 0..2 {
+            click_titlebar_gap(&mut harness, dbl_pos, &mut |cmd| {
+                if matches!(cmd, egui::ViewportCommand::Maximized(true)) {
+                    saw_maximized = true;
+                }
+            });
+        }
+        assert!(
+            saw_maximized,
+            "标签栏空白处双击应发出 Maximized(true)，点击点={dbl_pos:?}"
+        );
+    }
+
+    /// 标题栏拖动仍应移动窗口（双击修复不能破坏 StartDrag）。
+    ///
+    /// 同一位置按下后移动指针（超过点击距离）再抬起：拖动过程中应发出
+    /// StartDrag、且全程不发出 Maximized。
+    #[test]
+    fn 标题栏拖动仍移动窗口() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(1.0 / 60.0)
+            .build_eframe(|cc| MinoApp::new(cc));
+        harness.run_steps(6);
+        let start = titlebar_gap_pos(&mut harness);
+        let mut saw_drag = false;
+        let mut saw_maximized = false;
+        let mut collect = |cmd: &egui::ViewportCommand| match cmd {
+            egui::ViewportCommand::StartDrag => saw_drag = true,
+            egui::ViewportCommand::Maximized(_) => saw_maximized = true,
+            _ => {}
+        };
+        harness.event(egui::Event::PointerMoved(start));
+        harness.step();
+        collect_viewport_cmds(&harness, &mut collect);
+        harness.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        collect_viewport_cmds(&harness, &mut collect);
+        // 按住拖出一段距离（远超 max_click_dist=6）：进入 drag 状态。
+        let dragged = egui::pos2(start.x + 40.0, start.y + 30.0);
+        harness.event(egui::Event::PointerMoved(dragged));
+        harness.step();
+        collect_viewport_cmds(&harness, &mut collect);
+        harness.event(egui::Event::PointerButton {
+            pos: dragged,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        collect_viewport_cmds(&harness, &mut collect);
+
+        assert!(saw_drag, "拖动标签栏空白处应发出 StartDrag");
+        assert!(!saw_maximized, "单纯拖动不应触发 zoom");
+    }
 }
 
 #[cfg(test)]
 mod dblclick_probe {
-    use eframe::egui;
-
     /// 最小复现：kittest 两次 click 是否触发 double_clicked。
     #[test]
     fn 双击检测探针() {
@@ -4682,49 +4794,6 @@ mod dblclick_probe {
         assert!(
             harness.root().query_all_by_label("双击了").next().is_some(),
             "双击未触发"
-        );
-    }
-
-    /// 方案 G：显式 ui.interact(rect, id) 的单击/双击。
-    #[test]
-    fn 显式interact探针() {
-        use kittest::Queryable;
-
-        let mut harness = egui_kittest::Harness::builder()
-            .with_step_dt(1.0 / 60.0)
-            .build_ui(|ui| {
-                let inner = ui.scope_builder(egui::UiBuilder::new().id_salt("row"), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("行内标签");
-                        let _ = ui.button("其他");
-                    });
-                });
-                let row = ui.interact(
-                    inner.response.rect,
-                    egui::Id::new("row"),
-                    egui::Sense::click(),
-                );
-                if row.clicked() {
-                    ui.label("单击了");
-                }
-                if row.double_clicked() {
-                    ui.label("双击了");
-                }
-            });
-        harness.step();
-        {
-            let b = harness.get_by_label("行内标签");
-            b.click();
-        }
-        harness.step();
-        {
-            let b = harness.get_by_label("行内标签");
-            b.click();
-        }
-        harness.step();
-        assert!(
-            harness.root().query_all_by_label("双击了").next().is_some(),
-            "显式 interact 双击未触发"
         );
     }
 }
@@ -5163,7 +5232,8 @@ mod settings_tests {
         std::fs::remove_file(&config_path).ok();
     }
 
-    /// 回归：主机卡片的身份列和认证标签列不应受名称长度影响而漂移。
+    /// 回归：主机行的身份列和认证列不应受名称长度影响而漂移。
+    /// 认证列右对齐固定槽位，故断言右缘对齐（而非左缘）。
     #[test]
     fn 设置主机卡片列对齐() {
         use kittest::Queryable;
@@ -5215,7 +5285,7 @@ mod settings_tests {
         assert!((short_name.left() - long_name.left()).abs() < 1.0);
         assert!((short_name.left() - short_addr.left()).abs() < 1.0);
         assert!((long_name.left() - long_addr.left()).abs() < 1.0);
-        assert!((password.left() - key.left()).abs() < 1.0);
+        assert!((password.right() - key.right()).abs() < 1.0);
 
         std::fs::remove_file(&config_path).ok();
     }

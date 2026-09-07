@@ -947,7 +947,7 @@ impl TerminalView {
                         let Some(direction) = mouse_wheel_direction(delta.y) else {
                             continue;
                         };
-                        let steps = mouse_wheel_steps(*unit, delta.y, cell_height, self.rows);
+                        let steps = mouse_wheel_steps(*unit, delta.y);
                         if steps == 0 {
                             continue;
                         }
@@ -1244,26 +1244,24 @@ fn mouse_wheel_direction(delta_y: f32) -> Option<MouseWheelDirection> {
 }
 
 /// 一次 egui 滚轮事件应转换成多少个离散 xterm 滚轮按键。
-fn mouse_wheel_steps(
-    unit: egui::MouseWheelUnit,
-    delta_y: f32,
-    cell_height: f32,
-    rows: u16,
-) -> usize {
+///
+/// 滚轮是“意图”而非距离：一次滚轮手势应只上报少量按键（如 1)，而不是按
+/// 滚动像素距离折算成多次。按像素折算会让 macOS 触控板的 Point 事件
+/// （单帧几十像素）一次上报十几次，Vim 里直接翻过几屏、定位不到想看的行。
+fn mouse_wheel_steps(unit: egui::MouseWheelUnit, delta_y: f32) -> usize {
     let magnitude = delta_y.abs();
     if !magnitude.is_finite() || magnitude == 0.0 {
         return 0;
     }
 
-    let max_steps = usize::from(rows).max(1);
-    let steps = match unit {
-        // Point 事件可能小于一个 cell；xterm 滚轮是离散按钮，至少发一次，
-        // 避免触控板的小增量被全部截断。
-        egui::MouseWheelUnit::Point => (magnitude / (cell_height.max(1.0) * 3.0)).ceil(),
-        egui::MouseWheelUnit::Line => magnitude.ceil(),
-        egui::MouseWheelUnit::Page => max_steps as f32,
-    };
-    steps.max(1.0).min(max_steps as f32) as usize
+    match unit {
+        // 离散滚轮刻度：直接按刻度数上报（通常为 1）。
+        egui::MouseWheelUnit::Line => magnitude.ceil().clamp(1.0, 3.0) as usize,
+        // 触控板/高精度滚轮：一律视为一次手势、只发 1 次，避免惯性滚动刷屏。
+        egui::MouseWheelUnit::Point => 1,
+        // 整页滚动：只发 1 次，由应用自己决定翻多少。
+        egui::MouseWheelUnit::Page => 1,
+    }
 }
 
 /// 屏幕坐标 → 当前终端视口 cell 坐标（从零开始）。
@@ -2383,18 +2381,14 @@ mod mouse_wheel_tests {
 
     #[test]
     fn 小幅point滚轮不会被截断() {
-        assert_eq!(
-            mouse_wheel_steps(egui::MouseWheelUnit::Point, 0.25, 16.0, 24),
-            1
-        );
-        assert_eq!(
-            mouse_wheel_steps(egui::MouseWheelUnit::Line, -3.0, 16.0, 24),
-            3
-        );
-        assert_eq!(
-            mouse_wheel_steps(egui::MouseWheelUnit::Page, 1.0, 16.0, 24),
-            24
-        );
+        // 滚轮是“意图”而非距离：任何有效的滚轮事件都只发一次，由 Vim 自己
+        // 决定滚动行数；大 delta 不再按像素折算成多次，避免一次手势翻过几屏。
+        assert_eq!(mouse_wheel_steps(egui::MouseWheelUnit::Point, 0.25), 1);
+        assert_eq!(mouse_wheel_steps(egui::MouseWheelUnit::Point, 80.0), 1);
+        assert_eq!(mouse_wheel_steps(egui::MouseWheelUnit::Line, -3.0), 3);
+        assert_eq!(mouse_wheel_steps(egui::MouseWheelUnit::Line, -30.0), 3);
+        assert_eq!(mouse_wheel_steps(egui::MouseWheelUnit::Page, 1.0), 1);
+        assert_eq!(mouse_wheel_steps(egui::MouseWheelUnit::Point, 0.0), 0);
     }
 }
 

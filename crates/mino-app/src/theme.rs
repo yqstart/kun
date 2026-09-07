@@ -272,6 +272,19 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
     style.spacing.button_padding = egui::vec2(11.0, 5.0);
     style.spacing.interact_size = egui::vec2(30.0, 26.0);
 
+    // 全局滚动条：细窄浮动、不占布局宽度，平时半透明、hover 加深。
+    // 设置弹窗这类窄内容区不再被一条 10px 常驻轨道挤压。
+    style.spacing.scroll = egui::style::ScrollStyle {
+        floating: true,
+        bar_width: 8.0,
+        floating_width: 3.0,
+        floating_allocated_width: 0.0,
+        foreground_color: false,
+        dormant_background_opacity: 0.0,
+        active_background_opacity: 0.25,
+        ..Default::default()
+    };
+
     visuals.window_corner_radius = CornerRadius::same(14);
     visuals.window_shadow = egui::Shadow {
         offset: [0, 6],
