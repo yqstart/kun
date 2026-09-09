@@ -1766,11 +1766,14 @@ impl MinoApp {
                 egui::vec2(ui.available_width(), ROW_H),
                 egui::Sense::hover(),
             );
-            let row_response = ui
-                .interact(row_rect, row_id, egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-
-            let hover = row_response.hovered();
+            // 行背景在内容之前绘制；点击区域延后到内容之后注册，避免内部
+            // 名称/地址控件抢走整行点击，删除按钮随后再覆盖行点击区。
+            let hover = ui.input(|input| {
+                input
+                    .pointer
+                    .hover_pos()
+                    .is_some_and(|pointer| row_rect.contains(pointer))
+            });
             let selected = self.selected_host == Some(i);
             // 平时无线无底；选中 accent 软底，hover 白 6% 提亮。
             if selected {
@@ -1877,6 +1880,10 @@ impl MinoApp {
                     .size(9.0)
                     .color(theme.text_muted),
             );
+
+            let row_response = ui
+                .interact(row_rect, row_id, egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
 
             // 删除按钮最后注册，覆盖整行点击区，避免点击删除时先触发连接。
             let del_rect = egui::Rect::from_min_size(
@@ -4149,12 +4156,9 @@ mod connect_tests {
             for _ in 0..5 {
                 harness.step();
             }
-            if harness
-                .root()
-                .query_all_by_label("SFTP · 链路测试")
-                .next()
-                .is_some()
-            {
+            // SFTP 面板默认收起，连接成功后先出现终端右上角浮动按钮；
+            // 展开后再断言面板标题。
+            if harness.root().query_all_by_label("SFTP").next().is_some() {
                 connected = true;
                 break;
             }
@@ -4162,7 +4166,10 @@ mod connect_tests {
         }
         std::fs::remove_file(&config_path).ok();
 
-        assert!(connected, "点击连接后未出现 SFTP 面板（连接失败或崩溃）");
+        assert!(
+            connected,
+            "点击连接后未出现 SFTP 浮动按钮（连接失败或崩溃）"
+        );
         // 连接成功后设置弹窗应自动关闭（回归：曾保持打开遮住终端）。
         assert!(
             !harness.state().show_settings,
@@ -4350,12 +4357,8 @@ mod snapshot_tests {
                 for _ in 0..5 {
                     harness.step();
                 }
-                if harness
-                    .root()
-                    .query_all_by_label("SFTP · 链路测试")
-                    .next()
-                    .is_some()
-                {
+                // SFTP 面板默认收起，以浮动开关作为连接成功信号。
+                if harness.root().query_all_by_label("SFTP").next().is_some() {
                     connected = true;
                     break;
                 }
