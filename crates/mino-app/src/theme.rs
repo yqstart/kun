@@ -208,6 +208,16 @@ pub fn current_theme() -> &'static Theme {
     &THEMES[CURRENT_THEME.load(Ordering::Relaxed)]
 }
 
+/// 当前主题下标（持久化用；与 `current_theme()` 对应）。
+pub fn current_theme_index() -> usize {
+    CURRENT_THEME.load(Ordering::Relaxed)
+}
+
+/// 按名称查找主题下标（配置持久化用；未知名称返回 `None`）。
+pub fn theme_index_by_name(name: &str) -> Option<usize> {
+    THEMES.iter().position(|t| t.name == name)
+}
+
 /// 当前主题修订号；主题改变时递增，供终端等缓存消费者失效。
 pub fn theme_revision() -> u64 {
     THEME_REVISION.load(Ordering::Acquire)

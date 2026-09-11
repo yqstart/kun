@@ -166,6 +166,24 @@ pub struct TerminalView {
     selecting: bool,
     /// 复制后的短暂反馈 chip 到期时间。
     copy_flash_until: Option<f64>,
+    /// 当前 IME 预编辑文本（拼音/注音组字中、尚未上屏的组合串）。
+    ///
+    /// 真机链路：egui 每帧把本视图输出的 `PlatformOutput::ime` 转成
+    /// `winit::Window::set_ime_allowed(true)` 后，输入法才会激活；
+    /// 用户组字（拼音→候选）期间 OS 只发 `ImeEvent::Preedit`（不产生
+    /// `Key`/`Text`），选词上屏时才发一次 `ImeEvent::Commit`。
+    /// 该串不写入 PTY、只做内联渲染（光标处下划线）；`Commit` 到达后
+    /// 才真正写入终端。无预编辑时为 `None`。
+    ime_preedit: Option<ImePreedit>,
+}
+
+/// 内联 IME 预编辑状态（终端光标处的组字串）。
+#[derive(Clone, Debug, Default)]
+struct ImePreedit {
+    /// 组字串全文（`Preedit(text)` 最新一次的值）。
+    text: String,
+    /// 输入法给出的活跃区间（字符下标；绘制时加粗/高亮该区间）。
+    active_range: Option<std::ops::Range<usize>>,
 }
 
 impl TerminalView {
@@ -214,6 +232,7 @@ impl TerminalView {
             selection: None,
             selecting: false,
             copy_flash_until: None,
+            ime_preedit: None,
         }
     }
 
@@ -652,6 +671,8 @@ impl TerminalView {
                 CursorShape::Hidden => {}
             }
         }
+        // IME 预编辑串内联渲染（光标处、下划线标出组字中文本）。
+        self.paint_ime_preedit(ui, inner, cursor_rect);
         // 绘制耗时（背景 rect + 文本 galley + 光标形状）。
         self.last_paint_ms = paint_start.elapsed().as_secs_f32() * 1000.0;
 
@@ -745,9 +766,115 @@ impl TerminalView {
         if response.drag_stopped() {
             self.selecting = false;
         }
+        // 向后端声明 IME 意图：终端聚焦（且前台无弹窗抢夺输入）时允许输入法；
+        // 否则禁用，避免中文输入法候选窗跟随一个不接受中文的视图。
+        // 声明必须每帧执行——egui-winit 只在 `PlatformOutput::ime` 为 Some
+        // 时才调 `Window::set_ime_allowed(true)`，缺了这一帧输入法就起不来。
+        self.update_ime_output_with_input(ui, inner, cursor_rect, input_enabled);
         if input_enabled && ui.memory(|m| m.has_focus(self.focus_id)) {
             self.handle_input(ui, inner, output_rows);
         }
+    }
+
+    /// 每帧向 egui 后端声明本终端的 IME 意图（允许/跟随光标/中断组合）。
+    ///
+    /// 声明条件：前台输入可用（无设置弹窗等）且终端持有键盘焦点。
+    /// 条件不满足时不写 `output.ime`——egui-winit 收到 `None` 即
+    /// `set_ime_allowed(false)`，候选窗自动收起，无需手动中断。
+    /// 仅测试走 `update_ime_output_with_input` 传参；正式渲染恒为前台可用。
+    #[allow(dead_code)]
+    fn update_ime_output(&self, ui: &Ui, inner: Rect, cursor_rect: Option<Rect>) {
+        self.update_ime_output_with_input(ui, inner, cursor_rect, true);
+    }
+
+    /// `update_ime_output` 的可测试内核：`input_enabled` 为 false 时
+    /// （设置弹窗等前台模态打开）不声明 IME，避免输入法跟随后台终端。
+    fn update_ime_output_with_input(
+        &self,
+        ui: &Ui,
+        inner: Rect,
+        cursor_rect: Option<Rect>,
+        input_enabled: bool,
+    ) {
+        if !input_enabled || !ui.memory(|m| m.has_focus(self.focus_id)) {
+            return;
+        }
+        // 候选窗跟随：光标矩形即组字起点；滚出视口（None）时退到行首，
+        // 保证输入法窗口仍落在终端区域内、不飘到屏幕角落。
+        let cursor_rect = cursor_rect.unwrap_or_else(|| {
+            Rect::from_min_size(inner.min, Vec2::new(self.cell_width, self.cell_height))
+        });
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                // Terminal 语义：macOS 下输入法候选窗跟随光标、不接管回车
+                // 确认行为（Normal 会让部分输入法把回车当确认键吃掉）。
+                purpose: egui::IMEPurpose::Terminal,
+                rect: inner,
+                cursor_rect,
+                should_interrupt_composition: false,
+            });
+        });
+    }
+
+    /// IME 预编辑串内联渲染：光标所在 cell 起、下划线标出组字中文本。
+    ///
+    /// 只读 `self.ime_preedit`（已在 `handle_input` 里由 Preedit 事件更新），
+    /// 不触终端锁、不写缓存——组字串不进 PTY、不进回显、不污染行 hash。
+    fn paint_ime_preedit(&self, ui: &Ui, inner: Rect, cursor_rect: Option<Rect>) {
+        let Some(preedit) = self.ime_preedit.as_ref() else {
+            return;
+        };
+        if preedit.text.is_empty() {
+            return;
+        }
+        let Some(cursor) = cursor_rect else {
+            return;
+        };
+        let _ = inner;
+        let theme = crate::theme::current_theme();
+        let painter = ui.painter();
+        // 组字串底：与终端底色区分、与选中态区分的半透明 accent 底。
+        let bg = Color32::from_rgba_unmultiplied(
+            theme.accent.r(),
+            theme.accent.g(),
+            theme.accent.b(),
+            56,
+        );
+        let galley = painter.layout_no_wrap(
+            preedit.text.clone(),
+            FontId::monospace(self.font_size),
+            Color32::from_rgb(theme.term_fg.r, theme.term_fg.g, theme.term_fg.b),
+        );
+        let rect = Rect::from_min_size(cursor.min, galley.size());
+        painter.rect_filled(rect, 2.0, bg);
+        painter.galley(rect.min, galley, Color32::WHITE);
+        // 活跃区间加粗下划线（输入法标出的当前转换节）；无区间时整串下划线。
+        let underline_y = rect.bottom() - 1.0;
+        let active = preedit
+            .active_range
+            .clone()
+            .unwrap_or(0..preedit.text.chars().count());
+        let chars: Vec<char> = preedit.text.chars().collect();
+        let char_w = (rect.width() / chars.len().max(1) as f32).max(1.0);
+        let (range, stroke_w) =
+            if !preedit.text.is_empty() && (active.start != 0 || active.end != chars.len()) {
+                (active, 2.0)
+            } else {
+                (0..chars.len(), 1.0)
+            };
+        let from = range.start.min(chars.len());
+        let to = range.end.min(chars.len()).max(from);
+        if from < to {
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + from as f32 * char_w, underline_y),
+                    egui::pos2(rect.left() + to as f32 * char_w, underline_y),
+                ],
+                Stroke::new(stroke_w, theme.accent2),
+            );
+        }
+        // 组字期间持续重绘，保证候选变化/光标闪烁即时反映。
+        ui.ctx().request_repaint();
     }
 
     /// 将拖入终端区域的本地文件、目录或应用路径写入当前会话。
@@ -898,6 +1025,16 @@ impl TerminalView {
                         }
                     }
                     egui::Event::Text(text) => {
+                        // 组字中（有预编辑串）时忽略零散 Text：组字期的拼音字母
+                        // 已由 Preedit 接管显示，不应提前写入 PTY 污染命令行；
+                        // 选词上屏走 Commit 分支（见下）。无预编辑时走正常路径。
+                        if self
+                            .ime_preedit
+                            .as_ref()
+                            .is_some_and(|p| !p.text.is_empty())
+                        {
+                            continue;
+                        }
                         // 退格/删除键伴随的"空白类"文本（输入法产物）丢弃，
                         // 只影响空格/零宽等空白字符，正常输入不受影响。
                         if suppress_blank_text
@@ -918,6 +1055,62 @@ impl TerminalView {
                         }
                         session.write(text.as_bytes());
                         actions.push(InputAction::Text(text.clone()));
+                    }
+                    egui::Event::Ime(ime) => {
+                        // 中文输入法组字管线（见 `ime_preedit` 字段注释）：
+                        // Preedit 只存不写（等选词）；Commit 才写入 PTY。
+                        match ime {
+                            egui::ImeEvent::Preedit {
+                                text: preedit,
+                                active_range_chars,
+                            } => {
+                                // 空串 = 取消组字（Esc/切输入法/删光拼音）：
+                                // 丢弃未上屏串、不写 PTY、不留痕。
+                                if preedit.is_empty() {
+                                    self.ime_preedit = None;
+                                } else {
+                                    self.ime_preedit = Some(ImePreedit {
+                                        text: preedit.clone(),
+                                        active_range: active_range_chars.clone(),
+                                    });
+                                }
+                                need_repaint = true;
+                            }
+                            egui::ImeEvent::Commit(commit) => {
+                                // 组字结束：先清预编辑显示，再把上屏词写入终端。
+                                self.ime_preedit = None;
+                                if commit.is_empty() {
+                                    need_repaint = true;
+                                    continue;
+                                }
+                                session.write(commit.as_bytes());
+                                actions.push(InputAction::Text(commit.clone()));
+                                need_repaint = true;
+                            }
+                            egui::ImeEvent::DeleteSurrounding {
+                                before_chars,
+                                after_chars,
+                            } => {
+                                // 终端是 PTY 字节流、无 egui 文本缓冲可删；
+                                // 输入法要删的是它自己刚提交的环绕文本，
+                                // 转成退格/删除序列发给 shell 才是正确语义。
+                                // （不处理会让移动端 Gboard 等删不掉刚上屏的字。）
+                                let before = (*before_chars).min(64);
+                                let after = (*after_chars).min(64);
+                                for _ in 0..before {
+                                    session.write(b"\x7f");
+                                    actions.push(InputAction::Bytes(vec![0x7f]));
+                                }
+                                for _ in 0..after {
+                                    session.write(b"\x1b[3~");
+                                    actions.push(InputAction::Bytes(b"\x1b[3~".to_vec()));
+                                }
+                                need_repaint = true;
+                            }
+                            // Enabled/Disabled 在 egui 0.36 已废弃（winit 层忽略），
+                            // 无需处理。
+                            _ => {}
+                        }
                     }
                     egui::Event::Paste(text) => {
                         // 括号粘贴模式（bracketed paste）下包装转义序列。
@@ -1118,7 +1311,7 @@ impl TerminalView {
                 self.workdir.invalidate();
             }
             _ => {
-                // 可见文本（ASCII 可打印 / 空格 / 非 ASCII）。
+                // 可见文本（ASCII 可打印 / 空格 / 非 ASCII，含 IME Commit 的中文）。
                 if let Ok(s) = std::str::from_utf8(bytes) {
                     if s.chars()
                         .all(|c| c.is_ascii_graphic() || c == ' ' || !c.is_ascii())
@@ -1172,12 +1365,48 @@ impl TerminalView {
 enum InputAction {
     /// 已写入 PTY 的字节。
     Bytes(Vec<u8>),
-    /// 已写入的可见文本。
+    /// 已写入的可见文本（含 IME Commit 上屏的中文）。
     Text(String),
     /// 粘贴（工作目录跟踪器失效）。
     Paste,
     /// 复制当前终端选区。
     CopySelection,
+}
+
+/// 测试用网格文本读取。
+///
+/// 非测试构建不需要（正式代码走行级增量缓存不调它），`#[cfg(test)]` 下
+/// `dead_code` 误报用 allow 压住——它是给回归测试用的，不是无用代码。
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) fn tests_grid_text(session: &Session) -> String {
+    use alacritty_terminal::term::cell::Flags;
+    let term_arc = session.term();
+    let guard = term_arc.lock();
+    let content = guard.renderable_content();
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut prev_grid_line: i32 = i32::MIN;
+    for item in content.display_iter {
+        let cell = item.cell;
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
+            continue;
+        }
+        if item.point.line.0 != prev_grid_line {
+            if started {
+                lines.push(current.trim_end().to_string());
+            }
+            current = String::new();
+            started = true;
+            prev_grid_line = item.point.line.0;
+        }
+        current.push(cell.c);
+    }
+    if started {
+        lines.push(current.trim_end().to_string());
+    }
+    lines.join("\n")
 }
 
 // ==================== 辅助函数 ====================
@@ -3047,6 +3276,172 @@ mod ime_backspace_tests {
         assert!(
             !last_line.contains("ab "),
             "退格不应插入空格，最后一行：{last_line:?}"
+        );
+    }
+
+    /// 中文输入法组字不提前上屏：Preedit 只存不写，Commit 才写入终端。
+    ///
+    /// 回归用户报告"中文输入法状态下输入不了中文、进去的都是英文"：
+    /// 组字期的拼音字母若当普通 Text 写入 PTY，命令行会被拼音污染；
+    /// Commit 的中文若被过滤/丢弃，用户看到的就只剩英文。
+    #[test]
+    #[allow(non_snake_case)]
+    fn 中文输入法组字与上屏() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+
+        // 等 zsh 就绪。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if grid_text(view.borrow().session()).contains("mino") {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(ready, "zsh 未就绪");
+
+        // 1. 组字期：Preedit("ni") + 拼音字母的零散 Text 都不应写入终端。
+        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "ni".to_string(),
+            active_range_chars: Some(0..2),
+        }));
+        harness.event(egui::Event::Text("n".to_string()));
+        harness.event(egui::Event::Text("i".to_string()));
+        harness.run_steps(6);
+        assert_eq!(
+            view.borrow().ime_preedit.as_ref().map(|p| p.text.as_str()),
+            Some("ni"),
+            "预编辑串应暂存待渲染"
+        );
+        let text = grid_text(view.borrow().session());
+        assert!(
+            !text.lines().any(|l| l.contains("ni")),
+            "组字期拼音不应写入终端，终端内容：\n{text}"
+        );
+
+        // 2. 选词上屏：Commit("你") 必须写入终端并回显。
+        harness.event(egui::Event::Ime(egui::ImeEvent::Commit("你".to_string())));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut committed = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if grid_text(view.borrow().session()).contains("你") {
+                committed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            committed,
+            "Commit 中文应写入终端，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+        assert!(view.borrow().ime_preedit.is_none(), "上屏后预编辑串应清空");
+
+        // 3. 取消组字：空 Preedit 不写 PTY、不留痕。
+        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "hao".to_string(),
+            active_range_chars: Some(0..3),
+        }));
+        harness.run_steps(3);
+        assert!(view.borrow().ime_preedit.is_some());
+        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: String::new(),
+            active_range_chars: None,
+        }));
+        harness.run_steps(3);
+        assert!(
+            view.borrow().ime_preedit.is_none(),
+            "空 Preedit 应清空预编辑串"
+        );
+        let text = grid_text(view.borrow().session());
+        assert!(
+            !text.contains("hao"),
+            "取消的组字串不应写入终端，终端内容：\n{text}"
+        );
+    }
+
+    /// 终端聚焦时每帧声明 IME 意图（`PlatformOutput::ime`），否则真机上
+    /// `winit::Window::set_ime_allowed(true)` 永不触发、中文输入法起不来。
+    ///
+    /// 回归用户报告"输入法是中文状态但输入不了中文"的另一半根因：
+    /// 只处理 Commit 事件不够——OS 根本不会发组字事件。
+    #[test]
+    #[allow(clippy::single_range_in_vec_init, non_snake_case)]
+    fn 聚焦终端声明IME意图() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        harness.run_steps(6);
+        let ime = harness.output().platform_output.ime;
+        assert!(
+            ime.is_some(),
+            "聚焦的终端必须声明 IME 意图，否则输入法无法激活"
+        );
+        let ime = ime.expect("已断言 Some");
+        assert_eq!(
+            ime.purpose,
+            egui::IMEPurpose::Terminal,
+            "终端 IME 应用途声明 Terminal 语义"
+        );
+        assert!(
+            ime.rect.width() > 0.0 && ime.rect.height() > 0.0,
+            "IME 区域应为终端区域，实际：{:?}",
+            ime.rect
+        );
+        assert!(
+            ime.rect.contains_rect(ime.cursor_rect) || ime.cursor_rect.width() > 0.0,
+            "光标矩形应落在终端区域内，实际：{:?} / {:?}",
+            ime.rect,
+            ime.cursor_rect
+        );
+    }
+
+    /// 前台弹窗打开（`input_enabled=false`）时不声明 IME：输入法候选窗
+    /// 不应跟随一个不接受输入的后台终端。
+    #[test]
+    #[allow(non_snake_case)]
+    fn 弹窗打开时不声明IME意图() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        // show_with_input(false) 即设置弹窗打开时的渲染路径：终端仍渲染
+        // 后台输出，但不消费输入、也不声明 IME。
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show_with_input(ui, false);
+        });
+        harness.run_steps(6);
+        assert!(
+            harness.output().platform_output.ime.is_none(),
+            "后台终端不应声明 IME 意图"
         );
     }
 

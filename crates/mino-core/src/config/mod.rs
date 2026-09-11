@@ -46,7 +46,15 @@ impl Default for HostProfile {
 /// 全部主机配置。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostConfig {
+    #[serde(default)]
     pub hosts: Vec<HostProfile>,
+    /// 已选主题名称（`mino-app/src/theme.rs::THEMES[].name`）。
+    ///
+    /// 存名称而非下标：`THEMES` 顺序调整不影响已保存配置。
+    /// 老配置文件缺该字段时 `#[serde(default)]` 给空串，启动按默认主题
+    /// 处理（曾无此字段，切换皮肤退出重进永远回到第一套）。
+    #[serde(default)]
+    pub theme: String,
 }
 
 impl HostConfig {
@@ -124,6 +132,7 @@ mod tests {
 
     fn sample() -> HostConfig {
         HostConfig {
+            theme: "深蓝".into(),
             hosts: vec![HostProfile {
                 name: "测试服务器".into(),
                 host: "example.com".into(),
@@ -141,8 +150,20 @@ mod tests {
     fn 配置序列化与反序列化() {
         let config = sample();
         let toml_str = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            toml_str.contains("theme"),
+            "主题选择必须随配置落盘（曾丢失）：{toml_str}"
+        );
         let parsed: HostConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn 老配置缺主题字段时默认空串() {
+        // 升级前已存在的 hosts.toml 没有 theme 字段：不能解析失败，
+        // 启动按默认主题处理（此前无持久化，升级用户回到第一套）。
+        let parsed: HostConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed.theme, "");
     }
 
     #[cfg(unix)]

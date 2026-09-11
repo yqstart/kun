@@ -527,7 +527,6 @@ impl MinoApp {
         config_path: PathBuf,
         auto_update: bool,
     ) -> Self {
-        crate::theme::set_theme(&cc.egui_ctx, 0);
         let ctx = cc.egui_ctx.clone();
 
         // 加载失败不能静默按空配置启动：文件存在但解析失败时先备份原文，
@@ -571,6 +570,11 @@ impl MinoApp {
                 }
             }
         };
+
+        // 主题恢复：已保存的主题名 → 对应下标；未知/空则默认第一套
+        // （曾启动硬编码 set_theme(0)，切换皮肤退出重进永远回到原来的）。
+        let initial_theme = crate::theme::theme_index_by_name(config.theme.trim()).unwrap_or(0);
+        crate::theme::set_theme(&ctx, initial_theme);
 
         let mut app = Self {
             tabs: Vec::new(),
@@ -997,6 +1001,25 @@ impl MinoApp {
         }
     }
 
+    /// 切换主题并持久化到配置（退出重进保持所选皮肤）。
+    ///
+    /// 保存失败时回退到原主题并 toast 提示：内存态与落盘态必须一致，
+    /// 否则本次看着切成功了、重启又回到原来的（用户反馈的根因）。
+    fn apply_theme_and_persist(&mut self, ctx: &egui::Context, index: usize) {
+        let previous = self.config.theme.clone();
+        let name = crate::theme::THEMES[index.min(crate::theme::THEMES.len() - 1)].name;
+        crate::theme::set_theme(ctx, index);
+        self.config.theme = name.to_string();
+        if !self.save_config() {
+            // 落盘失败：内存态回滚，保持与磁盘一致。
+            self.config.theme = previous;
+            let rollback = crate::theme::theme_index_by_name(self.config.theme.trim()).unwrap_or(0);
+            crate::theme::set_theme(ctx, rollback);
+            return;
+        }
+        self.show_toast(format!("主题：{name}"), false);
+    }
+
     /// 打开一个全新的连接表单。
     ///
     /// “新建连接”始终代表新建配置，不能沿用上一次输入的主机、密码或私钥
@@ -1391,11 +1414,8 @@ impl MinoApp {
                                                         )
                                                         .clicked()
                                                     {
-                                                        crate::theme::set_theme(ui.ctx(), i);
-                                                        self.show_toast(
-                                                            format!("主题：{}", t.name),
-                                                            false,
-                                                        );
+                                                        let theme_ctx = ui.ctx().clone();
+                                                        self.apply_theme_and_persist(&theme_ctx, i);
                                                     }
                                                 }
                                             });
@@ -3291,11 +3311,7 @@ impl eframe::App for MinoApp {
             (egui::Key::Num3, 2),
         ] {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, key)) {
-                crate::theme::set_theme(&ctx, theme_idx);
-                self.show_toast(
-                    format!("主题：{}", crate::theme::current_theme().name),
-                    false,
-                );
+                self.apply_theme_and_persist(&ctx, theme_idx);
             }
         }
         for (key, idx) in [
@@ -4119,6 +4135,7 @@ mod connect_tests {
         //（曾直接覆盖并删除用户主机列表，运行一次测试丢一次配置）。
         let config_path = test_config_path("connect-e2e");
         let config = HostConfig {
+            theme: String::new(),
             hosts: vec![profile],
         };
         config.save(&config_path).expect("写入测试配置失败");
@@ -4321,6 +4338,7 @@ mod snapshot_tests {
         }
         let config_path = test_config_path("snapshot");
         let config = HostConfig {
+            theme: String::new(),
             hosts: vec![profile],
         };
         config.save(&config_path).expect("写入测试配置失败");
@@ -4439,13 +4457,23 @@ mod snapshot_tests {
 #[cfg(test)]
 mod theme_tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `CURRENT_THEME` 是进程级全局静态量：多线程并行跑测试时，
+    /// 一个测试的 `set_theme` 会污染另一个测试的 `current_theme()` 断言。
+    /// 本模块两个测试串行化，避免"单跑过、并跑随机挂"。
+    static THEME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// 三套主题切换并渲染截图（视觉验证用）。
     #[test]
     fn 三套主题渲染截图() {
         use kittest::Queryable;
 
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        let config_path = test_config_path("theme-shots");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
         harness.run_steps(6);
         // 主题下拉现在在设置弹窗里，先用 ⌘, 打开弹窗。
         harness.event(egui::Event::Key {
@@ -4479,11 +4507,53 @@ mod theme_tests {
                 theme_name,
                 "主题切换失败"
             );
+            // 切换即落盘：hosts.toml 里应记录所选主题名
+            //（回归：曾只改内存，退出重进回到原来的）。
+            let saved = HostConfig::load(&config_path).expect("主题切换后配置应可读");
+            assert_eq!(saved.theme, theme_name, "主题选择应持久化到配置");
             let img = harness.render().expect("渲染失败");
             let out = format!("/tmp/mino_theme_{theme_name}.png");
             img.save(&out).expect("保存截图失败");
             eprintln!("已保存：{out}");
         }
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// 回归：切换皮肤后重启应用，应恢复上次所选主题而非第一套。
+    #[test]
+    fn 主题切换重启后保持() {
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        let config_path = test_config_path("theme-persist");
+        HostConfig {
+            theme: String::new(),
+            hosts: Vec::new(),
+        }
+        .save(&config_path)
+        .expect("写入测试配置失败");
+
+        // 首次启动 → 切到"霓虹"（经持久化路径写回配置）。
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        let theme_ctx = harness.state().last_ctx.clone();
+        harness.state_mut().apply_theme_and_persist(&theme_ctx, 2);
+        harness.run_steps(3);
+        assert_eq!(crate::theme::current_theme().name, "霓虹");
+        drop(harness);
+
+        // 第二次启动（模拟退出重进）→ 应仍是"霓虹"。
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        assert_eq!(
+            crate::theme::current_theme().name,
+            "霓虹",
+            "重启后主题应保持上次选择，而非回到默认"
+        );
+
+        std::fs::remove_file(&config_path).ok();
     }
 }
 
@@ -5243,6 +5313,7 @@ mod settings_tests {
 
         let config_path = test_config_path("host-card-align");
         let config = HostConfig {
+            theme: String::new(),
             hosts: vec![
                 HostProfile {
                     name: "短名".into(),
@@ -5301,6 +5372,7 @@ mod settings_tests {
 
         let config_path = test_config_path("ssh-quick");
         let config = HostConfig {
+            theme: String::new(),
             hosts: vec![HostProfile {
                 name: "快捷主机".into(),
                 host: "127.0.0.1".into(),
@@ -5371,6 +5443,7 @@ mod settings_tests {
 
         let config_path = test_config_path("ssh-quick-align");
         let config = HostConfig {
+            theme: String::new(),
             hosts: vec![
                 HostProfile {
                     name: "短名".into(),

@@ -4,6 +4,17 @@ use egui::{RichText, Ui};
 use mino_core::ssh::sftp::{RemoteEntry, SftpEvent, SftpHandle};
 use tokio::sync::mpsc::Receiver;
 
+/// 传输聚合状态（标题行徽标用）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TransferState {
+    /// 有进行中的传输（数量为未结束项数）。
+    Uploading { active: usize },
+    /// 无进行中，但有失败项（数量为失败项数）。
+    Failed { failed: usize },
+    /// 全部完成。
+    Done,
+}
+
 /// 传输任务（进度条显示）。
 #[derive(Clone)]
 struct Transfer {
@@ -87,6 +98,9 @@ pub struct SftpView {
     loading: bool,
     /// 传输任务。
     transfers: Vec<Transfer>,
+    /// 传输详情是否展开。点击标题行徽标切换；新传输开始时自动展开、
+    /// 全部结束后保持上一次展开态（用户可手动收起看结果角标）。
+    transfers_expanded: bool,
     /// 确认对话框。
     dialog: Option<ConfirmDialog>,
     /// 行内错误。
@@ -132,6 +146,7 @@ impl SftpView {
             selection_anchor: None,
             loading: true,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -276,7 +291,10 @@ impl SftpView {
         self.selection_anchor = Some("..".to_string());
     }
 
-    /// 记录一项传输，先于后台事件进入队列，保证上传区域立即出现。
+    /// 记录一项传输，先于后台事件进入队列，保证上传徽标立即出现。
+    ///
+    /// 新传输恒展开详情：用户点「上传」后默认能看到进度条；手动收起
+    /// 只在点击徽标后发生且不受后续进度事件影响。
     fn begin_transfer(&mut self, id: u64, label: String, total: u64) {
         self.transfers.push(Transfer {
             id,
@@ -286,6 +304,27 @@ impl SftpView {
             finished: false,
             failed: false,
         });
+        self.transfers_expanded = true;
+    }
+
+    /// 当前聚合传输状态（无传输时 `None`，标题行不画徽标）。
+    fn transfer_state(&self) -> Option<TransferState> {
+        if self.transfers.is_empty() {
+            return None;
+        }
+        let active = self
+            .transfers
+            .iter()
+            .filter(|transfer| !transfer.finished && !transfer.failed)
+            .count();
+        if active > 0 {
+            return Some(TransferState::Uploading { active });
+        }
+        let failed = self.transfers.iter().filter(|t| t.failed).count();
+        if failed > 0 {
+            return Some(TransferState::Failed { failed });
+        }
+        Some(TransferState::Done)
     }
 
     /// 处理后台事件。返回本帧是否收到新事件（调用方据此请求重绘——
@@ -329,6 +368,9 @@ impl SftpView {
                             finished: false,
                             failed: false,
                         });
+                        // 后台事件到达的新传输同样默认展开（用户正在看文件
+                        // 列表也应看到进度出现；手动收起不受影响）。
+                        self.transfers_expanded = true;
                     }
                 }
                 SftpEvent::Done {
@@ -353,6 +395,7 @@ impl SftpView {
                                 finished: true,
                                 failed: false,
                             });
+                            self.transfers_expanded = true;
                         }
                     }
                     // 只有远程目录内容发生变化的操作才刷新列表；下载只写本地，
@@ -387,6 +430,7 @@ impl SftpView {
                                 finished: false,
                                 failed: true,
                             });
+                            self.transfers_expanded = true;
                         }
                     }
                     // 传输失败即使发生在旧目录，也必须结束对应进度条；
@@ -859,13 +903,25 @@ impl SftpView {
             None
         };
 
-        // ==================== 标题行：状态点 + 主机名 ====================
+        // ==================== 标题行：状态点 + 主机名 + 传输徽标 ====================
+        // 上传进度平时只是一个徽标：标题行右缘的 26×26 方形图标按钮，
+        // 有传输（进行中/已完成/失败）才出现；点击切换下方详情展开/收起。
+        // 徽标形态按聚合状态区分：
+        // - 进行中：主题进行色（accent2）圆底 + 白色向上箭头 + 进度弧环；
+        // - 全部完成：success 色圆底 + 白色对勾；
+        // - 有失败：danger 色圆底 + 白色感叹号。
+        // 无障碍：纯图标按钮需显式 widget_info 覆盖 label（Button 的
+        // WidgetInfo 取自文字 atoms，空文字会生成无 label 的 Button 节点，
+        // kittest 按 label 找不到；齿轮按钮同理但按最右 Button 查找）。
+        let transfer_state = self.transfer_state();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
             ui.painter().circle_filled(dot.center(), 3.2, theme.accent2);
+            let title_avail =
+                (ui.available_width() - transfer_state.map_or(0.0, |_| 26.0 + 6.0)).max(0.0);
             ui.add_sized(
-                [ui.available_width().max(0.0), 18.0],
+                [title_avail, 18.0],
                 egui::Label::new(
                     RichText::new(format!("SFTP · {}", self.host_name))
                         .strong()
@@ -874,6 +930,44 @@ impl SftpView {
                 )
                 .truncate(),
             );
+            if let Some(state) = transfer_state {
+                let badge_resp = ui.add_sized(
+                    [26.0, 26.0],
+                    egui::Button::new("")
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE)
+                        .min_size(egui::vec2(26.0, 26.0)),
+                );
+                let badge_resp = badge_resp
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(if self.transfers_expanded {
+                        "收起传输详情"
+                    } else {
+                        "展开传输详情"
+                    });
+                badge_resp.widget_info(|| {
+                    // 只能通过闭包覆盖：Button::ui 内部已按自身 atoms 注册过
+                    // WidgetInfo，后调用的 widget_info 会覆盖 accesskit 节点。
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        ui.is_enabled(),
+                        transfer_badge_label(state),
+                    )
+                });
+                if badge_resp.clicked() {
+                    self.transfers_expanded = !self.transfers_expanded;
+                }
+                if ui.is_rect_visible(badge_resp.rect) {
+                    if badge_resp.hovered() {
+                        ui.painter().rect_filled(
+                            badge_resp.rect,
+                            crate::theme::tokens::RADIUS_ITEM,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+                        );
+                    }
+                    paint_transfer_badge(ui.painter(), badge_resp.rect, state, self, theme);
+                }
+            }
         });
         ui.add_space(8.0);
 
@@ -928,102 +1022,24 @@ impl SftpView {
             }
         }
 
-        // ==================== 传输区域（列表上方，任何情况下可见） ====================
-        // 必须放在文件列表之前：列表的 ScrollArea（auto_shrink false）
-        // 会占据面板全部剩余高度，其后的内容被布局在滚动区底部之外、
-        // 超出面板可视区被裁剪——上传进度曾因此完全不可见（选完文件
-        // 后没有任何反馈，直到列表刷新出现新文件才知道上传成功）。
+        // ==================== 传输详情（徽标展开时可见） ====================
+        // 徽标是常驻入口：收起后标题行只剩状态徽标，文件列表获得全部
+        // 纵向空间；展开后详情卡片落在列表上方（ScrollArea auto_shrink
+        // false 会占满剩余高度，其后内容会被裁剪——上传进度曾因此不可见）。
         // 只保留最近的传输记录（上限 12 条）。
         if self.transfers.len() > 12 {
             self.transfers.drain(..self.transfers.len() - 12);
         }
-        let has_upload = self
-            .transfers
-            .iter()
-            .any(|transfer| transfer.label.starts_with("上传 "));
-        let uploads_finished = has_upload
-            && self
-                .transfers
-                .iter()
-                .filter(|transfer| transfer.label.starts_with("上传 "))
-                .all(|transfer| transfer.finished || transfer.failed);
+        let transfers_expanded = self.transfers_expanded;
         let mut close_upload_progress = false;
-        if has_upload {
-            egui::Frame::new()
-                .fill(theme.bg_elevated)
-                .stroke(egui::Stroke::new(1.0, theme.border))
-                .corner_radius(crate::theme::tokens::RADIUS_ITEM)
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("上传进度")
-                                .strong()
-                                .size(11.5)
-                                .color(theme.text_primary),
-                        );
-                        if uploads_finished {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new("关闭")
-                                                    .size(10.5)
-                                                    .color(theme.text_secondary),
-                                            )
-                                            .min_size(egui::vec2(38.0, 20.0)),
-                                        )
-                                        .clicked()
-                                    {
-                                        close_upload_progress = true;
-                                    }
-                                },
-                            );
-                        }
-                    });
-                    for transfer in self
-                        .transfers
-                        .iter()
-                        .filter(|transfer| transfer.label.starts_with("上传 "))
-                    {
-                        render_transfer_row(ui, transfer, theme);
-                    }
-                });
+        if transfers_expanded {
+            self.render_transfer_details(ui, theme, &mut close_upload_progress);
         }
         if close_upload_progress {
             // 只移除已经结束的上传记录；按钮只在全部上传结束后出现，
             // 因此不会误清理进行中的任务。
             self.transfers
                 .retain(|transfer| !transfer.label.starts_with("上传 "));
-        }
-        let has_other_transfer = self
-            .transfers
-            .iter()
-            .any(|transfer| !transfer.label.starts_with("上传 "));
-        if has_other_transfer {
-            ui.add_space(6.0);
-            egui::Frame::new()
-                .fill(theme.bg_elevated)
-                .stroke(egui::Stroke::new(1.0, theme.border))
-                .corner_radius(crate::theme::tokens::RADIUS_ITEM)
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new("传输记录")
-                            .strong()
-                            .size(11.5)
-                            .color(theme.text_secondary),
-                    );
-                    for transfer in self
-                        .transfers
-                        .iter()
-                        .filter(|transfer| !transfer.label.starts_with("上传 "))
-                    {
-                        render_transfer_row(ui, transfer, theme);
-                    }
-                });
         }
 
         // ==================== 文件列表 ====================
@@ -1304,6 +1320,101 @@ impl SftpView {
                     input: String::new(),
                 });
             }
+        }
+    }
+
+    /// 渲染展开态的传输详情（上传进度卡片 + 其它传输记录）。
+    ///
+    /// 调用方已确认 `transfers_expanded == true`；无传输时不画任何卡片
+    /// （标题行徽标也不出现），避免空面板被一张空卡片占掉纵向空间。
+    /// `close_upload_progress` 由调用方在渲染后消费：只清理已结束的上传。
+    fn render_transfer_details(
+        &self,
+        ui: &mut Ui,
+        theme: &'static crate::theme::Theme,
+        close_upload_progress: &mut bool,
+    ) {
+        let has_upload = self
+            .transfers
+            .iter()
+            .any(|transfer| transfer.label.starts_with("上传 "));
+        if has_upload {
+            let uploads_finished = self
+                .transfers
+                .iter()
+                .filter(|transfer| transfer.label.starts_with("上传 "))
+                .all(|transfer| transfer.finished || transfer.failed);
+            egui::Frame::new()
+                .fill(theme.bg_elevated)
+                .stroke(egui::Stroke::new(1.0, theme.border))
+                .corner_radius(crate::theme::tokens::RADIUS_ITEM)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("上传进度")
+                                .strong()
+                                .size(11.5)
+                                .color(theme.text_primary),
+                        );
+                        if uploads_finished {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("关闭")
+                                                    .size(10.5)
+                                                    .color(theme.text_secondary),
+                                            )
+                                            .min_size(egui::vec2(38.0, 20.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        *close_upload_progress = true;
+                                    }
+                                },
+                            );
+                        }
+                    });
+                    for transfer in self
+                        .transfers
+                        .iter()
+                        .filter(|transfer| transfer.label.starts_with("上传 "))
+                    {
+                        render_transfer_row(ui, transfer, theme);
+                    }
+                });
+        }
+        let has_other_transfer = self
+            .transfers
+            .iter()
+            .any(|transfer| !transfer.label.starts_with("上传 "));
+        if has_other_transfer {
+            if has_upload {
+                ui.add_space(6.0);
+            }
+            egui::Frame::new()
+                .fill(theme.bg_elevated)
+                .stroke(egui::Stroke::new(1.0, theme.border))
+                .corner_radius(crate::theme::tokens::RADIUS_ITEM)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("传输记录")
+                            .strong()
+                            .size(11.5)
+                            .color(theme.text_secondary),
+                    );
+                    for transfer in self
+                        .transfers
+                        .iter()
+                        .filter(|transfer| !transfer.label.starts_with("上传 "))
+                    {
+                        render_transfer_row(ui, transfer, theme);
+                    }
+                });
         }
     }
 
@@ -1827,6 +1938,127 @@ fn render_transfer_row(
     ui.add_space(6.0);
 }
 
+/// 徽标的无障碍 label（kittest 按此查找并点击）。
+///
+/// - 进行中：`传输进度 · 进行中 N 项`（收起时也可读出数量）；
+/// - 有失败：`传输进度 · 有 N 项失败`；
+/// - 全部完成：`传输进度 · 全部完成`。
+fn transfer_badge_label(state: TransferState) -> String {
+    match state {
+        TransferState::Uploading { active } => format!("传输进度 · 进行中 {active} 项"),
+        TransferState::Failed { failed } => format!("传输进度 · 有 {failed} 项失败"),
+        TransferState::Done => "传输进度 · 全部完成".to_string(),
+    }
+}
+
+/// 绘制 26×26 方形点击区内的 16px 传输徽标：
+///
+/// - 16px 圆形底（直径）：进行中 accent2 / 完成 success / 失败 danger；
+/// - 中央白色符号：向上箭头（上传语义）/ 对勾（完成）/ 感叹号（失败）；
+/// - 进行中额外画进度弧环：总进度（各传输 done/total 求和）的圆环描边，
+///   起点 12 点钟方向顺时针；0% 时只画轨道环（低透明白），避免空环。
+///
+/// 符号全部用线段/圆点手绘（矢量，避免 SF 缺字形渲染成方块；与齿轮
+/// 按钮同策略）。
+/// `view` 仅用于读取总进度，不产生借用写入。
+fn paint_transfer_badge(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    state: TransferState,
+    view: &SftpView,
+    theme: &'static crate::theme::Theme,
+) {
+    let center = rect.center();
+    let radius = 8.0;
+    let base = match state {
+        TransferState::Uploading { .. } => theme.accent2,
+        TransferState::Failed { .. } => theme.danger,
+        TransferState::Done => theme.success,
+    };
+    painter.circle_filled(center, radius, base);
+    // 极淡的深色描边，让圆形在 bg_elevated 卡片与深色面板上都有边界。
+    painter.circle_stroke(
+        center,
+        radius - 0.5,
+        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(48)),
+    );
+    // 进行中：进度弧环（轨道 + 前景）。
+    if matches!(state, TransferState::Uploading { .. }) {
+        let done: u64 = view.transfers.iter().map(|t| t.done).sum();
+        let total: u64 = view.transfers.iter().map(|t| t.total).sum();
+        let progress = if total == 0 {
+            0.0
+        } else {
+            (done as f32 / total as f32).clamp(0.0, 1.0)
+        };
+        let ring_r = radius + 2.5;
+        let track = egui::Color32::from_white_alpha(56);
+        let sweep = std::f32::consts::TAU * progress;
+        paint_ring(painter, center, ring_r, 0.0, std::f32::consts::TAU, track);
+        if sweep > 0.02 {
+            paint_ring(painter, center, ring_r, 0.0, sweep, egui::Color32::WHITE);
+        }
+    }
+    let fg = egui::Color32::WHITE;
+    match state {
+        TransferState::Uploading { .. } => {
+            // 向上箭头：竖线 + 两翼（上传语义；字符 "↑" 依赖字体，改手绘）。
+            let top = center + egui::vec2(0.0, -4.2);
+            let bottom = center + egui::vec2(0.0, 4.2);
+            painter.line_segment([bottom, top], egui::Stroke::new(1.8, fg));
+            painter.line_segment(
+                [top, top + egui::vec2(-3.0, 3.0)],
+                egui::Stroke::new(1.8, fg),
+            );
+            painter.line_segment(
+                [top, top + egui::vec2(3.0, 3.0)],
+                egui::Stroke::new(1.8, fg),
+            );
+        }
+        TransferState::Done => {
+            // 对勾：短臂 + 长臂。
+            let p0 = center + egui::vec2(-4.0, 0.2);
+            let p1 = center + egui::vec2(-1.2, 3.0);
+            let p2 = center + egui::vec2(4.2, -3.2);
+            painter.line_segment([p0, p1], egui::Stroke::new(1.8, fg));
+            painter.line_segment([p1, p2], egui::Stroke::new(1.8, fg));
+        }
+        TransferState::Failed { .. } => {
+            // 感叹号：竖线 + 底部圆点。
+            let top = center + egui::vec2(0.0, -4.0);
+            let bottom = center + egui::vec2(0.0, 1.6);
+            painter.line_segment([top, bottom], egui::Stroke::new(1.8, fg));
+            painter.circle_filled(center + egui::vec2(0.0, 3.8), 1.2, fg);
+        }
+    }
+}
+
+/// 在 `center` 为圆心、`radius` 为半径的圆上画一段圆弧（起点 12 点钟，
+/// 顺时针 `sweep` 弧度）。`sweep <= 0` 不画；整圆用多段折线逼近。
+fn paint_ring(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    start: f32,
+    sweep: f32,
+    color: egui::Color32,
+) {
+    if sweep <= 0.0 {
+        return;
+    }
+    let sweep = sweep.min(std::f32::consts::TAU);
+    // 每 ~10° 一段：16px 徽标上足够平滑，且形状数可控。
+    let steps = ((sweep / 0.18).ceil() as usize).clamp(2, 40);
+    let mut prev = center + egui::vec2(0.0, -radius);
+    let stroke = egui::Stroke::new(1.6, color);
+    for i in 1..=steps {
+        let angle = start + sweep * (i as f32 / steps as f32);
+        let point = center + egui::vec2(angle.sin() * radius, -angle.cos() * radius);
+        painter.line_segment([prev, point], stroke);
+        prev = point;
+    }
+}
+
 /// 行首文件/目录矢量图标：文件夹采用 macOS 风格的蓝色渐变与高光，
 /// 文件为细描边轮廓。矢量绘制避免 emoji 字形随字体变化。
 fn paint_entry_icon(painter: &egui::Painter, rect: egui::Rect, is_dir: bool) {
@@ -2080,6 +2312,7 @@ mod tests {
             selection_anchor: Some("readme.md".into()),
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2181,6 +2414,7 @@ mod tests {
             selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2204,7 +2438,7 @@ mod tests {
         harness.get_by_label("下载选中项");
     }
 
-    /// 上传事件应落在独立的上传进度区域，而不是只显示一条状态文字。
+    /// 上传事件应落在详情卡片（默认展开），而不是只显示一个徽标。
     #[test]
     fn 上传进度独立区域且列表上方可见() {
         use kittest::Queryable;
@@ -2223,6 +2457,7 @@ mod tests {
             selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2241,6 +2476,8 @@ mod tests {
 
         let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
         harness.run_steps(2);
+        // 标题行徽标（进行中）与详情卡片同时出现。
+        harness.get_by_label("传输进度 · 进行中 1 项");
         harness.get_by_label("上传进度");
         harness.get_by_label("上传 demo.bin");
         // 区域在列表内容（"空目录"提示）之前，处于面板可视范围内。
@@ -2253,6 +2490,180 @@ mod tests {
             "上传进度区域应在文件列表上方（原 ScrollArea 之后不可见）"
         );
         assert!(progress.top() >= 0.0 && progress.top() < 400.0);
+    }
+
+    /// 点击标题行徽标可收起/展开传输详情；收起后只剩徽标，文件列表
+    /// 获得纵向空间；徽标按聚合状态区分（进行中/失败/完成）。
+    #[test]
+    fn 传输徽标点击收起展开详情() {
+        use kittest::Queryable;
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(128);
+        let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SftpHandle::from_raw(handle_tx);
+        let mut view = SftpView {
+            host_name: "测试主机".into(),
+            handle,
+            rx,
+            current_path: "/home/test".into(),
+            sftp_home: "/home/test".into(),
+            entries: Vec::new(),
+            selected: vec![],
+            selection_anchor: None,
+            loading: false,
+            transfers: vec![Transfer {
+                id: 1,
+                label: "上传 demo.bin".into(),
+                done: 512,
+                total: 1024,
+                finished: false,
+                failed: false,
+            }],
+            transfers_expanded: true,
+            dialog: None,
+            error: None,
+            notice: None,
+            closed: false,
+            cell_width: 0.0,
+            last_primary_click: None,
+        };
+
+        let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
+        harness.run_steps(2);
+        // 展开态：徽标 + 详情卡片同时可见。
+        harness.get_by_label("传输进度 · 进行中 1 项");
+        harness.get_by_label("上传进度");
+
+        // 点击徽标收起：详情消失，徽标保留。
+        harness.get_by_label("传输进度 · 进行中 1 项").click();
+        harness.run_steps(2);
+        harness.get_by_label("传输进度 · 进行中 1 项");
+        assert!(
+            harness.root().query_by_label("上传进度").is_none(),
+            "收起后不应继续显示传输详情卡片"
+        );
+
+        // 再次点击展开：详情恢复。
+        harness.get_by_label("传输进度 · 进行中 1 项").click();
+        harness.run_steps(2);
+        harness.get_by_label("上传进度");
+        harness.get_by_label("上传 demo.bin");
+    }
+
+    /// 无传输时不画徽标；完成后徽标为完成态、有失败时为失败态。
+    ///
+    /// 注意：harness 闭包会可变借用 `view`，中途不能再直接 push——
+    /// 三个状态各自用独立 harness 验证（断言纯逻辑 + 渲染各一次）。
+    #[test]
+    fn 传输徽标按聚合状态区分() {
+        use kittest::Queryable;
+
+        fn make_view(transfers: Vec<Transfer>) -> SftpView {
+            let (_tx, rx) = tokio::sync::mpsc::channel(128);
+            let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            SftpView {
+                host_name: "测试主机".into(),
+                handle: SftpHandle::from_raw(handle_tx),
+                rx,
+                current_path: "/home/test".into(),
+                sftp_home: "/home/test".into(),
+                entries: Vec::new(),
+                selected: vec![],
+                selection_anchor: None,
+                loading: false,
+                transfers,
+                transfers_expanded: true,
+                dialog: None,
+                error: None,
+                notice: None,
+                closed: false,
+                cell_width: 0.0,
+                last_primary_click: None,
+            }
+        }
+        fn done_transfer(id: u64, name: &str) -> Transfer {
+            Transfer {
+                id,
+                label: format!("上传 {name}"),
+                done: 1024,
+                total: 1024,
+                finished: true,
+                failed: false,
+            }
+        }
+
+        // 无传输：无状态、徽标不应出现。
+        let view = make_view(Vec::new());
+        assert_eq!(view.transfer_state(), None);
+        let mut view = view;
+        let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
+        harness.run_steps(2);
+        assert!(
+            harness
+                .root()
+                .query_all_by_label("传输进度 · 全部完成")
+                .next()
+                .is_none(),
+            "无传输时不应出现传输徽标"
+        );
+
+        // 全部完成：完成态徽标。
+        let view = make_view(vec![done_transfer(1, "done.bin")]);
+        assert_eq!(view.transfer_state(), Some(TransferState::Done));
+        let mut view = view;
+        let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
+        harness.run_steps(2);
+        harness.get_by_label("传输进度 · 全部完成");
+
+        // 有失败：失败态徽标优先于完成。
+        let view = make_view(vec![
+            done_transfer(1, "done.bin"),
+            Transfer {
+                id: 2,
+                label: "上传 bad.bin".into(),
+                done: 0,
+                total: 100,
+                finished: false,
+                failed: true,
+            },
+        ]);
+        assert_eq!(
+            view.transfer_state(),
+            Some(TransferState::Failed { failed: 1 })
+        );
+        let mut view = view;
+        let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
+        harness.run_steps(2);
+        harness.get_by_label("传输进度 · 有 1 项失败");
+
+        // 有进行中：进行中优先于失败（数量为未结束项数）。
+        let view = make_view(vec![
+            done_transfer(1, "done.bin"),
+            Transfer {
+                id: 2,
+                label: "上传 bad.bin".into(),
+                done: 0,
+                total: 100,
+                finished: false,
+                failed: true,
+            },
+            Transfer {
+                id: 3,
+                label: "上传 ing.bin".into(),
+                done: 10,
+                total: 100,
+                finished: false,
+                failed: false,
+            },
+        ]);
+        assert_eq!(
+            view.transfer_state(),
+            Some(TransferState::Uploading { active: 1 })
+        );
+        let mut view = view;
+        let mut harness = egui_kittest::Harness::new_ui(|ui| view.show(ui));
+        harness.run_steps(2);
+        harness.get_by_label("传输进度 · 进行中 1 项");
     }
 
     /// 上传全部结束后，进度区域应提供关闭入口并清理记录。
@@ -2281,6 +2692,7 @@ mod tests {
                 finished: true,
                 failed: false,
             }],
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2374,6 +2786,7 @@ mod tests {
             selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2438,6 +2851,7 @@ mod tests {
             selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2502,6 +2916,7 @@ mod tests {
             selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2537,6 +2952,7 @@ mod tests {
             selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2599,6 +3015,7 @@ mod tests {
             selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2686,6 +3103,7 @@ mod tests {
             selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2746,6 +3164,7 @@ mod tests {
             selection_anchor: Some("old.txt".into()),
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
@@ -2865,6 +3284,7 @@ mod tests {
             selection_anchor: None,
             loading: false,
             transfers: Vec::new(),
+            transfers_expanded: true,
             dialog: None,
             error: None,
             notice: None,
