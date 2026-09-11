@@ -180,6 +180,10 @@ fn macos_filenames_fallback() -> Vec<PathBuf> {
 }
 
 /// 百分号解码（`file://` URL → 本地路径；非法序列原样保留）。
+///
+/// macOS 文件分支用（`resolve_file_url`）；非 macOS 构建无调用者，
+/// 用 `cfg_attr` 压住 `-D warnings` 的 `dead_code`（CI 在 Linux 跑 clippy）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn percent_decode(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let bytes = input.as_bytes();
@@ -198,6 +202,7 @@ fn percent_decode(input: &str) -> String {
     output
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
