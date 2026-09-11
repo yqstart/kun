@@ -21,25 +21,43 @@ use mino_core::terminal::keys::{self, Key, Mods, MouseWheelDirection};
 use mino_core::terminal::{Session, SessionEvent, TermMode};
 
 /// 行缓存：内容 hash 未变时复用已布局文本（Galley），避免每帧重建。
-/// `galley` 与 pixels_per_point 绑定，窗口缩放后需全量失效（见 `show`）。
+/// `runs` 与 pixels_per_point 绑定，窗口缩放后需全量失效（见 `show`）。
 #[derive(Clone)]
 struct RowCache {
     /// 内容指纹（fg+bg+样式+字符；不含光标效果，光标移动不触发重建）。
     hash: u64,
-    /// 已布局文本（绘制直接使用，无需 layout_job）。
-    galley: std::sync::Arc<egui::Galley>,
+    /// 已布局文本分段（每段按终端列定位绘制，无需整行 layout_job）。
+    runs: Vec<CachedRun>,
     /// 背景段（合并相邻相同背景色，含起止列）。
     backgrounds: Vec<BgRect>,
 }
 
-/// 文本段（合并相邻相同前景样式的 cell）。
+/// 缓存的文本分段（列定位 + 已布局 Galley）。
+///
+/// 每个分段单独 layout 后按终端列 `x = start_col * cell_width` 绘制——
+/// 整行一个 LayoutJob 会让 egui 按字体实际 advance 排字：
+/// CJK 字形经 fallback 字体实际宽度 ≠ 2× 等宽 cell，
+/// 后续字符整体左移，输入越多光标漂移越远。
+/// 分段绘制恢复「终端列 = 屏幕列」的不变量。
+#[derive(Clone)]
+struct CachedRun {
+    /// 起始终端列（含宽字符占用的双列）。
+    start_col: usize,
+    /// 已布局文本（绘制直接使用，无需 layout_job）。
+    galley: std::sync::Arc<egui::Galley>,
+}
+
+/// 文本段（合并相邻相同前景样式的 cell；`start_col` 为终端列定位用）。
 struct Segment {
+    start_col: usize,
     text: String,
     fg: Color32,
     bold: bool,
     italic: bool,
     underline: bool,
     strikeout: bool,
+    /// 本段是否为宽字符段（CJK/emoji，占双列；与半角不混排）。
+    is_wide: bool,
 }
 
 /// 背景矩形（合并相邻相同背景色的 cell，含起止列）。
@@ -166,6 +184,12 @@ pub struct TerminalView {
     selecting: bool,
     /// 复制后的短暂反馈 chip 到期时间。
     copy_flash_until: Option<f64>,
+    /// 图片粘贴失败信息（下一帧 `toast` 显示一次；`TerminalView` 无 toast 通道）。
+    image_paste_error: Option<String>,
+    /// 远程图片粘贴待上传（本地中转路径；`MinoApp` 经 SFTP 上传后写远端 token）。
+    pending_image_upload: Option<std::path::PathBuf>,
+    /// 剪贴板图片读取器（正式为系统剪贴板；测试注入 `Fake`）。
+    clipboard: Box<dyn crate::clip_image::ClipboardReader>,
     /// 当前 IME 预编辑文本（拼音/注音组字中、尚未上屏的组合串）。
     ///
     /// 真机链路：egui 每帧把本视图输出的 `PlatformOutput::ime` 转成
@@ -232,8 +256,30 @@ impl TerminalView {
             selection: None,
             selecting: false,
             copy_flash_until: None,
+            image_paste_error: None,
+            pending_image_upload: None,
+            clipboard: Box::new(crate::clip_image::SystemClipboard::new()),
             ime_preedit: None,
         }
+    }
+
+    /// 测试用：注入剪贴板读取器（模拟截图/文件/空剪贴板）。
+    #[cfg(test)]
+    pub fn set_clipboard_for_test(
+        &mut self,
+        clipboard: Box<dyn crate::clip_image::ClipboardReader>,
+    ) {
+        self.clipboard = clipboard;
+    }
+
+    /// 取出远程图片粘贴待上传（本地中转路径；`MinoApp` 经 SFTP 上传后写远端 token）。
+    pub fn take_pending_image(&mut self) -> Option<std::path::PathBuf> {
+        self.pending_image_upload.take()
+    }
+
+    /// 取出图片粘贴失败信息（`MinoApp` 转 `toast` 显示一次）。
+    pub fn take_image_paste_error(&mut self) -> Option<String> {
+        self.image_paste_error.take()
     }
 
     /// 本帧终端渲染分段耗时（性能 HUD 读取；未渲染时均为 0）。
@@ -587,14 +633,32 @@ impl TerminalView {
         // ==================== 绘制（锁外） ====================
         let layout_start = std::time::Instant::now();
         // 先为新构建的行做文本布局并写缓存（命中行不进入此循环）。
+        // 每个分段独立 layout（单行不换行），绘制时按终端列定位——
+        // 避免整行 LayoutJob 的字体实际 advance 累积漂移（CJK 宽字符）。
         for (grid_line, data) in &lines_data {
-            let job = build_job(&data.segments, self.font_size);
-            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            let mut runs = Vec::with_capacity(data.segments.len());
+            for seg in &data.segments {
+                let galley = ui.fonts_mut(|f| {
+                    f.layout_job(singleline_job(
+                        &seg.text,
+                        self.font_size,
+                        seg.fg,
+                        seg.bold,
+                        seg.italic,
+                        seg.underline,
+                        seg.strikeout,
+                    ))
+                });
+                runs.push(CachedRun {
+                    start_col: seg.start_col,
+                    galley,
+                });
+            }
             self.rows_cache.insert(
                 *grid_line,
                 RowCache {
                     hash: data.hash,
-                    galley,
+                    runs,
                     backgrounds: data.backgrounds.clone(),
                 },
             );
@@ -634,9 +698,14 @@ impl TerminalView {
                     painter.rect_filled(rect, 2.0, selection_bg);
                 }
             }
-            // 文本（直接绘制缓存的 Galley，Arc clone 零成本；不再 layout_job）。
-            let pos = origin + Vec2::new(0.0, v as f32 * cell_height);
-            painter.galley(pos, cache.galley.clone(), Color32::WHITE);
+            // 文本分段：每段按终端列定位绘制（Arc clone 零成本；不再 layout_job）。
+            // 分段起点 x = start_col * cell_width——终端列与屏幕列严格对齐，
+            // 同段内连续同字宽字符（半角 run / CJK run 不混排）无累积漂移。
+            let row_top = origin.y + v as f32 * cell_height;
+            for run in &cache.runs {
+                let pos = egui::pos2(origin.x + run.start_col as f32 * cell_width, row_top);
+                painter.galley(pos, run.galley.clone(), Color32::WHITE);
+            }
         }
 
         // 光标形状绘制（shape 已在锁内读取，无需二次上锁）。
@@ -926,6 +995,9 @@ impl TerminalView {
         let mut need_repaint = false;
         // 本帧输入动作（闭包内只读 self 写入 PTY，闭包外统一更新工作目录跟踪器）。
         let mut actions: Vec<InputAction> = Vec::new();
+        // 本帧是否有文本粘贴事件：有则走文本老路，释放键分支不再读剪贴板图片。
+        let has_text_paste =
+            ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
 
         // 检测本帧是否有退格/删除键按下（含上一帧的抑制状态）。
         // 某些输入法（如微信输入法）在退格时会伴随发送"空格类" Text 事件，
@@ -973,6 +1045,18 @@ impl TerminalView {
                         pressed,
                         ..
                     } => {
+                        // 释放粘贴键且本帧无文本粘贴事件 = 剪贴板是图片（或空）：
+                        // egui-winit 只在 `clipboard.get()` 有文本时才发 `Paste`，
+                        // 有图无文时只剩释放键。必须在 `!pressed → continue`
+                        // 之前特化处理（释放帧 `pressed=false`）。
+                        if !*pressed
+                            && *key == egui::Key::V
+                            && (modifiers.command || modifiers.ctrl)
+                            && !has_text_paste
+                        {
+                            actions.push(InputAction::ImagePasteRequest);
+                            continue;
+                        }
                         if !*pressed {
                             continue;
                         }
@@ -1022,6 +1106,7 @@ impl TerminalView {
                                 session.write(&bytes);
                                 actions.push(InputAction::Bytes(bytes));
                             }
+                            continue;
                         }
                     }
                     egui::Event::Text(text) => {
@@ -1264,8 +1349,47 @@ impl TerminalView {
                 // 粘贴内容不可逐字节信任（可能包含控制序列），暂停目录跟踪。
                 self.workdir.invalidate();
             }
+            InputAction::ImagePasteRequest => self.handle_image_paste(),
             InputAction::CopySelection => self.copy_selection(ctx),
         }
+    }
+
+    /// 处理图片粘贴请求（释放 `Cmd/Ctrl+V` 且本帧无文本粘贴事件时）。
+    ///
+    /// 优先级见 `clip_image::paste_image_token`：文本优先（此处已无文本）、
+    /// macOS 文件直接用原路径、截图编码 PNG 落盘。本地会话直接写 `@token`；
+    /// 远程会话暂存中转路径，由 `MinoApp` 经 SFTP 上传后写远端 token。
+    /// 空剪贴板静默无操作；失败记入 `image_paste_error` 由上层 `toast`。
+    fn handle_image_paste(&mut self) {
+        let result = crate::clip_image::paste_image_token(&mut *self.clipboard, shell_escape_path);
+        match result {
+            Ok(None) => {}
+            Ok(Some(pasted)) => {
+                if self.session.is_remote() {
+                    // token 暂不写 PTY，等 SFTP `Done` 后写远端路径。
+                    // Finder 文件（`staged=None`）同样需上传：token 去掉 `@`
+                    // 即本地原路径，走同一套 SFTP 中转链路。
+                    let local = pasted.staged.unwrap_or_else(|| {
+                        std::path::PathBuf::from(pasted.token.trim_start_matches('@'))
+                    });
+                    self.pending_image_upload = Some(local);
+                } else {
+                    self.session.write(pasted.token.as_bytes());
+                    self.workdir.push_text(&pasted.token);
+                    self.selection = None;
+                }
+            }
+            Err(message) => {
+                self.image_paste_error = Some(message);
+            }
+        }
+    }
+
+    /// 写入已生成的粘贴 token（远程图片上传完成、本地文件路径等上层装配后调用）。
+    pub fn push_pasted_text(&mut self, token: &str) {
+        self.session.write(token.as_bytes());
+        self.workdir.push_text(token);
+        self.selection = None;
     }
 
     /// 将当前终端选区交给 egui 平台层写入系统剪贴板。
@@ -1369,6 +1493,8 @@ enum InputAction {
     Text(String),
     /// 粘贴（工作目录跟踪器失效）。
     Paste,
+    /// 图片粘贴请求（释放粘贴键且本帧无文本粘贴事件；闭包外读剪贴板）。
+    ImagePasteRequest,
     /// 复制当前终端选区。
     CopySelection,
 }
@@ -1609,6 +1735,13 @@ fn selection_to_text(
 /// 单行语义：占位格跳过、颜色解析、背景段合并、文本段合并。
 /// 注意：不再对光标 cell 做反色——Block 光标最终由光标色实心矩形覆盖，反色不可见，
 /// 剔除后光标行内容 hash 稳定，光标移动不触发行重建。
+///
+/// 列定位关键：`Segment.start_col` 记录段首终端列；宽字符（CJK/emoji，占双列）
+/// 与半角字符**不混排**——宽字符起新段，后续半角另起新段。
+/// 这样同段内所有字符字宽一致（半角 1 列 / 宽字符 2 列），分段绘制时
+/// `x = start_col * cell_width` 即精确对齐，无累积漂移。
+/// （历史 bug：整行一个 LayoutJob 让 egui 按 fallback 字体实际 advance 排字，
+/// CJK 实际宽度 ≠ 2×cell，后续字符整体左移，光标越打越远。）
 #[allow(clippy::too_many_arguments)]
 fn build_line_data(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
@@ -1676,7 +1809,7 @@ fn build_line_data(
             continue;
         }
 
-        // 文本段合并。
+        // 文本段合并（宽字符起新段：字宽与半角不同，不混排）。
         let text = if cell.flags.contains(Flags::HIDDEN) || leading_spacer {
             ' '
         } else {
@@ -1687,10 +1820,17 @@ fn build_line_data(
         } else {
             cell.zerowidth()
         };
+        // 主宽字符（WIDE_CHAR 标志）占双列：后续半角另起新段。
+        // 行尾换行占位（LEADING）与隐藏字符视作半角空格宽度。
+        let is_wide = !leading_spacer
+            && !cell.flags.contains(Flags::HIDDEN)
+            && cell.flags.contains(Flags::WIDE_CHAR);
         push_or_merge(
             &mut segments,
+            col,
             text,
             zero_width,
+            is_wide,
             CellStyle {
                 fg,
                 bg,
@@ -1810,11 +1950,17 @@ impl CellStyle {
     }
 }
 
-/// 合并或追加一个 cell 到段列表（相同样式则追加字符）。
+/// 合并或追加一个 cell 到段列表。
+///
+/// 合并条件：相同样式 **且** 字宽一致（宽字符与半角不混排）。
+/// 同段内字宽一致 → 分段绘制 `x = start_col * cell_width` 精确对齐，
+/// 无字体实际 advance 的累积漂移（见 `CachedRun`）。
 fn push_or_merge(
     segments: &mut Vec<Segment>,
+    col: usize,
     c: char,
     zero_width: Option<&[char]>,
+    is_wide: bool,
     style: CellStyle,
     hash: &mut u64,
 ) {
@@ -1824,6 +1970,7 @@ fn push_or_merge(
             && last.italic == style.italic
             && last.underline == style.underline
             && last.strikeout == style.strikeout
+            && last.is_wide == is_wide
         {
             last.text.push(c);
             if let Some(zero_width) = zero_width {
@@ -1834,12 +1981,14 @@ fn push_or_merge(
         }
     }
     segments.push(Segment {
+        start_col: col,
         text: c.to_string(),
         fg: style.fg,
         bold: style.bold,
         italic: style.italic,
         underline: style.underline,
         strikeout: style.strikeout,
+        is_wide,
     });
     if let Some(zero_width) = zero_width {
         if let Some(last) = segments.last_mut() {
@@ -1881,7 +2030,42 @@ fn style_key(
     .key()
 }
 
-/// 将段列表构建为 egui LayoutJob。
+/// 为单个同宽文本段构建单行 LayoutJob（不换行，按给定样式）。
+fn singleline_job(
+    text: &str,
+    font_size: f32,
+    fg: Color32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+) -> LayoutJob {
+    let _ = bold;
+    let format = TextFormat {
+        font_id: FontId::monospace(font_size),
+        color: fg,
+        italics: italic,
+        underline: if underline {
+            Stroke::new(1.0, fg)
+        } else {
+            Stroke::NONE
+        },
+        strikethrough: if strikeout {
+            Stroke::new(1.0, fg)
+        } else {
+            Stroke::NONE
+        },
+        ..Default::default()
+    };
+    let mut job = LayoutJob::single_section(text.to_owned(), format);
+    job.wrap.max_width = f32::INFINITY;
+    job.break_on_newline = false;
+    job.halign = egui::Align::LEFT;
+    job
+}
+
+/// 将段列表构建为 egui LayoutJob（仅测试用；正式渲染走分段列定位）。
+#[allow(dead_code)]
 fn build_job(segments: &[Segment], font_size: f32) -> LayoutJob {
     let mut job = LayoutJob::default();
     for seg in segments {
@@ -3009,6 +3193,176 @@ mod paste_tests {
             "载荷中只能保留由终端生成的结束标记"
         );
     }
+
+    /// 图片粘贴接缝：Fake 剪贴板给像素 → 本地会话直接写 `@token`。
+    #[test]
+    fn 图片粘贴写入token() {
+        use crate::clip_image::ClipboardReader;
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        struct FakeClipboard;
+        impl ClipboardReader for FakeClipboard {
+            fn clipboard_text(&mut self) -> Option<String> {
+                None
+            }
+            fn clipboard_file_paths(&self) -> Vec<std::path::PathBuf> {
+                Vec::new()
+            }
+            fn clipboard_image(&mut self) -> Option<(usize, usize, Vec<u8>)> {
+                Some((2, 1, vec![255u8; 8]))
+            }
+        }
+
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        view.borrow_mut()
+            .set_clipboard_for_test(Box::new(FakeClipboard));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        // 等 zsh 就绪。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            harness.step();
+            let text = tests_grid_text(view.borrow().session());
+            if text.contains("mino") {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(ready, "zsh 未就绪");
+
+        // 释放 Cmd+V 且无 Paste 事件 → 触发图片粘贴。
+        // 焦点说明：`Harness::new_ui` 首帧即聚焦终端（`initialized` 分支），
+        // `wait_text` 的步进已让焦点稳定；此处不再额外点按（点击会清选区，
+        // 与图片逻辑无关）。若焦点丢失，`handle_input` 整段跳过是预期行为，
+        // 用 `has_focus` 前置断言而非事后猜。
+        assert!(
+            harness
+                .ctx
+                .memory(|m| m.has_focus(egui::Id::new("terminal_view"))),
+            "终端应持有焦点，否则图片粘贴不会触发"
+        );
+        harness.event(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        // PTY 回显异步到达：轮询等待落盘文件名上屏。注意 token 中的 `@`
+        // 可能被 zsh `oh-my-zsh` 主题渲染过滤，断言只看文件名与后缀。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            harness.step();
+            let text = tests_grid_text(view.borrow().session());
+            if text.contains("mino-") && text.contains(".png") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+
+        let text = tests_grid_text(view.borrow().session());
+        assert!(
+            text.contains("mino-") && text.contains(".png"),
+            "图片粘贴应写入落盘文件名，终端内容：\n{text}"
+        );
+        // 落盘文件真实存在：直接按落盘目录扫描（终端回显经 zsh 主题
+        // 二次渲染，`@` 前缀与路径可能被截断/重排，不能从回显反推路径）。
+        let staged: Vec<_> = std::fs::read_dir(crate::clip_image::paste_dir())
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("png"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !staged.is_empty(),
+            "落盘目录应有 png：{}",
+            crate::clip_image::paste_dir().display()
+        );
+        for path in staged {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// 空剪贴板释放粘贴键：静默无操作，不写 PTY、不 toast。
+    #[test]
+    fn 空剪贴板释放粘贴键无操作() {
+        use crate::clip_image::ClipboardReader;
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        struct EmptyClipboard;
+        impl ClipboardReader for EmptyClipboard {
+            fn clipboard_text(&mut self) -> Option<String> {
+                None
+            }
+            fn clipboard_file_paths(&self) -> Vec<std::path::PathBuf> {
+                Vec::new()
+            }
+            fn clipboard_image(&mut self) -> Option<(usize, usize, Vec<u8>)> {
+                None
+            }
+        }
+
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        view.borrow_mut()
+            .set_clipboard_for_test(Box::new(EmptyClipboard));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            harness.step();
+            if tests_grid_text(view.borrow().session()).contains("mino") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        harness.event(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run_steps(6);
+        assert!(
+            view.borrow_mut().take_image_paste_error().is_none(),
+            "空剪贴板不应产生错误"
+        );
+        assert!(
+            view.borrow_mut().take_pending_image().is_none(),
+            "空剪贴板不应产生待上传"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3149,6 +3503,72 @@ mod cell_semantics_tests {
             .map(|segment| segment.text.as_str())
             .collect();
         assert_eq!(text, "a b ");
+    }
+
+    /// 回归：中文输入越多光标漂移越远——整行 LayoutJob 按 fallback 字体实际
+    /// advance 排字，CJK 实际宽度 ≠ 2×cell，后续字符整体左移。
+    /// 修复要求：宽字符与半角不混排（各自分段），分段按终端列定位绘制。
+    #[test]
+    fn 中文与半角分段列定位() {
+        let theme = crate::theme::current_theme();
+        let mut grid = Grid::<Cell>::new(1, 8, 0);
+        // "现在ab"：中(0,宽) 中(2,宽) a(4) b(5)。
+        grid[Line(0)][Column(0)].c = '现';
+        grid[Line(0)][Column(0)].flags.insert(Flags::WIDE_CHAR);
+        grid[Line(0)][Column(1)].c = ' ';
+        grid[Line(0)][Column(1)]
+            .flags
+            .insert(Flags::WIDE_CHAR_SPACER);
+        grid[Line(0)][Column(2)].c = '在';
+        grid[Line(0)][Column(2)].flags.insert(Flags::WIDE_CHAR);
+        grid[Line(0)][Column(3)].c = ' ';
+        grid[Line(0)][Column(3)]
+            .flags
+            .insert(Flags::WIDE_CHAR_SPACER);
+        grid[Line(0)][Column(4)].c = 'a';
+        grid[Line(0)][Column(5)].c = 'b';
+
+        let data = build_line_data(
+            &grid,
+            0,
+            8,
+            &Colors::default(),
+            theme.term_fg,
+            theme.term_bg,
+            to_egui(theme.term_bg),
+        );
+        // 宽字符起新段、半角另起新段：[现在][ab]，列定位 0/4。
+        // （连续同宽字符可合并：同段内字宽一致即可，分段绘制时按列定位，
+        // 无字体实际 advance 的累积漂移。）
+        assert_eq!(data.segments.len(), 2, "宽字符与半角须分段");
+        assert_eq!(data.segments[0].text, "现在");
+        assert_eq!(data.segments[0].start_col, 0);
+        assert!(data.segments[0].is_wide);
+        assert_eq!(data.segments[1].text, "ab  ");
+        assert_eq!(data.segments[1].start_col, 4);
+        assert!(!data.segments[1].is_wide);
+    }
+
+    /// 同色纯半角仍合并为一段（分段绘制不增加 layout 开销）。
+    #[test]
+    fn 纯半角行合并为一段() {
+        let theme = crate::theme::current_theme();
+        let mut grid = Grid::<Cell>::new(1, 4, 0);
+        for (i, c) in "abcd".chars().enumerate() {
+            grid[Line(0)][Column(i)].c = c;
+        }
+        let data = build_line_data(
+            &grid,
+            0,
+            4,
+            &Colors::default(),
+            theme.term_fg,
+            theme.term_bg,
+            to_egui(theme.term_bg),
+        );
+        assert_eq!(data.segments.len(), 1);
+        assert_eq!(data.segments[0].text, "abcd");
+        assert_eq!(data.segments[0].start_col, 0);
     }
 }
 

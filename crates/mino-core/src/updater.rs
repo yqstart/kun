@@ -20,7 +20,7 @@ pub struct UpdateInfo {
 }
 
 /// 默认仓库（可被测试覆盖）。
-pub const DEFAULT_REPO: &str = "yqstart/kun";
+pub const DEFAULT_REPO: &str = "yqstart/mino";
 
 /// 检查是否有新版本。
 ///
@@ -438,7 +438,7 @@ mod tests {
             <feed xmlns=\"http://www.w3.org/2005/Atom\">\n\
               <title>Release notes from mino</title>\n\
               <entry>\n\
-                <link rel=\"alternate\" type=\"text/html\" href=\"https://github.com/yqstart/kun/releases/tag/v0.2.0\"/>\n\
+                <link rel=\"alternate\" type=\"text/html\" href=\"https://github.com/yqstart/mino/releases/tag/v0.2.0\"/>\n\
                 <title>mino v0.2.0</title>\n\
                 <content type=\"html\">&lt;h2&gt;[0.2.0]&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;新增功能&lt;/li&gt;&lt;/ul&gt;</content>\n\
               </entry>\n\
@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(fields.tag_name, "v0.2.0");
         assert_eq!(
             fields.html_url,
-            "https://github.com/yqstart/kun/releases/tag/v0.2.0"
+            "https://github.com/yqstart/mino/releases/tag/v0.2.0"
         );
         assert!(fields.body.contains("新增功能"));
         // 标签与实体应被清理干净。
@@ -485,8 +485,8 @@ mod tests {
             "mino-0.2.0-macos-arm64.dmg"
         );
         assert_eq!(
-            asset_url_for("yqstart/kun", "v0.2.0", "0.2.0", "x64"),
-            "https://github.com/yqstart/kun/releases/download/v0.2.0/mino-0.2.0-macos-x64.dmg"
+            asset_url_for("yqstart/mino", "v0.2.0", "0.2.0", "x64"),
+            "https://github.com/yqstart/mino/releases/download/v0.2.0/mino-0.2.0-macos-x64.dmg"
         );
     }
 

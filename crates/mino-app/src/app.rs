@@ -128,6 +128,16 @@ struct LocatePending {
     started_at: f64,
 }
 
+/// 等待中的远程图片粘贴（本地中转 → SFTP 上传 → 远端 token 写回）。
+struct PendingImagePaste {
+    /// 目标标签稳定身份（上传完成时按 id 找 tab，关闭后丢弃）。
+    tab_id: u64,
+    /// 远端全路径（发起时锁定，不跟随目录切换）。
+    remote_path: String,
+    /// 已发起上传时的传输 id（`Done/Error` 按 id 匹配）。
+    transfer_id: u64,
+}
+
 impl TerminalTab {
     fn new(id: u64, label: String, terminal: TerminalView) -> Self {
         Self {
@@ -201,6 +211,12 @@ pub struct MinoApp {
     ready_sftp: Option<SftpConnection>,
     /// SFTP 连接错误（状态栏持久显示，toast 易被忽略）。
     sftp_error: Option<String>,
+    /// 等待中的远程图片粘贴（tab 身份 + 本地中转路径 + 远端文件名 + 传输 id）。
+    ///
+    /// 终端只产出本地中转文件；上传由面板 `SFTP` 句柄执行，`Done` 后再向
+    /// 该 tab 的 PTY 写远端 `@token`。单槽：新粘贴覆盖旧等待（旧中转留
+    /// `/tmp` 自清，不阻塞新图）。
+    pending_image_paste: Option<PendingImagePaste>,
     update_state: UpdateState,
     update_rx: Option<std::sync::mpsc::Receiver<Result<Option<UpdateInfo>, String>>>,
     download_rx: Option<std::sync::mpsc::Receiver<DownloadEvent>>,
@@ -599,6 +615,7 @@ impl MinoApp {
             pending_sftp: None,
             ready_sftp: None,
             sftp_error: None,
+            pending_image_paste: None,
             update_state: UpdateState::Idle,
             update_rx: None,
             download_rx: None,
@@ -1222,6 +1239,107 @@ impl MinoApp {
             } else {
                 // 等待输出期间保持重绘，pwd 结果到达后下一帧即导航。
                 ctx.request_repaint();
+            }
+        }
+    }
+
+    /// 每帧推进远程图片粘贴：终端产出本地中转 → 经面板 SFTP 上传 →
+    /// `Done` 后向该 tab 写远端 `@token`。
+    ///
+    /// - 无 SFTP / 已关闭：`toast` 提示并丢弃（不写 broken 路径），
+    ///   本地中转留 `/tmp` 自清；
+    /// - 上传中：复用面板传输进度条（`begin_transfer` 已自动展开）；
+    /// - `tab` 已关闭：按 id 找不到即丢弃。
+    fn poll_image_paste(&mut self, ctx: &egui::Context) {
+        // 借用分离：先把各 tab 的产出与错误收集到局部，再统一处理
+        // （`show_toast` 要 `&mut self`，不能在 `&mut self.tabs` 循环内调用）。
+        struct NewUpload {
+            tab_id: u64,
+            local: PathBuf,
+        }
+        let mut new_uploads: Vec<NewUpload> = Vec::new();
+        let mut no_sftp_tabs: Vec<u64> = Vec::new();
+        let mut closed_sftp_tabs: Vec<u64> = Vec::new();
+        let mut paste_errors: Vec<String> = Vec::new();
+        for tab in &mut self.tabs {
+            if let Some(local) = tab.terminal.take_pending_image() {
+                // 本地会话已在 `TerminalView::handle_image_paste` 内直接写入，
+                // 能到这里的一定是远程（`take_pending_image` 本地恒为 `None`）。
+                match tab.sftp.as_ref() {
+                    None => no_sftp_tabs.push(tab.id),
+                    Some(sftp) if sftp.is_closed() => closed_sftp_tabs.push(tab.id),
+                    Some(_) => new_uploads.push(NewUpload {
+                        tab_id: tab.id,
+                        local,
+                    }),
+                }
+            }
+            if let Some(message) = tab.terminal.take_image_paste_error() {
+                paste_errors.push(message);
+            }
+        }
+        for tab_id in no_sftp_tabs {
+            let _ = tab_id;
+            self.show_toast("远程会话需先连接 SFTP 才能粘贴图片", true);
+        }
+        for tab_id in closed_sftp_tabs {
+            let _ = tab_id;
+            self.show_toast("SFTP 已关闭，图片未能上传", true);
+        }
+        for message in paste_errors {
+            self.show_toast(format!("图片粘贴失败：{message}"), true);
+        }
+        // 1. 新中转经面板 SFTP 发起上传（复用传输进度条，自动展开）。
+        for upload in new_uploads {
+            let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == upload.tab_id) else {
+                continue;
+            };
+            let Some(sftp) = tab.sftp.as_mut() else {
+                self.show_toast("远程会话需先连接 SFTP 才能粘贴图片", true);
+                continue;
+            };
+            let name = upload
+                .local
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "mino-paste.png".to_string());
+            let remote = crate::views::sftp_view::join_path(sftp.current_remote_dir(), &name);
+            let transfer_id = sftp.upload_local_file(&upload.local);
+            self.pending_image_paste = Some(PendingImagePaste {
+                tab_id: tab.id,
+                remote_path: remote,
+                transfer_id,
+            });
+            ctx.request_repaint();
+        }
+        // 3. 上传完成即写远端 token（`SftpView::poll_events` 已消费事件，
+        // 此处按传输 id 在面板传输记录中确认完成/失败）。
+        let Some(pending) = self.pending_image_paste.take() else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == pending.tab_id) else {
+            return;
+        };
+        let Some(sftp) = tab.sftp.as_mut() else {
+            self.show_toast("SFTP 已关闭，图片未能上传", true);
+            return;
+        };
+        match sftp.transfer_result(pending.transfer_id) {
+            Some(true) => {
+                let token = format!(
+                    "@{}",
+                    crate::clip_image::shell_escape_for_token(&pending.remote_path)
+                );
+                tab.terminal.session().write(token.as_bytes());
+                tab.terminal.push_pasted_text(&token);
+                ctx.request_repaint();
+            }
+            Some(false) => {
+                self.show_toast("图片上传失败，详见 SFTP 面板", true);
+            }
+            None => {
+                // 传输仍在进行中：放回等待，下一帧继续。
+                self.pending_image_paste = Some(pending);
             }
         }
     }
@@ -3365,6 +3483,7 @@ impl eframe::App for MinoApp {
         self.poll_connection(&ctx);
         self.poll_sftp();
         self.poll_locate_pending(&ctx);
+        self.poll_image_paste(&ctx);
         self.poll_update();
         self.poll_download(&ctx);
         self.poll_install(&ctx);

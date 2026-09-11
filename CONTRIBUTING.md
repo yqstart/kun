@@ -12,7 +12,7 @@
 ## 本地运行
 
 ```bash
-git clone https://github.com/yqstart/kun.git
+git clone https://github.com/yqstart/mino.git
 cd mino
 cargo run
 ```

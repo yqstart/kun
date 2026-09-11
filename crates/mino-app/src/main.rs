@@ -2,6 +2,7 @@
 
 pub mod anim;
 mod app;
+pub mod clip_image;
 pub mod dialog;
 mod native;
 pub mod perf;

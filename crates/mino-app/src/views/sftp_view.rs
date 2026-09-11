@@ -1,5 +1,7 @@
 //! SFTP 面板：远程文件浏览、传输进度与文件操作。
 
+use std::path::Path;
+
 use egui::{RichText, Ui};
 use mino_core::ssh::sftp::{RemoteEntry, SftpEvent, SftpHandle};
 use tokio::sync::mpsc::Receiver;
@@ -1445,15 +1447,44 @@ impl SftpView {
             return;
         }
         if let Some(path) = rfd::FileDialog::new().pick_file() {
-            let name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "file".to_string());
-            let label = format!("上传 {name}");
-            let total = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-            let remote = self.join(&name);
-            let id = self.handle.upload(&path, &remote);
-            self.begin_transfer(id, label, total);
+            self.upload_local_file(&path);
+        }
+    }
+
+    /// 上传指定的本地文件到当前远程目录（图片粘贴的 SFTP 中转复用此入口）。
+    pub fn upload_local_file(&mut self, path: &Path) -> u64 {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_string());
+        let label = format!("上传 {name}");
+        let total = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        let remote = self.join(&name);
+        let id = self.handle.upload(path, &remote);
+        self.begin_transfer(id, label, total);
+        id
+    }
+
+    /// 当前远程目录（图片粘贴上传后写远端 token 用）。
+    pub fn current_remote_dir(&self) -> &str {
+        &self.current_path
+    }
+
+    /// 面板是否已关闭（图片粘贴无 SFTP 时上层据此提示）。
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// 查询传输结果（图片粘贴上传完成判定用）：
+    /// `Some(true)` 完成、`Some(false)` 失败、`None` 仍在进行中/未知 id。
+    pub fn transfer_result(&self, id: u64) -> Option<bool> {
+        let transfer = self.transfers.iter().find(|t| t.id == id)?;
+        if transfer.failed {
+            Some(false)
+        } else if transfer.finished {
+            Some(true)
+        } else {
+            None
         }
     }
 
