@@ -39,6 +39,10 @@ struct RowCache {
 /// CJK 字形经 fallback 字体实际宽度 ≠ 2× 等宽 cell，
 /// 后续字符整体左移，输入越多光标漂移越远。
 /// 分段绘制恢复「终端列 = 屏幕列」的不变量。
+///
+/// 宽字符段严格只含**一个**宽字符（见 `push_or_merge`）：段内多字符仍按字体
+/// 实际 advance 排字，CJK 的 1em advance（PingFang/Heiti 13px）比双列
+/// （2×cell_width ≈ 16.1px）窄，同段连续排字会重新累积漂移。
 #[derive(Clone)]
 struct CachedRun {
     /// 起始终端列（含宽字符占用的双列）。
@@ -46,6 +50,13 @@ struct CachedRun {
     /// 已布局文本（绘制直接使用，无需 layout_job）。
     galley: std::sync::Arc<egui::Galley>,
 }
+
+/// 宽字符 Galley 缓存键。
+///
+/// 宽字符段恒为单字符，同一（字符, 影响布局的样式）的 Galley 可跨行跨帧复用，
+/// 中文文本字符高度重复，layout 实际只发生一次。粗体不参与——它只经 `fg`
+/// 映射到亮色（见 `singleline_job`）；背景不参与——背景由背景段单独绘制。
+type WideGlyphKey = (char, Color32, bool, bool, bool);
 
 /// 文本段（合并相邻相同前景样式的 cell；`start_col` 为终端列定位用）。
 struct Segment {
@@ -56,7 +67,7 @@ struct Segment {
     italic: bool,
     underline: bool,
     strikeout: bool,
-    /// 本段是否为宽字符段（CJK/emoji，占双列；与半角不混排）。
+    /// 本段是否为宽字符段（CJK/emoji，占双列；恒为单字符，与半角不混排）。
     is_wide: bool,
 }
 
@@ -155,6 +166,9 @@ pub struct TerminalView {
     last_ppp: f32,
     /// 上次渲染时的主题修订号（主题切换后 Galley/背景均需失效）。
     last_theme_revision: u64,
+    /// 宽字符（CJK/emoji）Galley 缓存：同一字符的布局跨行跨帧复用
+    /// （宽字符段恒为单字符，定位由终端列决定、与内容无关）。
+    wide_glyphs: HashMap<WideGlyphKey, std::sync::Arc<egui::Galley>>,
     focus_id: egui::Id,
     initialized: bool,
     last_mode: TermMode,
@@ -236,6 +250,7 @@ impl TerminalView {
             rows: 0,
             last_ppp: 0.0,
             last_theme_revision: crate::theme::theme_revision(),
+            wide_glyphs: HashMap::new(),
             focus_id: egui::Id::new("terminal_view"),
             initialized: false,
             last_mode: TermMode::NONE,
@@ -505,6 +520,7 @@ impl TerminalView {
             self.cell_height = cell_height;
             // Galley 与 pixels_per_point 绑定：缩放变化后旧布局失效，全量重建。
             self.rows_cache.clear();
+            self.wide_glyphs.clear();
         }
         let cell_width = self.cell_width;
         let cell_height = self.cell_height;
@@ -635,20 +651,22 @@ impl TerminalView {
         // 先为新构建的行做文本布局并写缓存（命中行不进入此循环）。
         // 每个分段独立 layout（单行不换行），绘制时按终端列定位——
         // 避免整行 LayoutJob 的字体实际 advance 累积漂移（CJK 宽字符）。
+        // 宽字符段恒为单字符，Galley 按 (字符, 样式) 跨行跨帧复用。
         for (grid_line, data) in &lines_data {
             let mut runs = Vec::with_capacity(data.segments.len());
             for seg in &data.segments {
-                let galley = ui.fonts_mut(|f| {
-                    f.layout_job(singleline_job(
-                        &seg.text,
-                        self.font_size,
-                        seg.fg,
-                        seg.bold,
-                        seg.italic,
-                        seg.underline,
-                        seg.strikeout,
-                    ))
-                });
+                let galley = match wide_glyph_key(seg) {
+                    Some(key) => {
+                        if let Some(cached) = self.wide_glyphs.get(&key) {
+                            cached.clone()
+                        } else {
+                            let galley = layout_segment(ui, seg, self.font_size);
+                            self.wide_glyphs.insert(key, galley.clone());
+                            galley
+                        }
+                    }
+                    None => layout_segment(ui, seg, self.font_size),
+                };
                 runs.push(CachedRun {
                     start_col: seg.start_col,
                     galley,
@@ -868,18 +886,29 @@ impl TerminalView {
         if !input_enabled || !ui.memory(|m| m.has_focus(self.focus_id)) {
             return;
         }
-        // 候选窗跟随：光标矩形即组字起点；滚出视口（None）时退到行首，
+        // 候选窗跟随：egui-winit 0.36 的 winit 后端调 `set_ime_cursor_area`
+        // 时只用 `IMEOutput.rect`（忽略 `cursor_rect`，见 egui-winit
+        // `handle_platform_output_inner`），macOS 经
+        // `firstRectForCharacterRange` 拿到的就是这个矩形——`rect` 必须是
+        // 光标 cell 级小矩形。曾传整个终端 `inner`，候选窗落在终端左下角一带、
+        // 远离实际输入位置。滚出视口（None）时退到首行行首单 cell，
         // 保证输入法窗口仍落在终端区域内、不飘到屏幕角落。
         let cursor_rect = cursor_rect.unwrap_or_else(|| {
             Rect::from_min_size(inner.min, Vec2::new(self.cell_width, self.cell_height))
         });
+        // 与 TextEdit 同口径转全局坐标（popup/layer 变换下才与屏幕对齐）。
+        let to_global = ui
+            .ctx()
+            .layer_transform_to_global(ui.layer_id())
+            .unwrap_or_default();
+        let cursor_global = to_global * cursor_rect;
         ui.ctx().output_mut(|o| {
             o.ime = Some(egui::output::IMEOutput {
                 // Terminal 语义：macOS 下输入法候选窗跟随光标、不接管回车
                 // 确认行为（Normal 会让部分输入法把回车当确认键吃掉）。
                 purpose: egui::IMEPurpose::Terminal,
-                rect: inner,
-                cursor_rect,
+                rect: cursor_global,
+                cursor_rect: cursor_global,
                 should_interrupt_composition: false,
             });
         });
@@ -1505,7 +1534,7 @@ enum InputAction {
 /// `dead_code` 误报用 allow 压住——它是给回归测试用的，不是无用代码。
 #[cfg(test)]
 #[allow(dead_code)]
-pub(super) fn tests_grid_text(session: &Session) -> String {
+pub(crate) fn tests_grid_text(session: &Session) -> String {
     use alacritty_terminal::term::cell::Flags;
     let term_arc = session.term();
     let guard = term_arc.lock();
@@ -1952,9 +1981,15 @@ impl CellStyle {
 
 /// 合并或追加一个 cell 到段列表。
 ///
-/// 合并条件：相同样式 **且** 字宽一致（宽字符与半角不混排）。
+/// 合并条件：相同样式 **且** 字宽一致（宽字符与半角不混排），且当前 cell
+/// **不是宽字符**——宽字符恒单独成段。
 /// 同段内字宽一致 → 分段绘制 `x = start_col * cell_width` 精确对齐，
 /// 无字体实际 advance 的累积漂移（见 `CachedRun`）。
+/// 宽字符必须单独成段：字体对 CJK 的 advance 是 1em（13px），双列宽是
+/// 2×cell_width（SF Mono 13px 字号下 16.1px），若同段连续排字，段内每字
+/// 少 3.1px，5 个字就漂 15px——表现为「中文越打越多，光标离文字越远、
+/// 文字与后面内容之间出现一片空白」。单字符段按终端列定位后，段内无排字，
+/// 每个宽字符精确落在自己的双列起点。
 fn push_or_merge(
     segments: &mut Vec<Segment>,
     col: usize,
@@ -1965,12 +2000,13 @@ fn push_or_merge(
     hash: &mut u64,
 ) {
     if let Some(last) = segments.last_mut() {
-        if last.fg == style.fg
+        if !is_wide
+            && !last.is_wide
+            && last.fg == style.fg
             && last.bold == style.bold
             && last.italic == style.italic
             && last.underline == style.underline
             && last.strikeout == style.strikeout
-            && last.is_wide == is_wide
         {
             last.text.push(c);
             if let Some(zero_width) = zero_width {
@@ -2028,6 +2064,37 @@ fn style_key(
         strikeout,
     }
     .key()
+}
+
+/// 为单个文本段 layout 单行 Galley（按段样式）。
+fn layout_segment(ui: &Ui, seg: &Segment, font_size: f32) -> std::sync::Arc<egui::Galley> {
+    ui.fonts_mut(|f| {
+        f.layout_job(singleline_job(
+            &seg.text,
+            font_size,
+            seg.fg,
+            seg.bold,
+            seg.italic,
+            seg.underline,
+            seg.strikeout,
+        ))
+    })
+}
+
+/// 宽字符段的 Galley 缓存键；非宽段、或带零宽组合符的宽字符返回 `None`。
+///
+/// 组合符（基符 + 变音/emoji 连接符）必须整体 shaping，不能拆成单字符 Galley，
+/// 这类宽字符不入缓存、随行重建直接 layout（列定位仍是单字符段，不受影响）。
+fn wide_glyph_key(seg: &Segment) -> Option<WideGlyphKey> {
+    if !seg.is_wide {
+        return None;
+    }
+    let mut chars = seg.text.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some((c, seg.fg, seg.italic, seg.underline, seg.strikeout))
 }
 
 /// 为单个同宽文本段构建单行 LayoutJob（不换行，按给定样式）。
@@ -2716,6 +2783,175 @@ mod tests {
         assert!(
             top_after < top_before,
             "滚动后视口应显示更早的输出行（{top_before} → {top_after}）"
+        );
+    }
+
+    /// 找一条以 `first` 开头的可见行，返回（显示行号, [(终端列, 字符)]）。
+    fn grid_row_starting_with(
+        session: &Session,
+        first: char,
+    ) -> Option<(usize, Vec<(usize, char)>)> {
+        let term_arc = session.term();
+        let guard = term_arc.lock();
+        let content = guard.renderable_content();
+        let display_offset = content.display_offset as i32;
+        let mut rows: Vec<(i32, Vec<(usize, char)>)> = Vec::new();
+        for item in content.display_iter {
+            let line = item.point.line.0;
+            if rows.last().map(|(l, _)| *l) != Some(line) {
+                rows.push((line, Vec::new()));
+            }
+            let cell = item.cell;
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
+                continue;
+            }
+            rows.last_mut()
+                .expect("上面刚压入一行")
+                .1
+                .push((item.point.column.0, cell.c));
+        }
+        rows.into_iter()
+            .find(|(_, cells)| cells.first().map(|(_, c)| *c) == Some(first))
+            .map(|(line, cells)| ((line + display_offset).max(0) as usize, cells))
+    }
+
+    /// 回归：中文宽字符按终端列（双列）绘制，不在字符间留下累积空白。
+    ///
+    /// 用户现象：中文越打越多，光标离文字越来越远、中文与后面内容之间出现
+    /// 一片空白。根因：字体对 CJK 的 advance 是 1em（13px），而一个宽字符占
+    /// 两列（2×cell_width ≈ 16.1px）；连续的宽字符若放进同一个 Galley，egui
+    /// 按字体实际 advance 排字，段内每字少 3.1px、越打越左漂，直到下一个按
+    /// 终端列绝对定位的分段才复位——漂移量全变成可见空白。
+    /// 断言（像素级）：①5 个中文字各自一个墨迹簇、起点贴住各自双列起点；
+    /// ②中文末笔到后续半角字符的间距 < 一个 cell（无空白漂移）。
+    #[test]
+    #[cfg(target_os = "macos")] // 依赖系统中文 fallback 字体（PingFang/STHeiti）
+    fn 中文宽字符按终端列对齐() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        // 字体必须在首帧前装好：cell_width 与宽字符 Galley 都按首帧字体缓存
+        // （kittest 默认字体没有中文字形，也量不出真实 cell_width）。
+        crate::setup_fonts(&harness.ctx);
+        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
+        // 字体链必须真能画中文：缺字形时测到的是占位符宽度，断言无意义。
+        // （`set_fonts` 在下一帧 begin_pass 生效，故须等跑过帧再查。）
+        assert!(
+            harness
+                .ctx
+                .fonts_mut(|f| f.has_glyphs(&FontId::monospace(13.0), "中")),
+            "等宽字体链缺少中文字形，无法验证中文列对齐"
+        );
+
+        // 输出一行「中中中中中ab」：5 个中文占 0/2/4/6/8 列，半角紧随其后。
+        view.borrow()
+            .session()
+            .write("printf '中中中中中ab\\n'\r".as_bytes());
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            harness.step();
+            if grid_row_starting_with(view.borrow().session(), '中').is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        // 再多跑一帧让该行进入渲染，然后按下帧同一时刻的网格读行号。
+        harness.step();
+        let (row_v, cells) =
+            grid_row_starting_with(view.borrow().session(), '中').expect("终端未出现中文输出行");
+        assert_eq!(
+            &cells[..7],
+            &[
+                (0, '中'),
+                (2, '中'),
+                (4, '中'),
+                (6, '中'),
+                (8, '中'),
+                (10, 'a'),
+                (11, 'b')
+            ],
+            "中文输出行的网格列不符"
+        );
+
+        // 渲染该行后按像素核对墨迹列（终端列 → 屏幕列的唯一映射是
+        // `inner.left() + col * cell_width`）。
+        let img = harness.render().expect("渲染失败");
+        let (cell_width, cell_height) = {
+            let v = view.borrow();
+            (v.cell_width, v.cell_height)
+        };
+        let bg = crate::theme::current_theme().term_bg;
+        // 终端面板边界：kittest 的 CentralPanel 外层留 8px 白边，视图用
+        // `max_rect()` 铺满面板——取非留白像素的包围盒即面板矩形。
+        let margin_bg = *img.get_pixel(2, 2);
+        let (mut x0, mut x1, mut y0, mut y1) = (u32::MAX, 0, u32::MAX, 0);
+        for (x, y, p) in img.enumerate_pixels() {
+            if *p != margin_bg {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+        let outer = Rect::from_min_max(
+            egui::pos2(x0 as f32, y0 as f32),
+            egui::pos2(x1 as f32 + 1.0, y1 as f32 + 1.0),
+        );
+        let inner = outer.shrink(PADDING);
+        let row_top = inner.top() + row_v as f32 * cell_height;
+        let band = (row_top.max(0.0) as u32)..((row_top + cell_height) as u32);
+        let is_ink = |x: u32| {
+            band.clone().any(|y| {
+                let p = img.get_pixel(x, y);
+                let d = |a: u8, b: u8| (i32::from(a) - i32::from(b)).abs();
+                d(p[0], bg.r).max(d(p[1], bg.g)).max(d(p[2], bg.b)) > 24
+            })
+        };
+        // 行内墨迹列 → 连续墨迹簇。
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for x in (0..img.width()).filter(|x| is_ink(*x)) {
+            match runs.last_mut() {
+                Some(last) if last.1 + 1 == x => last.1 = x,
+                _ => runs.push((x, x)),
+            }
+        }
+        let cjk_end = inner.left() + 10.0 * cell_width;
+        let cjk: Vec<(u32, u32)> = runs
+            .iter()
+            .copied()
+            .filter(|(start, _)| (*start as f32) < cjk_end)
+            .collect();
+        assert_eq!(
+            cjk.len(),
+            5,
+            "5 个中文字应各自成一个墨迹簇（宽字漂移会粘连或留空），实际 {cjk:?}"
+        );
+        for (i, (start, _)) in cjk.iter().enumerate() {
+            let got = *start as f32 - cjk[0].0 as f32;
+            let expect = 2.0 * i as f32 * cell_width;
+            assert!(
+                (got - expect).abs() <= 2.5,
+                "第 {i} 个中文字墨迹起点距首字 {got:.1}px，应为 {expect:.1}px（双列）"
+            );
+        }
+        let a_ink = runs
+            .iter()
+            .map(|(start, _)| *start)
+            .find(|x| (*x as f32) >= cjk_end)
+            .expect("未找到中文之后的半角字符墨迹");
+        let gap = a_ink as f32 - cjk.last().expect("已断言非空").1 as f32;
+        assert!(
+            gap < cell_width,
+            "中文末笔 {a_ink}px 到后续半角墨迹之间有 {gap:.1}px 空白（应 < 一个 cell {cell_width:.1}px）"
         );
     }
 }
@@ -3507,7 +3743,9 @@ mod cell_semantics_tests {
 
     /// 回归：中文输入越多光标漂移越远——整行 LayoutJob 按 fallback 字体实际
     /// advance 排字，CJK 实际宽度 ≠ 2×cell，后续字符整体左移。
-    /// 修复要求：宽字符与半角不混排（各自分段），分段按终端列定位绘制。
+    /// 修复要求：宽字符**每个 cell 单独成段**、半角另起新段，分段按终端列定位绘制。
+    /// 宽字符不能合并同类段：段内仍按字体实际 advance 排字，CJK 的 1em（13px）
+    /// 比双列（2×cell_width ≈ 16.1px）窄，连续排字每字少 3.1px，越长漂越远。
     #[test]
     fn 中文与半角分段列定位() {
         let theme = crate::theme::current_theme();
@@ -3537,16 +3775,17 @@ mod cell_semantics_tests {
             theme.term_bg,
             to_egui(theme.term_bg),
         );
-        // 宽字符起新段、半角另起新段：[现在][ab]，列定位 0/4。
-        // （连续同宽字符可合并：同段内字宽一致即可，分段绘制时按列定位，
-        // 无字体实际 advance 的累积漂移。）
-        assert_eq!(data.segments.len(), 2, "宽字符与半角须分段");
-        assert_eq!(data.segments[0].text, "现在");
-        assert_eq!(data.segments[0].start_col, 0);
-        assert!(data.segments[0].is_wide);
-        assert_eq!(data.segments[1].text, "ab  ");
-        assert_eq!(data.segments[1].start_col, 4);
-        assert!(!data.segments[1].is_wide);
+        // 每个宽字符独立成段（按自身双列起点定位），半角自成一列：[现][在][ab  ]。
+        let texts: Vec<&str> = data.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["现", "在", "ab  "], "宽字符须逐 cell 成段");
+        let cols: Vec<usize> = data.segments.iter().map(|s| s.start_col).collect();
+        assert_eq!(cols, vec![0, 2, 4], "分段起点 = 终端列");
+        assert!(data.segments[0].is_wide && data.segments[1].is_wide);
+        assert!(!data.segments[2].is_wide);
+        // 每个宽字符段都是单字符 → 可走 (字符, 样式) Galley 缓存。
+        assert_eq!(wide_glyph_key(&data.segments[0]).map(|k| k.0), Some('现'));
+        assert_eq!(wide_glyph_key(&data.segments[1]).map(|k| k.0), Some('在'));
+        assert_eq!(wide_glyph_key(&data.segments[2]), None);
     }
 
     /// 同色纯半角仍合并为一段（分段绘制不增加 layout 开销）。
@@ -3826,16 +4065,107 @@ mod ime_backspace_tests {
             egui::IMEPurpose::Terminal,
             "终端 IME 应用途声明 Terminal 语义"
         );
+        // egui-winit 0.36 只用 `rect` 定位候选窗（忽略 cursor_rect）：
+        // rect 必须是光标 cell 级小矩形。曾传整个终端区域，候选窗落在
+        // 终端左下角一带、远离实际输入位置（用户报告"输入法不在输入位置附近"）。
+        let (cell_w, cell_h) = (view.borrow().cell_width, view.borrow().cell_height);
+        assert!(cell_w > 0.0 && cell_h > 0.0, "cell 尺寸应在首帧后就绪");
         assert!(
-            ime.rect.width() > 0.0 && ime.rect.height() > 0.0,
-            "IME 区域应为终端区域，实际：{:?}",
+            (ime.rect.width() - cell_w).abs() < 1.0 && (ime.rect.height() - cell_h).abs() < 1.0,
+            "IME rect 应为光标 cell 大小（{cell_w:.1}x{cell_h:.1}），实际：{:?}",
             ime.rect
         );
+        assert_eq!(
+            ime.rect, ime.cursor_rect,
+            "rect 与 cursor_rect 应一致（后端只消费 rect）"
+        );
+    }
+
+    /// 终端光标位置快照（网格行，网格列，display_offset）。
+    fn cursor_disp_pos(session: &Session) -> (i32, i32, usize) {
+        let term_arc = session.term();
+        let guard = term_arc.lock();
+        let content = guard.renderable_content();
+        (
+            content.cursor.point.line.0,
+            content.cursor.point.column.0 as i32,
+            content.display_offset,
+        )
+    }
+
+    /// 候选窗跟随终端光标：egui-winit 只用 `IMEOutput.rect` 调
+    /// `set_ime_cursor_area` 定位候选窗，光标移动后 rect 必须同步移动。
+    ///
+    /// 回归用户报告"输入法不在输入位置附近、而在终端左下方"：
+    /// 根因是 rect 曾传整个终端区域，macOS 按该矩形左下角放候选窗。
+    #[test]
+    #[allow(non_snake_case)]
+    fn IME候选窗跟随终端光标() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        // 等 shell 启动输出稳定（光标连续多帧不动），否则 prompt 绘制
+        // 干扰"移动前后"的差值比较。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut last = cursor_disp_pos(view.borrow().session());
+        let mut stable = 0;
+        while stable < 3 && Instant::now() < deadline {
+            harness.step();
+            std::thread::sleep(Duration::from_millis(100));
+            let cur = cursor_disp_pos(view.borrow().session());
+            if cur == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = cur;
+            }
+        }
+        let before = harness
+            .output()
+            .platform_output
+            .ime
+            .expect("聚焦终端应声明 IME 意图")
+            .rect;
+        let (r0, c0, o0) = last;
+        // 右移 5 列、下移 2 行（CSI 直接进 PTY，不依赖 shell 回显）。
+        view.borrow().session().write(b"\x1b[5C\x1b[2B");
+        std::thread::sleep(Duration::from_millis(200));
+        harness.run_steps(6);
+        let after = harness
+            .output()
+            .platform_output
+            .ime
+            .expect("移动后仍应声明 IME 意图")
+            .rect;
+        let (r1, c1, o1) = cursor_disp_pos(view.borrow().session());
+        assert_ne!((r1, c1), (r0, c0), "CSI 光标移动未生效，差值比较无意义");
+        let (cell_w, cell_h) = (view.borrow().cell_width, view.borrow().cell_height);
         assert!(
-            ime.rect.contains_rect(ime.cursor_rect) || ime.cursor_rect.width() > 0.0,
-            "光标矩形应落在终端区域内，实际：{:?} / {:?}",
-            ime.rect,
-            ime.cursor_rect
+            ((after.min.x - before.min.x) - (c1 - c0) as f32 * cell_w).abs() < 1.0,
+            "候选窗应随光标列移动：列差 {}，rect x 差 {:.1}，实际 {:?} / {:?}",
+            c1 - c0,
+            after.min.x - before.min.x,
+            before,
+            after
+        );
+        assert!(
+            ((after.min.y - before.min.y) - ((r1 + o1 as i32) - (r0 + o0 as i32)) as f32 * cell_h)
+                .abs()
+                < 1.0,
+            "候选窗应随光标行移动：显示行差 {}，rect y 差 {:.1}，实际 {:?} / {:?}",
+            (r1 + o1 as i32) - (r0 + o0 as i32),
+            after.min.y - before.min.y,
+            before,
+            after
         );
     }
 

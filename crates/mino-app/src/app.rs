@@ -150,9 +150,50 @@ impl TerminalTab {
         }
     }
 
-    /// 标签显示标题：只显示应用设置的名称，不采用 shell 上报的路径标题。
-    fn title(&self) -> &str {
-        &self.label
+    /// 标签/状态栏标题：`(显示文本, 全路径悬浮提示)`。
+    ///
+    /// - 本地标签：当前目录的**末级文件夹名**（与 zsh `%c` 提示符一致，home
+    ///   显示 `~`）+ 全路径提示。目录来自终端输入跟踪（`cd` 回车后更新、
+    ///   `pwd` 输出校正）；**不**采用 shell 上报的窗口标题——oh-my-zsh 的
+    ///   标题是截断过的 `%15<..<%~%<<`，既非末级目录名也拿不到完整路径。
+    /// - 远程标签：主机名（远端目录由 sshd 决定、本地跟踪器不适用，主机名
+    ///   才是用户认得的身份），无悬浮提示；`label` 仅在目录未知时兜底。
+    fn title(&self) -> (String, Option<String>) {
+        match self.local_dir() {
+            Some((name, full)) => (name, Some(full)),
+            None => (self.label.clone(), None),
+        }
+    }
+
+    /// 本地会话的 `(末级目录名, 全路径)`；远程会话返回 `None`。
+    fn local_dir(&self) -> Option<(String, String)> {
+        if self.terminal.session().is_remote() {
+            return None;
+        }
+        // 本地会话的目录由终端输入跟踪（`cd` 回车后更新，`pwd` 输出校正）。
+        let full = self.terminal.current_directory()?;
+        Some((dir_display_name(&full), full))
+    }
+}
+
+/// 目录的展示名：只保留最末级文件夹名（与 zsh `%c` 提示符语义一致）。
+///
+/// - home 显示 `~`、根目录显示 `/`（`%c` 同样如此，避免标签写着用户名）；
+/// - 尾随 `/` 先剥掉，`/Users/me/proj/` 与 `/Users/me/proj` 同名。
+fn dir_display_name(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if !home.is_empty() && trimmed == home.trim_end_matches('/') {
+            return "~".to_string();
+        }
+    }
+    match Path::new(trimmed).file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => trimmed.to_string(),
     }
 }
 
@@ -2386,7 +2427,8 @@ impl MinoApp {
             let mut switch_to: Option<usize> = None;
             let mut close_idx: Option<usize> = None;
             for (i, tab) in self.tabs.iter().enumerate() {
-                let title = tab.title();
+                // 本地标签显示当前目录的末级名，全路径作悬浮提示。
+                let (title, title_tooltip) = tab.title();
                 let selected = i == self.active_tab;
                 // 数字索引前缀：与终端主流 Tab 习惯一致（1, 2, ...）。
                 let prefix = format!("{} ", i + 1);
@@ -2436,23 +2478,26 @@ impl MinoApp {
                                     );
                                     // 无边框透明按钮（selectable_label 选中自带边框，
                                     // 与手绘高亮叠加会形成"双重框"）。
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new(title).size(12.5).color(
-                                                    if selected {
-                                                        theme.accent
-                                                    } else {
-                                                        theme.text_muted
-                                                    },
-                                                ),
-                                            )
-                                            .fill(egui::Color32::TRANSPARENT)
-                                            .stroke(egui::Stroke::NONE)
-                                            .corner_radius(crate::theme::tokens::RADIUS_ITEM),
+                                    let title_resp = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new(title).size(12.5).color(
+                                                if selected {
+                                                    theme.accent
+                                                } else {
+                                                    theme.text_muted
+                                                },
+                                            ),
                                         )
-                                        .clicked()
-                                    {
+                                        .fill(egui::Color32::TRANSPARENT)
+                                        .stroke(egui::Stroke::NONE)
+                                        .corner_radius(crate::theme::tokens::RADIUS_ITEM),
+                                    );
+                                    // 悬浮展示终端当前目录的全路径。
+                                    let title_resp = match &title_tooltip {
+                                        Some(full) => title_resp.on_hover_text(full),
+                                        None => title_resp,
+                                    };
+                                    if title_resp.clicked() {
                                         switch_to = Some(i);
                                     }
                                     ui.add_space(1.0);
@@ -2597,15 +2642,18 @@ impl MinoApp {
             ui.add_space(6.0);
             if let Some(tab) = self.tabs.get(self.active_tab) {
                 let session = tab.terminal.session();
-                // 状态栏与标签栏使用同一应用标题，不显示 shell 上报的路径。
-                let title = tab.title();
+                // 与标签栏同一标题（本地为当前目录末级名，远程为主机名）。
+                let (title, title_tooltip) = tab.title();
                 let exited = session.has_exited();
                 status_dot(ui, if exited { theme.danger } else { theme.success }, false);
-                ui.label(
+                let title_label = ui.label(
                     egui::RichText::new(title)
                         .size(11.5)
                         .color(theme.text_secondary),
                 );
+                if let Some(full) = title_tooltip {
+                    title_label.on_hover_text(full);
+                }
                 if exited {
                     ui.colored_label(theme.danger, "会话已退出");
                 }
@@ -4687,10 +4735,15 @@ mod tab_tests {
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
+        // 本地标签标题 = 当前目录末级名（启动即 home → `~`），
+        // 不采用 shell 上报的窗口标题（oh-my-zsh 的标题是截断过的路径）。
+        let (title, tooltip) = harness.state().tabs[0].title();
+        let home = std::env::var("HOME").expect("测试环境应有 HOME");
+        assert_eq!(title, "~", "启动目录 home 应显示为 `~`");
         assert_eq!(
-            harness.state().tabs[0].title(),
-            "本地终端",
-            "本地标签标题不应跟随 shell 的路径标题变化"
+            tooltip.as_deref(),
+            Some(home.as_str()),
+            "悬浮提示应为全路径"
         );
         assert_eq!(
             harness.query_all_by_label("×").count(),
@@ -4774,6 +4827,190 @@ mod tab_tests {
             0,
             "全部关闭后应无 × 按钮"
         );
+    }
+
+    /// 目录展示名 = 最末级文件夹名（zsh `%c` 语义）。
+    #[test]
+    fn 目录展示名只保留末级() {
+        assert_eq!(dir_display_name("/Users/me/proj"), "proj");
+        assert_eq!(dir_display_name("/Users/me/proj/"), "proj");
+        assert_eq!(dir_display_name("/"), "/");
+        assert_eq!(dir_display_name(""), "/");
+        let home = std::env::var("HOME").expect("测试环境应有 HOME");
+        assert_eq!(dir_display_name(&home), "~");
+        assert_eq!(dir_display_name(&format!("{home}/")), "~");
+        // home 内的子目录仍只显示末级名（不缩写为 `~/x`）。
+        assert_eq!(dir_display_name(&format!("{home}/proj")), "proj");
+    }
+
+    /// 本地标签标题跟随终端当前目录：只显示末级文件夹名，悬浮提示给全路径。
+    ///
+    /// 目录来源是终端输入跟踪（`cd` 回车后更新），不采用 shell 上报的窗口
+    /// 标题——oh-my-zsh 的标题是截断过的 `%15<..<%~%<<`，既非末级目录名也
+    /// 拿不到完整路径。
+    #[test]
+    fn 本地标签标题跟随当前目录() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+
+        let base = std::env::temp_dir().join(format!("mino-tab-title-{}", std::process::id()));
+        let project = base.join("proj-alpha");
+        std::fs::create_dir_all(&project).expect("创建测试目录失败");
+
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let tab = Rc::new(RefCell::new(TerminalTab::new(
+            1,
+            "本地终端".into(),
+            TerminalView::new(session),
+        )));
+        let show = tab.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            show.borrow_mut().terminal.show(ui);
+        });
+        harness.run_steps(6);
+
+        // 启动目录 = home → `~`（与 zsh 提示符一致），提示为全路径。
+        let home = std::env::var("HOME").expect("测试环境应有 HOME");
+        let (title, tooltip) = tab.borrow().title();
+        assert_eq!(title, "~", "启动目录 home 应显示为 `~`");
+        assert_eq!(tooltip.as_deref(), Some(home.as_str()));
+
+        // 等 shell 就绪（独立哨兵输出，不依赖目录名）。
+        harness.event(egui::Event::Text("printf __MINO_TAB_READY__".into()));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            harness.step();
+            let text =
+                crate::views::terminal_view::tests_grid_text(tab.borrow().terminal.session());
+            if text.contains("__MINO_TAB_READY__") {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(ready, "zsh 未就绪");
+
+        // cd 进嵌套目录：标题只显示末级名，提示给完整（已规范化）路径。
+        harness.event(egui::Event::Text(format!("cd {}", project.display())));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let expected = std::fs::canonicalize(&project)
+            .expect("规范化测试目录失败")
+            .to_string_lossy()
+            .into_owned();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut followed = false;
+        while Instant::now() < deadline {
+            harness.step();
+            let (title, tooltip) = tab.borrow().title();
+            if title == "proj-alpha" && tooltip.as_deref() == Some(expected.as_str()) {
+                followed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        let (title, tooltip) = tab.borrow().title();
+        assert!(
+            followed,
+            "cd 后标题未跟随目录：title={title:?} tooltip={tooltip:?}（期望 proj-alpha / {expected}）"
+        );
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    /// 标签栏与状态栏都渲染当前目录的末级名（不再是固定 "本地终端"），
+    /// 悬浮标题显示全路径。
+    #[test]
+    fn 标签栏与状态栏显示当前目录名() {
+        use kittest::Queryable;
+        use std::time::{Duration, Instant};
+
+        let base = std::env::temp_dir().join(format!("mino-tab-label-{}", std::process::id()));
+        let project = base.join("proj-beta");
+        std::fs::create_dir_all(&project).expect("创建测试目录失败");
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
+        harness.run_steps(6);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            harness.step();
+            let text = crate::views::terminal_view::tests_grid_text(
+                harness.state().tabs[0].terminal.session(),
+            );
+            if !text.trim().is_empty() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(ready, "zsh 未就绪");
+
+        harness.event(egui::Event::Text(format!("cd {}", project.display())));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let expected = std::fs::canonicalize(&project)
+            .expect("规范化测试目录失败")
+            .to_string_lossy()
+            .into_owned();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut shown = false;
+        while Instant::now() < deadline {
+            harness.step();
+            if harness.query_all_by_label("proj-beta").count() == 2 {
+                shown = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        let tab_title = crate::views::terminal_view::tests_grid_text(
+            harness.state().tabs[0].terminal.session(),
+        );
+        assert!(
+            shown,
+            "标签栏与状态栏应各显示一次目录名，实际 “proj-beta” 出现 {} 次；终端内容：\n{tab_title}",
+            harness.query_all_by_label("proj-beta").count()
+        );
+
+        // 悬浮标签标题 → 全路径提示。
+        harness
+            .query_all_by_label("proj-beta")
+            .next()
+            .expect("标签标题节点缺失")
+            .hover();
+        for _ in 0..4 {
+            harness.step();
+        }
+        assert_eq!(
+            harness.query_all_by_label(&expected).count(),
+            1,
+            "悬浮标签标题应显示全路径 {expected}"
+        );
+        std::fs::remove_dir_all(base).ok();
     }
 
     /// 最后一个标签关闭后，空状态不能紧贴顶部标签栏，且快捷键应作为独立键帽渲染。
@@ -5095,10 +5332,11 @@ mod settings_tests {
             hud.rect().bottom(),
             viewport.bottom()
         );
-        // 与左侧会话标题同处一行（垂直中心对齐）。
+        // 与左侧会话标题同处一行（垂直中心对齐）。启动目录为 home，
+        // 标题显示为 `~`（末级目录名的 home 缩写）。
         let title = harness
             .root()
-            .query_all_by_label_contains("本地终端")
+            .query_all_by_label("~")
             .find(|node| node.rect().bottom() > viewport.bottom() - 40.0)
             .expect("状态栏中应显示会话标题");
         assert!(
