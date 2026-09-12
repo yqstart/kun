@@ -43,6 +43,21 @@ impl Default for HostProfile {
     }
 }
 
+/// 本地项目收藏（仅本地目录，不绑定远程主机）。
+///
+/// 打开即新建本地终端标签（工作目录为 `path`），`command` 非空时在
+/// 会话建立后自动执行一条启动命令（视觉等价用户在首个提示符后粘贴回车）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectProfile {
+    /// 显示名称。
+    pub name: String,
+    /// 本地目录。
+    pub path: PathBuf,
+    /// 打开后自动执行的启动命令（可空）。
+    #[serde(default)]
+    pub command: String,
+}
+
 /// 全部主机配置。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostConfig {
@@ -55,6 +70,9 @@ pub struct HostConfig {
     /// 处理（曾无此字段，切换皮肤退出重进永远回到第一套）。
     #[serde(default)]
     pub theme: String,
+    /// 收藏的本地项目（老配置缺字段时默认空）。
+    #[serde(default)]
+    pub projects: Vec<ProjectProfile>,
 }
 
 impl HostConfig {
@@ -143,6 +161,11 @@ mod tests {
                     passphrase: None,
                 },
             }],
+            projects: vec![ProjectProfile {
+                name: "演示项目".into(),
+                path: PathBuf::from("/tmp/mino-demo"),
+                command: "echo hi".into(),
+            }],
         }
     }
 
@@ -164,6 +187,29 @@ mod tests {
         // 启动按默认主题处理（此前无持久化，升级用户回到第一套）。
         let parsed: HostConfig = toml::from_str("").unwrap();
         assert_eq!(parsed.theme, "");
+    }
+
+    #[test]
+    fn 项目序列化与反序列化() {
+        let config = sample();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            toml_str.contains("command"),
+            "启动命令必须随配置落盘：{toml_str}"
+        );
+        let parsed: HostConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed, config);
+        assert_eq!(parsed.projects[0].command, "echo hi");
+    }
+
+    #[test]
+    fn 老配置缺projects字段时默认空() {
+        let parsed: HostConfig = toml::from_str("").unwrap();
+        assert!(parsed.projects.is_empty());
+        let legacy = "[hosts]\nname = \"a\"\nhost = \"h\"\nport = 22\nuser = \"root\"\n[hosts.auth.Password]\n0 = \"x\"\n";
+        let _ = legacy;
+        let minimal: HostConfig = toml::from_str("theme = \"深蓝\"\n").unwrap();
+        assert!(minimal.projects.is_empty());
     }
 
     #[cfg(unix)]

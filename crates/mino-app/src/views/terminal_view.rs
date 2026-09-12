@@ -172,6 +172,12 @@ pub struct TerminalView {
     focus_id: egui::Id,
     initialized: bool,
     last_mode: TermMode,
+    /// 上次上报给 PTY 的窗口焦点状态（`None` = 尚未上报过）。
+    ///
+    /// 程序用 `DECSET 1004` 打开焦点上报后，终端必须在窗口获得/失去焦点时
+    /// 发 `ESC [ I` / `ESC [ O`；缺了它，依赖焦点事件的程序（vim、tmux、
+    /// omp 等）会一直以为窗口仍处于上一次的状态。
+    last_reported_focus: Option<bool>,
     /// 退格/删除键按下后，下一帧的"空白类" Text 事件应丢弃。
     /// （某些输入法（如微信输入法）退格时会伴随发送空格类文本，
     /// 写入终端表现为"删除键插入空格"；正常字符不受影响）
@@ -254,6 +260,7 @@ impl TerminalView {
             focus_id: egui::Id::new("terminal_view"),
             initialized: false,
             last_mode: TermMode::NONE,
+            last_reported_focus: None,
             suppress_blank_frames: 0,
             workdir: crate::workdir::WorkdirTracker::new(cwd),
             pwd_output_rows: None,
@@ -320,6 +327,15 @@ impl TerminalView {
         Some(self.workdir.cwd().to_string_lossy().into_owned())
     }
 
+    /// 输入跟踪器维护的目录（仅本地标题的内核查询失败时回退用）。
+    pub fn tracked_directory(&self) -> Option<String> {
+        Some(self.workdir.cwd().to_string_lossy().into_owned())
+    }
+    /// 测试用：直接访问工作目录跟踪器（模拟 Tab/粘贴后的失效态）。
+    #[cfg(test)]
+    pub fn workdir_for_test(&mut self) -> &mut crate::workdir::WorkdirTracker {
+        &mut self.workdir
+    }
     /// SFTP 定位前调用：当前输入行为空时向 shell 注入一条 `pwd` 并等待输出。
     ///
     /// 返回 true 表示已注入 `pwd`（调用方应等待若干帧后的定位结果，不要
@@ -397,8 +413,55 @@ impl TerminalView {
             match event {
                 SessionEvent::PtyWrite(text) => self.session.write(text.as_bytes()),
                 SessionEvent::Title(title) => self.cached_title = title,
+                // 程序查询终端配色（OSC 4/10/11/12）：VT 仿真层不知道主题，
+                // 必须由这里给出真实颜色，否则查询永无应答，TUI 只能按
+                // “未知终端”回退（omp 启动时就会查 OSC 11）。
+                SessionEvent::ColorRequest { index, formatter } => {
+                    let color = self.query_color(index);
+                    let reply = formatter(color);
+                    self.session.write(reply.as_bytes());
+                }
+                // 文本区像素尺寸查询（CSI 14 t）：用实际 cell 尺寸换算。
+                SessionEvent::TextAreaSizeRequest(formatter) => {
+                    let size = alacritty_terminal::event::WindowSize {
+                        num_lines: self.rows,
+                        num_cols: self.cols,
+                        cell_width: self.cell_width.max(1.0).round() as u16,
+                        cell_height: self.cell_height.max(1.0).round() as u16,
+                    };
+                    let reply = formatter(size);
+                    self.session.write(reply.as_bytes());
+                }
                 _ => {}
             }
+        }
+    }
+
+    /// 解析终端查询的颜色索引为真实 RGB（与渲染层同一套优先级）。
+    ///
+    /// 优先级与 `resolve_color` 一致：OSC 动态覆盖 > 内置主题调色板。
+    /// 索引语义见 alacritty `term::color`：0-255 调色板、256 前景、
+    /// 257 背景、258 光标；更远的 Dim/Bright 变体用 256 色表兜底。
+    fn query_color(&self, index: usize) -> Rgb {
+        // `Colors` 只实现越界即 panic 的 `Index`，查询索引由终端程序控制，
+        // 必须先做边界检查（269 = alacritty 的 Colors::COUNT）。
+        let stored = {
+            let term = self.session.term();
+            let guard = term.lock();
+            let colors = guard.colors();
+            (index < alacritty_terminal::term::color::COUNT).then(|| colors[index])
+        };
+        if let Some(Some(rgb)) = stored {
+            return rgb;
+        }
+        let theme = crate::theme::current_theme();
+        match index {
+            256 => theme.term_fg,
+            257 => theme.term_bg,
+            258 => theme.term_cursor,
+            0..=255 => crate::theme::xterm256(index as u8, theme.term_palette),
+            // 越界（Dim/Bright 变体）：回落到默认前景，避免给出伪造颜色。
+            _ => theme.term_fg,
         }
     }
 
@@ -801,6 +864,10 @@ impl TerminalView {
             });
         }
         self.had_focus = has_terminal_focus;
+        // 窗口焦点变化上报（DECSET 1004）：程序（vim/tmux/omp 等）开启后
+        // 终端必须在获得/失去焦点时发 `ESC [ I` / `ESC [ O`。
+        let window_focused = ui.ctx().input(|i| i.focused);
+        self.report_focus_change(window_focused);
         // 点击/拖拽区域覆盖整个面板：终端文字不是 egui Label，必须自己维护
         // cell 选区，才能实现 Warp/Terminal.app 习惯的拖选后 ⌘C。
         let surface_rect = ui.max_rect();
@@ -860,6 +927,25 @@ impl TerminalView {
         self.update_ime_output_with_input(ui, inner, cursor_rect, input_enabled);
         if input_enabled && ui.memory(|m| m.has_focus(self.focus_id)) {
             self.handle_input(ui, inner, output_rows);
+        }
+    }
+
+    /// 按窗口焦点变化向 PTY 上报（`DECSET 1004`，xterm 焦点事件）。
+    ///
+    /// 只有状态真的变化、且程序已启用焦点上报时才发；首帧只记录基准
+    /// 状态——程序是在自己启用之后才开始期待事件，补发历史变化会让它
+    /// 收到一个从未发生的「焦点切换」。
+    fn report_focus_change(&mut self, focused: bool) {
+        match self.last_reported_focus {
+            Some(previous) if previous != focused => {
+                self.last_reported_focus = Some(focused);
+                if self.last_mode.contains(TermMode::FOCUS_IN_OUT) {
+                    self.session
+                        .write(if focused { b"\x1b[I" } else { b"\x1b[O" });
+                }
+            }
+            None => self.last_reported_focus = Some(focused),
+            Some(_) => {}
         }
     }
 
@@ -4205,5 +4291,219 @@ mod ime_backspace_tests {
         );
         assert_eq!(map_char_key(&egui::Key::Slash, true), Some(Key::Char('?')));
         assert_eq!(map_char_key(&egui::Key::Num1, false), Some(Key::Char('1')));
+    }
+}
+
+#[cfg(test)]
+mod query_response_tests {
+    use super::*;
+    use mino_core::terminal::{Session, SessionEvent, SessionOptions};
+    use std::sync::Arc;
+
+    fn test_view() -> TerminalView {
+        let session = Session::spawn_local(
+            SessionOptions {
+                shell: Some("/bin/cat".to_string()),
+                ..Default::default()
+            },
+            80,
+            24,
+            Arc::new(|_e: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        TerminalView::new(session)
+    }
+
+    /// 程序查询终端配色时必须给出真实颜色。
+    ///
+    /// 索引语义（alacritty `term::color`）：0-255 调色板、256 前景、
+    /// 257 背景、258 光标。曾因会话层丢弃 `Event::ColorRequest`，
+    /// `printf '\e]11;?\a'` 永远收不到答复——查询终端背景色的 TUI
+    /// （omp 启动即查 OSC 11）只能按“未知终端”回退。
+    #[test]
+    #[allow(non_snake_case)]
+    fn 颜色查询按索引返回主题颜色() {
+        let view = test_view();
+        let theme = crate::theme::current_theme();
+        assert_eq!(view.query_color(257), theme.term_bg, "257 应为背景色");
+        assert_eq!(view.query_color(256), theme.term_fg, "256 应为前景色");
+        assert_eq!(view.query_color(258), theme.term_cursor, "258 应为光标色");
+        assert_eq!(
+            view.query_color(1),
+            crate::theme::xterm256(1, theme.term_palette),
+            "0-255 应走调色板"
+        );
+        // 越界索引（Dim/Bright 变体）不能 panic，也不能编造颜色。
+        assert_eq!(view.query_color(10_000), theme.term_fg);
+    }
+
+    /// OSC 覆盖（程序自己设过的颜色）优先于内置调色板——终端的答复
+    /// 必须与实际渲染一致，否则查询方拿到的颜色和屏幕上看到的不是一回事。
+    #[test]
+    #[allow(non_snake_case)]
+    fn 颜色查询优先使用OSC覆盖() {
+        use std::time::{Duration, Instant};
+        let script = std::env::temp_dir().join(format!("mino-osc-set-{}.sh", std::process::id()));
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '\\033]11;rgb:1111/2222/3333\\007'\nsleep 5\n",
+        )
+        .expect("写测试脚本失败");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).ok();
+        }
+        let session = Session::spawn_local(
+            SessionOptions {
+                shell: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            80,
+            24,
+            Arc::new(|_e: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = TerminalView::new(session);
+        let expected = Rgb {
+            r: 0x11,
+            g: 0x22,
+            b: 0x33,
+        };
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut actual = view.query_color(257);
+        while Instant::now() < deadline && actual != expected {
+            std::thread::sleep(Duration::from_millis(30));
+            actual = view.query_color(257);
+        }
+        assert_eq!(
+            actual, expected,
+            "OSC 11 设置的背景色应优先于主题色，实际：{actual:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod capability_response_tests {
+    use super::*;
+    use mino_core::terminal::{Session, SessionEvent, SessionOptions};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// python3 是否可用（端到端用例需要带超时地读 PTY）。
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// 端到端：程序发终端查询后，mino 必须把应答写回 PTY。
+    ///
+    /// 覆盖两条曾经完全缺失的链路：
+    /// - OSC 11 背景色查询（`ColorRequest` 曾被会话层丢弃 → 永不应答）
+    /// - `DECSET 1004` 焦点上报（窗口焦点变化时发 `ESC [ I` / `ESC [ O`）
+    #[test]
+    #[allow(non_snake_case)]
+    fn 终端查询与焦点上报有应答() {
+        if !python3_available() {
+            eprintln!("跳过：缺少 python3");
+            return;
+        }
+        let tag = std::process::id();
+        let reply = std::env::temp_dir().join(format!("mino-cap-reply-{tag}.bin"));
+        let script = std::env::temp_dir().join(format!("mino-cap-probe-{tag}"));
+        let _ = std::fs::remove_file(&reply);
+        // 脚本：声明自身已就绪 → 打开焦点上报并查询背景色 → 带超时累积 stdin。
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/usr/bin/env python3
+import os, select, sys, termios, time, tty
+path = {path:?}
+fd = sys.stdin.fileno()
+# PTY 默认为规范模式：不关掉 ICANON，无换行的转义序列应答会卡在行缓冲里。
+tty.setcbreak(fd)
+os.write(1, b"\x1b[?1004h\x1b]11;?\x07\x1b]0;ready\x07")
+data = b""
+deadline = time.time() + 10
+while time.time() < deadline:
+    ready, _, _ = select.select([fd], [], [], 0.1)
+    if ready:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        data += chunk
+        with open(path, "wb") as handle:
+            handle.write(data)
+        if b"\x1b[I" in data and b"]11;" in data:
+            break
+"#,
+                path = reply.display().to_string()
+            ),
+        )
+        .expect("写探测脚本失败");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).ok();
+        }
+
+        let session = Session::spawn_local(
+            SessionOptions {
+                shell: Some(script.to_string_lossy().into_owned()),
+                working_directory: Some(std::env::temp_dir()),
+                ..Default::default()
+            },
+            80,
+            24,
+            Arc::new(|_e: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let mut view = TerminalView::new(session);
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut received = Vec::new();
+        let mut focused = false;
+        while Instant::now() < deadline {
+            // 回写后台事件（颜色/尺寸应答走这条路径）。
+            view.drain_background_events();
+            // 用终端真实模式驱动（程序发了 `DECSET 1004` 后才会出现该位）。
+            view.last_mode = {
+                let term = view.session().term();
+                let mode = term.lock().renderable_content().mode;
+                mode
+            };
+            // 程序打开 DECSET 1004 后，模拟窗口先失焦再获焦。
+            if view.last_mode.contains(TermMode::FOCUS_IN_OUT) && !focused {
+                focused = true;
+                view.report_focus_change(false);
+                view.report_focus_change(true);
+            }
+            if let Ok(data) = std::fs::read(&reply) {
+                received = data;
+                if received.windows(3).any(|w| w == b"]11")
+                    && received.windows(3).any(|w| w == b"\x1b[I")
+                {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let text = String::from_utf8_lossy(&received).into_owned();
+        assert!(
+            text.contains("]11;rgb:"),
+            "OSC 11 背景色查询应有应答，实际收到：{text:?}"
+        );
+        assert!(
+            text.contains("\x1b[I"),
+            "DECSET 1004 获焦事件应上报，实际收到：{text:?}"
+        );
+        let _ = std::fs::remove_file(&reply);
+        let _ = std::fs::remove_file(&script);
     }
 }

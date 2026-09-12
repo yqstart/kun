@@ -43,7 +43,7 @@ impl Dimensions for TermSize {
 }
 
 /// 会话事件（后台线程 → UI 线程的通知）。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SessionEvent {
     /// 终端有新内容，需要重绘。
     Wakeup,
@@ -55,10 +55,135 @@ pub enum SessionEvent {
     PtyWrite(String),
     /// 终端铃响。
     Bell,
+    /// 程序查询某个颜色（OSC 4/10/11/12）。
+    ///
+    /// VT 仿真层不知道真实调色板（那是渲染层的主题），所以只把查询交给
+    /// UI：UI 用当前主题颜色调用 `formatter` 得到应答串，再写回 PTY。
+    /// 丢掉这个事件会让 `printf '\e]11;?\a'` 永远收不到答复——查询终端
+    /// 配色的 TUI（omp、neovim、fzf 等）会一直按“未知终端”回退。
+    ColorRequest {
+        /// 颜色索引：0-255 为调色板，`NamedColor` 的 Foreground/Background/Cursor 取更大值。
+        index: usize,
+        /// 由 alacritty 提供的应答格式化函数（输入 Rgb，输出完整转义序列）。
+        formatter: Arc<dyn Fn(alacritty_terminal::vte::ansi::Rgb) -> String + Send + Sync>,
+    },
+    /// 程序查询文本区像素尺寸（CSI 14 t）。
+    TextAreaSizeRequest(Arc<dyn Fn(WindowSize) -> String + Send + Sync>),
+}
+
+impl std::fmt::Debug for SessionEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionEvent::Wakeup => f.write_str("Wakeup"),
+            SessionEvent::Title(title) => f.debug_tuple("Title").field(title).finish(),
+            SessionEvent::ChildExit => f.write_str("ChildExit"),
+            SessionEvent::PtyWrite(text) => f.debug_tuple("PtyWrite").field(text).finish(),
+            SessionEvent::Bell => f.write_str("Bell"),
+            SessionEvent::ColorRequest { index, .. } => f
+                .debug_struct("ColorRequest")
+                .field("index", index)
+                .finish(),
+            SessionEvent::TextAreaSizeRequest(_) => f.write_str("TextAreaSizeRequest"),
+        }
+    }
 }
 
 /// 事件回调：后台有数据时由监听器线程调用（用于触发 UI 重绘）。
 pub type EventHandler = Arc<dyn Fn(&SessionEvent) + Send + Sync>;
+
+/// 读取本地 shell 当前工作目录（macOS `PROC_PIDVNODEPATHINFO`）。
+///
+/// 内核态真实值，与 shell 是否内建、是否输出无关：`source`/别名/函数、
+/// 粘贴多行、tmux 嵌套下的 `cd` 都能正确反映。
+///
+/// `pid` 是 PTY 子进程（macOS 上是 `/usr/bin/login`，见下 `spawn_local`）：
+/// 先读它的直接子进程（`exec` 后的真实 shell），读不到才回退读自身——
+/// `login -flp` 自身常驻根目录附近，读它会得到永远不变的 `/`。
+/// 只在 `waitpid(WNOHANG)==0`（仍是当前进程的子进程）时查询，防止 PID
+/// 复用后读到陌生进程的目录。
+#[cfg(all(unix, target_os = "macos"))]
+fn child_current_dir(pid: i32) -> Option<PathBuf> {
+    if let Some(shell_pid) = login_shell_child(pid) {
+        if let Some(dir) = proc_cwd(shell_pid) {
+            return Some(dir);
+        }
+    }
+    proc_cwd(pid)
+}
+
+/// `login` 进程的直接子进程（`exec` 后的真实 shell）。
+///
+/// `waitpid` 只确认“仍是我的子进程”（防 PID 复用），不确认身份；
+/// 之后用 `proc_listchildpids` 枚举直接子进程并取第一个——`login -f`
+/// 只 `exec` 一个 shell，无多子进程歧义。
+#[cfg(all(unix, target_os = "macos"))]
+fn login_shell_child(pid: i32) -> Option<i32> {
+    let mut status = 0;
+    if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } != 0 {
+        return None;
+    }
+    let mut children = [0 as libc::pid_t; 16];
+    let count = unsafe {
+        libc::proc_listchildpids(
+            pid,
+            children.as_mut_ptr() as *mut libc::c_void,
+            (children.len() * std::mem::size_of::<libc::pid_t>()) as i32,
+        )
+    };
+    if count <= 0 {
+        return None;
+    }
+    let child = children[0];
+    if child <= 0 {
+        return None;
+    }
+    Some(child)
+}
+
+/// 单个 PID 的内核 cwd（`PROC_PIDVNODEPATHINFO` 的 `pvi_cdir`）。
+#[cfg(all(unix, target_os = "macos"))]
+fn proc_cwd(pid: i32) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let raw = proc_vnode_path(pid)?;
+    let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    if len == 0 {
+        return None;
+    }
+    let dir = PathBuf::from(OsStr::from_bytes(&raw[..len]));
+    if dir.is_absolute() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// 单个 PID 的内核 cwd 原始字节（NUL 结尾，`MAXPATHLEN`=1024）。
+///
+/// `vip_path` 在 libc 中为 `[[c_char; 32]; 32]`（绕老 rustc 定长限制），
+/// 按连续 1024 字节读。调用方保证 PID 身份：直接子进程（login）用
+/// `waitpid(WNOHANG)` 确认存活；真实 shell 是 login 存活期间的直接子进程，
+/// 其 PID 在此期间不会被系统回收复用（父进程未 wait 的僵尸/运行中进程
+/// 的 PID 不会分配给他人）。
+#[cfg(all(unix, target_os = "macos"))]
+fn proc_vnode_path(pid: i32) -> Option<[u8; 1024]> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int,
+        )
+    };
+    if ret as usize != std::mem::size_of::<libc::proc_vnodepathinfo>() {
+        return None;
+    }
+    // 按连续 1024 字节读 NUL 截断（即 MAXPATHLEN）。
+    let raw = info.pvi_cdir.vip_path.as_ptr() as *const u8;
+    Some(unsafe { *(raw as *const [u8; 1024]) })
+}
 
 /// 只向仍由当前进程持有的子进程发送信号。
 ///
@@ -179,6 +304,26 @@ impl EventListener for Listener {
                     true
                 }
                 Event::Bell => false,
+                // 颜色/尺寸查询：仿真层不知道真实调色板与像素尺寸，转交 UI
+                // 才是唯一能给出正确答案的地方。查询本身很轻（一条短转义
+                // 序列），保留完整语义直接入队；队列满时按普通状态事件丢弃
+                // （丢一条查询只会让程序回退默认值，不会破坏终端状态）。
+                Event::ColorRequest(index, formatter) => {
+                    if pending.len() < MAX_PENDING_EVENTS {
+                        pending.push(SessionEvent::ColorRequest { index, formatter });
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Event::TextAreaSizeRequest(formatter) => {
+                    if pending.len() >= MAX_PENDING_EVENTS {
+                        false
+                    } else {
+                        pending.push(SessionEvent::TextAreaSizeRequest(formatter));
+                        true
+                    }
+                }
                 // 不要为未入队事件用 pending.last() 通知：队列已满时会
                 // 误重复通知上一次事件，造成无意义的重绘。
                 _ => false,
@@ -451,6 +596,27 @@ impl Session {
     pub fn has_exited(&self) -> bool {
         *self.shared.exited.lock().unwrap()
     }
+    /// 本地 shell 子进程的当前工作目录（macOS 内核查询）。
+    ///
+    /// 内核态真实值：跟踪器只认“本视图键入的可见文本 + 回车”，`source`、
+    /// 别名/函数、粘贴多行、`cd -`、远程嵌套会话里的 `cd` 都追踪不到。
+    /// 远程会话与非 macOS 恒返回 `None`（无子进程 / 无该内核接口）。
+    /// 返回前做 `canonicalize`，与跟踪器的规范化路径可比（`/tmp` → `/private/tmp`）。
+    #[cfg(all(unix, target_os = "macos"))]
+    pub fn child_current_dir(&self) -> Option<PathBuf> {
+        if self.is_remote {
+            return None;
+        }
+        let pid = self.child_pid?;
+        let dir = child_current_dir(pid)?;
+        Some(std::fs::canonicalize(&dir).unwrap_or(dir))
+    }
+
+    /// 非 macOS 的占位实现（无 `PROC_PIDVNODEPATHINFO` 内核接口）。
+    #[cfg(not(all(unix, target_os = "macos")))]
+    pub fn child_current_dir(&self) -> Option<PathBuf> {
+        None
+    }
 
     /// 关闭会话。
     pub fn shutdown(self) {
@@ -583,6 +749,57 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| matches!(event, SessionEvent::ChildExit)));
+    }
+
+    /// 程序的终端查询必须进入事件队列，不能被会话层静默丢弃。
+    ///
+    /// 仿真层不知道真实调色板与像素尺寸，只有 UI 能回答；曾把
+    /// `Event::ColorRequest` 当无关事件丢掉，导致 OSC 10/11/12、OSC 4
+    /// 查询永远没有答复，查询终端配色的 TUI 只能按“未知终端”回退。
+    #[test]
+    fn 颜色与尺寸查询进入事件队列() {
+        use alacritty_terminal::vte::ansi::Rgb;
+
+        let shared = Arc::new(Shared::default());
+        let listener = Listener {
+            shared: shared.clone(),
+            on_event: Arc::new(|_event| {}),
+        };
+        let color_formatter: Arc<dyn Fn(Rgb) -> String + Send + Sync> = Arc::new(|color| {
+            format!(
+                "\x1b]11;rgb:{:02x}/{:02x}/{:02x}\x07",
+                color.r, color.g, color.b
+            )
+        });
+        listener.send_event(Event::ColorRequest(257, color_formatter));
+        listener.send_event(Event::TextAreaSizeRequest(Arc::new(|size| {
+            format!("\x1b[4;{};{}t", size.num_lines, size.num_cols)
+        })));
+
+        let pending = shared.pending.lock().unwrap();
+        assert_eq!(pending.len(), 2, "两条查询都应入队");
+        match &pending[0] {
+            SessionEvent::ColorRequest { index, formatter } => {
+                assert_eq!(*index, 257);
+                assert_eq!(
+                    formatter(Rgb { r: 1, g: 2, b: 3 }),
+                    "\x1b]11;rgb:01/02/03\x07"
+                );
+            }
+            other => panic!("首个事件应为 ColorRequest，实际 {other:?}"),
+        }
+        match &pending[1] {
+            SessionEvent::TextAreaSizeRequest(formatter) => {
+                let text = formatter(WindowSize {
+                    num_lines: 30,
+                    num_cols: 100,
+                    cell_width: 8,
+                    cell_height: 16,
+                });
+                assert_eq!(text, "\x1b[4;30;100t");
+            }
+            other => panic!("第二个事件应为 TextAreaSizeRequest，实际 {other:?}"),
+        }
     }
 
     /// 高频输出只需触发一次唤醒回调，不能按输出块无限追加 Wakeup 事件。

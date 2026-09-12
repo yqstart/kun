@@ -192,30 +192,65 @@ fn load_icon() -> Option<egui::IconData> {
     }
 }
 
+/// 崩溃日志路径：`~/.config/mino/crash.log`（与主机配置同目录）。
+///
+/// 不放临时目录：`/tmp` 会被系统清理，且用户报告闪退时需要的是一个
+/// 能直接发出来的稳定路径。
+fn crash_log_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home)
+        .join(".config")
+        .join("mino")
+        .join("crash.log")
+}
+
 fn main() -> eframe::Result {
     env_logger::init();
 
     // ==================== 崩溃日志捕获 ====================
-    // panic 信息写入文件，便于排查闪退问题（闪退时 stderr 不可见）。
-    let panic_log = std::env::temp_dir().join("mino-panic.log");
+    // panic 信息必须落盘：从 Finder/Dock 启动时 stderr 无人接收，闪退
+    // 现场会完全丢失（用户只能看到窗口消失）。追加写入固定文件，保留
+    // 多次崩溃的历史；下次启动由 MinoApp 读取并提示，用户可直接提供该文件。
     std::panic::set_hook(Box::new(move |info| {
         let location = info
             .location()
             .map(|l| format!("{}:{}", l.file(), l.line()))
             .unwrap_or_else(|| "未知位置".into());
         let backtrace = std::backtrace::Backtrace::force_capture();
-        let msg = format!(
-            "=== {PRODUCT_NAME} 崩溃时间：{} ===\n位置：{location}\n信息：{info}\n堆栈：\n{backtrace}\n",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs().to_string())
-                .unwrap_or_else(|_| "未知".into())
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|_| "未知".into());
+        let entry = format!(
+            "=== {PRODUCT_NAME} 崩溃 ts={timestamp} {location} ===\n信息：{info}\n堆栈：\n{backtrace}\n"
         );
-        let _ = std::fs::write(&panic_log, &msg);
-        eprintln!(
-            "{PRODUCT_NAME} 发生崩溃，详情已写入 {}",
-            panic_log.display()
-        );
+
+        let mut written = None;
+        for path in [
+            crash_log_path(),
+            std::env::temp_dir().join("mino-panic.log"),
+        ] {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let ok = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, entry.as_bytes()))
+                .is_ok();
+            if ok {
+                written = Some(path);
+                break;
+            }
+        }
+
+        match written {
+            Some(path) => {
+                eprintln!("{PRODUCT_NAME} 发生崩溃，详情已写入 {}", path.display());
+            }
+            None => eprintln!("{PRODUCT_NAME} 发生崩溃，且崩溃日志写入失败"),
+        }
     }));
 
     let mut viewport = egui::ViewportBuilder::default()

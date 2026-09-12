@@ -62,6 +62,14 @@ crates/
 - **Wakeup 单次 repaint**：drain_events 不再对 Wakeup 二次 request（mino-core `Listener::send_event` 已直接调 on_event=request_repaint）
 - 性能验证：idle 帧（无内容变化）构建耗时 0.03ms（此前全量扫描 0.5-2ms，降 15-60 倍）
 
+### 终端能力应答（v1.0.8，`terminal/mod.rs` + `terminal_view.rs`）
+
+- **程序的终端查询必须应答**：mino 曾把 alacritty 的 `Event::ColorRequest` / `Event::TextAreaSizeRequest` 当无关事件丢掉，导致 `printf '\e]11;?\a'` **永远收不到答复**（实测对比 macOS Terminal.app：Terminal 回 `]11;rgb:1e1e/…`，minо 无任何输出）。查询终端配色的 TUI（omp 启动即查 OSC 11）只能按"未知终端"回退配色
+- 事件链路：`SessionEvent::ColorRequest { index, formatter }` / `TextAreaSizeRequest(formatter)` 入队（`Listener::send_event`，formatter 是 alacritty 给的 `Arc<dyn Fn(Rgb) -> String>`），UI 侧 `TerminalView::drain_background_events` 用 `query_color(index)` 解析真实颜色后调 formatter 写回 PTY
+- **颜色索引语义**（alacritty `term::color`）：0-255 调色板、256 前景、257 背景、258 光标、259+ Dim/Bright 变体；优先级与渲染 `resolve_color` 一致：**OSC 动态覆盖（`term.colors()`）> 主题调色板**。`Colors` 只实现越界即 panic 的 `Index`，查询索引由终端程序控制，**必须先做边界检查**（`COUNT` = 269）
+- **焦点事件上报（`DECSET 1004`）**：程序开启后，窗口获得/失去焦点必须发 `ESC [ I` / `ESC [ O`（`TerminalView::report_focus_change`，读 `ctx.input(|i| i.focused)`）；**首帧只记录基准状态**，不能补发历史变化（程序是在自己启用之后才开始期待事件）；回归测试 `终端查询与焦点上报有应答`（python3 脚本开 cbreak 读 PTY，断言收到 `]11;rgb:` 与 `\x1b[I`）、`颜色查询按索引返回主题颜色`、`颜色查询优先使用OSC覆盖`、mino-core `颜色与尺寸查询进入事件队列`
+- **对照 Terminal.app 的方法**（本机排查用）：把 omp 包一层透明 PTY 代理分别跑在 mino 与 Terminal.app 里，比对**两个方向**的字节——`mino → 程序`方向能看出终端应答差异，`程序 → mino`方向能看出按键编码差异。实测结论：**按键字节两者完全一致**（方向键/回车/修饰键组合），差异只在终端能力应答与焦点上报
+
 ### 工作目录跟踪（`mino-app/src/workdir.rs`）
 
 - 终端输入仍直接交给 shell；跟踪器只根据 PTY 中可观察到的可见字符、退格、回车和控制键，维护一个尽力而为的当前目录
@@ -142,6 +150,7 @@ crates/
 
 - 集成测试依赖本地测试 sshd：`/usr/sbin/sshd -f /tmp/mino-test-sshd/sshd_config`（端口 2222、公钥认证、含 sftp subsystem）；启动方式 `bash scripts/test-sshd.sh start`
 - 配置文件：`~/.config/mino/hosts.toml`（toml 中 enum 用内部标记：`[hosts.auth.Key]`）；**保存走原子写**（先写 `hosts.toml.tmp` 再 rename 覆盖，进程被杀/磁盘满不会截断或清空配置）；**加载失败绝不静默清空**——文件存在但解析失败时先备份为 `hosts.toml.bak` 再按空配置启动并 toast 提示（`MinoApp::new_with_config`）
+- **崩溃日志 `~/.config/mino/crash.log`**（`main.rs::crash_log_path`，**追加**写入，保留多次崩溃历史；写失败回落 `/tmp/mino-panic.log`）——Finder/Dock 启动时 stderr 无人接收，闪退现场只能靠文件留存。下次启动 `take_crash_report`（与配置同目录，测试传隔离路径）**归档为 `crash.log.1` 并 toast 提示路径**（归档而非删除：日志是用户报告闪退的唯一证据；归档保证同一个崩溃不反复提示）；测试构建跳过该检查（`#[cfg(not(test))]`），行为由 `崩溃日志取走后归档` 单测覆盖
 - **测试绝不能读写用户真实配置**：`MinoApp::new` 使用 `default_config_path()`（用户真实 `~/.config/mino/hosts.toml`），涉及配置读写的测试必须走 `MinoApp::new_with_config(cc, test_config_path("标签"))`（`/tmp/mino-test-config-{tag}-{pid}.toml` 隔离路径）——**曾发生测试直接 save + remove_file 用户真实 hosts.toml：跑一次 `cargo test` 就覆盖并删除用户主机列表一次（表现为"每次更新新版本后主机全部消失"）**
 - 应用图标：`assets/icon.png`（**紫青渐变圆角底 + 白色 `>_` 终端提示符，四周留 10% 透明边距**，make-icon.swift 绘制，与应用内动态 logo 同构图）→ `load_icon()` 解码为 IconData → `ViewportBuilder::with_icon`——**eframe 在 macOS 上通过 NSApp 运行时设置 Dock 图标**，无 .app bundle 的 debug 构建也能生效；`.app` 安装版的 Dock 图标由 package-macos.sh 的 mino.icns 提供（同一设计）。**图标必须留透明边距：占满画布的无边距图标会被 macOS Dock 放大显示（比邻图标大一圈）**。**make-icon.swift 必须用 `NSBitmapImageRep` 位图上下文渲染（`NSImage.lockFocus` 在 Retina 屏按 2x 渲染导致输出尺寸翻倍）**
 - 字体：Monospace 族 = SF Mono（主）+ **Menlo（符号 fallback）** + STHeiti（CJK）+ egui 默认；Proportional 族 = SF 主 + STHeiti。**SF Mono 缺 `➜`(U+279C)/`❯`(U+276F)/`⚡` 等常用 zsh 提示符符号**，缺字形会被 egui 渲染为 `?` 替换符；Menlo 同为等宽且完整覆盖（宽度一致不漂移），必须排在 CJK fallback 之前。**禁止加载 Apple Color Emoji.ttc**（192MB 彩色位图字体，ab_glyph 无法解析 → egui panic）
@@ -152,7 +161,7 @@ crates/
 ## 验证
 
 ```bash
- cargo test --workspace         # 单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页（含标题栏双击 zoom/拖拽） + 双击交互 + 表单默认值 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单 + 中文宽字符列对齐（像素级）+ 标签标题跟随当前目录 + IME候选窗跟随光标；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
+ cargo test --workspace         # 单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页（含标题栏双击 zoom/拖拽） + 双击交互 + 表单默认值 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单 + 中文宽字符列对齐（像素级）+ 标签标题跟随当前目录 + IME候选窗跟随光标 + 终端能力应答（OSC 颜色查询/焦点上报，需 python3）+ 崩溃日志归档；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
 cargo clippy --workspace --all-targets   # 零警告
 cargo fmt --all
 ```
